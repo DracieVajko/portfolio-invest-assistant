@@ -1,0 +1,97 @@
+{
+  "settings": {
+    "ollama_base_url": "http://127.0.0.1:11434",
+    "ollama_chat_endpoint": "/api/chat",
+    "ollama_tags_endpoint": "/api/tags",
+    "model": "plutus:latest",
+    "fallback_model": "local-fallback",
+    "optional_summary_model": "local-summary",
+    "language": "en",
+    "num_ctx": 32000,
+    "temperature": 0.15,
+    "ollama_timeout_seconds": 900,
+    "days_price_history": "6mo",
+    "output_folder": "reports",
+    "archive_folder": "reports/archive",
+    "cache_folder": "data/cache",
+    "log_folder": "logs",
+    "max_news_per_asset": 6,
+    "max_forum_per_asset": 4,
+    "max_web_per_asset": 4,
+    "min_data_quality_for_signal": 60,
+    "allow_ai_to_change_probabilities": false,
+    "use_trading212_api": true,
+    "use_tradingview_public_data": true,
+    "use_social_sentiment": true,
+    "use_revolut_manual_research": true,
+    "news_relevance_threshold": 50,
+    "buy_probability_threshold": 60,
+    "sell_probability_threshold": 70,
+    "ai_max_assets": 10,
+    "global_news_queries": [
+      "stock market today AI chips semiconductors data center earnings",
+      "Nvidia AMD Broadcom Qualcomm Marvell Micron semiconductor news today",
+      "EV battery lithium CATL BYD Solid Power news today",
+      "market movers stocks today analyst upgrades earnings guidance"
+    ],
+    "discovery_queries": [
+      "best performing semiconductor stocks today earnings guidance upgrade",
+      "AI infrastructure stocks breakout today data center power cooling",
+      "EV battery stocks news today lithium battery producers",
+      "short squeeze stocks today high volume earnings catalyst"
+    ],
+    "odysseus_url": "http://localhost:7000",
+    "odysseus_model": "",
+    "odysseus_probe_timeout": 10
+  },
+  "assets": [
+    {
+      "broker_symbol": "AAPL",
+      "yahoo_symbol": "AAPL",
+      "tradingview_symbol": "NASDAQ:AAPL",
+      "name": "Apple Inc. (example)",
+      "group": "EQUITY",
+      "quantity": null,
+      "average_price": null,
+      "target_weight_pct": null,
+      "search_query": "AAPL Apple earnings guidance",
+      "aliases": [
+        "AAPL",
+        "Apple"
+      ],
+      "enabled": true
+    },
+    {
+      "broker_symbol": "MSFT",
+      "yahoo_symbol": "MSFT",
+      "tradingview_symbol": "NASDAQ:MSFT",
+      "name": "Microsoft Corp. (example)",
+      "group": "EQUITY",
+      "quantity": null,
+      "average_price": null,
+      "target_weight_pct": null,
+      "search_query": "MSFT Microsoft cloud earnings",
+      "aliases": [
+        "MSFT",
+        "Microsoft"
+      ],
+      "enabled": true
+    },
+    {
+      "broker_symbol": "BTC-USD",
+      "yahoo_symbol": "BTC-USD",
+      "tradingview_symbol": "BINANCE:BTCUSD",
+      "name": "Bitcoin (example)",
+      "group": "CRYPTO",
+      "quantity": null,
+      "average_price": null,
+      "target_weight_pct": null,
+      "search_query": "Bitcoin BTC-USD price macro",
+      "aliases": [
+        "BTC",
+        "Bitcoin"
+      ],
+      "enabled": true
+    }
+  ]
+}

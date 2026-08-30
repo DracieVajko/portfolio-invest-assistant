@@ -1,0 +1,57 @@
+﻿# Secrets and local configuration
+api.env
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+secrets.*
+credentials.*
+portfolio_config.json
+!portfolio_config.example.json
+
+# Personal financial data
+PIEs/*.csv
+!PIEs/example_*.csv
+investment_engine/memory/memory.json
+
+# Runtime output
+data/
+logs/
+reports/
+experimental/reports/
+
+# Python cache and tests
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# SQLite and other caches
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary and backup files
+*.bak
+*.tmp
+*.swp
+*Conflict*
