@@ -16,7 +16,6 @@ Skutočné T212 response fieldy:
 import os
 import requests
 import time
-import threading
 from typing import Dict, Optional, Any, List
 from datetime import datetime
 
@@ -71,7 +70,7 @@ class Trading212Auth:
         endpoint: str,
         data: Optional[Dict] = None,
         params: Optional[Dict] = None,
-        retry_count: int = 3,
+        retry_count: int = 5,
     ) -> Dict[str, Any]:
         headers = self.generate_auth_header()
         url = f"{self.api_base}/{endpoint.lstrip('/')}"
@@ -80,7 +79,7 @@ class Trading212Auth:
             try:
                 self._handle_rate_limit()
 
-                kwargs = dict(headers=headers, timeout=15)
+                kwargs = dict(headers=headers, timeout=20)
                 if params:
                     kwargs["params"] = params
 
@@ -94,8 +93,10 @@ class Trading212Auth:
                     response = self.session.request(method, url, json=data, **kwargs)
 
                 if response.status_code == 429:
-                    wait = int(response.headers.get("Retry-After", 60))
-                    print(f"[Trading212Auth] Rate limited, waiting {wait}s...")
+                    # Better 429 handling with exponential backoff + jitter
+                    wait = int(response.headers.get("Retry-After", 2 ** attempt * 10))
+                    wait = min(wait, 120)  # Cap at 2 minutes
+                    print(f"[Trading212Auth] Rate limited (429), waiting {wait}s... (attempt {attempt + 1}/{retry_count})")
                     time.sleep(wait)
                     continue
 
@@ -136,25 +137,19 @@ class Trading212Auth:
 
         return {"error": f"Request failed after {retry_count} retries: {endpoint}", "status": "error"}
 
-    # Class-level rate limiter (shared across all instances)
-    _class_rate_limit_timestamp = 0
-    _class_request_count = 0
-    _class_lock = threading.Lock()
-
     def _handle_rate_limit(self, max_requests: int = 50):
         current_time = time.time()
-        with Trading212Auth._class_lock:
-            if current_time - Trading212Auth._class_rate_limit_timestamp > 60:
-                Trading212Auth._class_rate_limit_timestamp = current_time
-                Trading212Auth._class_request_count = 0
-            Trading212Auth._class_request_count += 1
-            if Trading212Auth._class_request_count > max_requests:
-                sleep_time = 60 - (current_time - Trading212Auth._class_rate_limit_timestamp)
-                if sleep_time > 0:
-                    print(f"[Trading212Auth] Global rate limit – sleeping {sleep_time:.1f}s...")
-                    time.sleep(sleep_time)
-                    Trading212Auth._class_rate_limit_timestamp = time.time()
-                    Trading212Auth._class_request_count = 0
+        if current_time - self._rate_limit_timestamp > 60:
+            self._rate_limit_timestamp = current_time
+            self._request_count = 0
+        self._request_count += 1
+        if self._request_count > max_requests:
+            sleep_time = 60 - (current_time - self._rate_limit_timestamp)
+            if sleep_time > 0:
+                print(f"[Trading212Auth] Rate limit – sleeping {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+                self._rate_limit_timestamp = time.time()
+                self._request_count = 0
 
 
 class Trade212Client:

@@ -1,23 +1,17 @@
 @echo off
-setlocal
-
+title Portfolio Analysis - Full Report
 cd /d "%~dp0"
 
-if not exist logs mkdir logs
+echo Running full portfolio analysis...
+py -3.12 portfolio_ai_assistant.py --config portfolio_config.json --investment-engine --generate-full-report
+
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Portfolio analysis failed. Check the messages above.
+    pause
+    exit /b 1
+)
 
 echo.
-echo ======================================================
-echo Portfolio AI Assistant
-echo ======================================================
-echo.
-
-python portfolio_ai_assistant.py
-
-echo.
-echo ======================================================
-echo Finished
-echo Exit code: %ERRORLEVEL%
-echo ======================================================
-echo.
-
+echo Report generation finished. See Python output above for the actual saved paths.
 pause

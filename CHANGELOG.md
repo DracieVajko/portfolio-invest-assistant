@@ -1,42 +1,62 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to this project are documented in this file.
 
-## [v0.6.0-monolith] - 2026-08-29
+The format is based on Keep a Changelog and adheres to Semantic Versioning for tagged releases.
 
-Maintenance-oriented continuation of the monolithic line. Based on the historical `portfolio_ai_assistant_V4_5` snapshot, sanitized for public staging.
+## [Unreleased]
+
+- Active work in progress on the modular line (`main`, `v1.0.0-beta.1`). Breaking changes, configuration and report schema evolution are possible. No stable API is promised.
+
+## [1.0.0-beta.1] - Beta / WIP
+
+Experimental modular beta. Not production-ready. For development and research only; the latest stable monolithic release is [`v0.6.0`](../../tree/v0.6.0).
 
 ### Added
-- Sanitized `api.env.example` with safe localhost placeholders (no real credentials).
-- Sanitized `portfolio_config.example.json` with 3 demo assets (`AAPL`, `MSFT`, `BTC-USD`), conservative defaults (`ai_max_assets=10`, `max_news_per_asset=10`), deduplicated keys, and sanitized URLs (`http://127.0.0.1:1234/v1`, `http://127.0.0.1:7000`).
-- Local `portfolio_config.json` (gitignored) identical to the example for out-of-the-box `python portfolio_ai_assistant.py --no-ai`.
-- `PIEs/README.md` and four `PIEs/example_*.csv` demo exports (header + 2 fictitious rows).
-- `.gitignore` covering secrets, runtime output, caches, and temporary patches.
+- Modular `investment_engine/` package: `config/settings.py`, `main.py` (`run_engine`), `providers/` (factory/fallback for Ollama / LM Studio / OpenRouter), `research/` (market data, market regime, news engine, peak/valley, technical analysis), `portfolio/` (exposure, pie metadata, sidecar), `reporting/`, `schemas/`, `scoring/`, `pipeline/`, `prompts/` and `memory/`.
+- Multi-timeframe market-regime analysis for EXI2.DE and other assets: SMA/EMA/MACD/ADX/Supertrend/RSI/CCI/ATR/OBV/VWAP, Fibonacci levels, peak/valley detection, daily/weekly/monthly/15m/1h via `yfinance`.
+- Pie-level exposure aggregation (`portfolio/exposure.py`, `PIEs/config/*.json`, `PIEs/example_*.csv` — real `PIEs/*.csv` remain gitignored).
+- Isolated experimental backtest (`experimental/backtest/`): deterministic indicators, `tech_pie_pullback_v1` strategy, next-open execution, dated FX configs (`experimental/backtest/config/*.json`), `data_hash`/`fx_hash`/`config_hash` tracking. No Trading 212, LLM or network calls in the backtest core.
+- Tests for the new domains: `tests/test_market_regime.py`, `tests/test_pie_exposure.py`, `tests/test_pie_hardening.py` and `experimental/tests/` (7 backtest tests, including `test_no_lookahead.py`).
 
-### Fixed
-- `load_dotenv` import: graceful fallback via `try: from dotenv import load_dotenv` with `_HAS_DOTENV` flag; `load_environment_variables()` no longer crashes if `api.env` is absent or `python-dotenv` is missing.
-- `run_t212_analysis.bat` / `run_t212_export.bat`: now call `python trading212\integration.py` with `%~dp0`-relative paths instead of the non-existent `trading212_integration.py`.
-- `requirements.txt`: removed exact duplicate `ddgs>=0.2.0` line.
-- Duplicate definitions in `portfolio_ai_assistant.py`: removed earlier identical `migrate_legacy_config` and `validate_config` blocks; later definitions remain effective.
-- Temporary patch artefacts `fix_call_stage.py` / `fix_settings.py`: intentionally not carried over (their changes already present in the monolith).
+### Changed
+- Monolithic `portfolio_ai_assistant.py` reduced to a thin wrapper delegating to `investment_engine`.
 
-### Known Technical Debt (documented, not migrated)
-- Dual Trading 212 read-only implementation: inline logic in `portfolio_ai_assistant.py` (`fetch_trading212_positions`, `normalize_t212_ticker`, …) and `trading212/` package (`auth.py`, `portfolio.py`, `integration.py`) coexist.
-- Remaining duplicate definitions: `check_ollama_available` (2) and `get_working_model` (2) — later definitions win at runtime; left for minimal-risk maintenance.
-- No test suite; live providers (yfinance, DDGS, Trading 212) may be unavailable or rate-limited.
+### Limitations
+- Beta / WIP: may contain bugs, incomplete features, incorrect calculations, data-provider edge cases, configuration incompatibilities and breaking changes.
+- Experimental backtest is research only and does not imply future profitability; requires independent validation for look-ahead bias and costs.
 
-### Lineage
-- `v0.5.0` — previous historical monolith milestone.
-- `v0.6.0-monolith` — this maintenance snapshot (staging, not yet tagged).
-- `v1.0.0` — separate modular rewrite, WIP/experimental, not part of the monolith line.
+See [v1.0.0-beta.1](docs/releases/v1.0.0-beta.1.md) for the full beta note.
 
-No Git, tag, or network operations were performed during staging.
+## [0.6.0] - Current stable monolithic release
 
-## [v0.5.0] - historical
+Stable monolithic workflow used for regular local portfolio monitoring. This is the latest stable release; `main` (`v1.0.0-beta.1`) is the beta rewrite.
 
-Previous historical monolithic milestone preserved in `Zalohy/portfolio_ai_assistant_V4_5/`. Not sanitized; contains private credentials, real PIE exports, and runtime caches. Reference only.
+- Maintenance-oriented continuation of the monolithic line, sanitized for staging/public use (based on `Zalohy/portfolio_ai_assistant_V4_5`).
+- Deterministic `portfolio_ai_assistant.py` with Trading 212 read-only import, multi-source news (`yfinance`, `DDGS`), and Markdown/JSON reporting.
+- Sanitized `api.env.example` and `portfolio_config.example.json` with localhost placeholders and demo assets (`AAPL`, `MSFT`, `BTC-USD`).
+- `PIEs/example_*.csv` and `PIEs/README.md`; real `PIEs/*.csv` and `investment_engine/memory/memory.json` remain gitignored.
+- `.gitignore` covering secrets, runtime output (`data/`, `logs/`, `reports/`), caches (`__pycache__/`, `.pytest_cache/`, `*.db`) and temporary patches (`fix_*.py`).
+- No full automated test suite; outputs must be independently validated (prices, signals, LLM tidy-ups). Live providers may be unavailable or rate-limited.
 
-## [v1.0.0] — WIP (modular)
+See [v0.6.0](docs/releases/v0.6.0.md) for the full release note.
 
-Separate modular rewrite on the `main` branch (`portfolio-invest-assistant`, modular). Experimental and unstable; not published as a release. No lineage merge with `v0.6.0-monolith`.
+## [0.5.0] - Historical
 
+Historical feature-rich monolithic milestone with multi-source research and portfolio auto-discovery. Preserved snapshot; not the current stable release.
+
+- Monolithic `portfolio_ai_assistant.py` with multi-source research (`yfinance`, `DDGS`, `finvizfinance`) and portfolio auto-discovery.
+- Trading 212 read-only integration (`GET` only, no order placement).
+- Same safe template pattern: `api.env.example`, `portfolio_config.example.json`, gitignored local data.
+
+Reference only. See [v0.5.0](docs/releases/v0.5.0.md).
+
+## [0.1.0] - Historical
+
+Initial historical monolithic portfolio tracker baseline. Earliest preserved snapshot.
+
+- Single-script portfolio tracker with basic Trading 212 read-only import and report generation.
+- Safe templates: `api.env.example`, `portfolio_config.example.json`; local `api.env` / `portfolio_config.json` gitignored.
+- No claim of completeness or production readiness; reference baseline only.
+
+See [v0.1.0](docs/releases/v0.1.0.md).

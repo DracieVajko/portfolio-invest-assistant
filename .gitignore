@@ -1,24 +1,27 @@
-# Secrets and local configuration
+﻿# Secrets and local configuration
 api.env
 .env
 .env.*
 !.env.example
-portfolio_config.json
-!portfolio_config.example.json
 *.secret
 *.secrets
+secrets.*
 credentials.*
+portfolio_config.json
+!portfolio_config.example.json
 
-# Private financial data
+# Personal financial data
 PIEs/*.csv
 !PIEs/example_*.csv
+investment_engine/memory/memory.json
 
 # Runtime output
 data/
 logs/
 reports/
+experimental/reports/
 
-# Python and test artifacts
+# Python cache and tests
 __pycache__/
 *.py[cod]
 *$py.class
@@ -34,25 +37,21 @@ venv/
 env/
 ENV/
 
-# Databases and cache
+# SQLite and other caches
 *.db
 *.sqlite
 *.sqlite3
 *.db-shm
 *.db-wal
 
-# Local memory
-investment_engine/memory/memory.json
-
-# Temporary patch and editor files
-fix_*.py
-*.bak
-*.tmp
-*.swp
-*Conflict*
-
-# IDE and OS files
+# Editor and operating-system files
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Temporary and backup files
+*.bak
+*.tmp
+*.swp
+*Conflict*

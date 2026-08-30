@@ -3,20 +3,18 @@
     "ollama_base_url": "http://127.0.0.1:11434",
     "ollama_chat_endpoint": "/api/chat",
     "ollama_tags_endpoint": "/api/tags",
-    "model": "oda-fin-rl-8b",
-    "fallback_model": "openai/gpt-oss-20b",
-    "optional_summary_model": "google/gemma-4-12b",
-    "language": "sk",
-    "num_ctx": 12288,
+    "model": "local-model",
+    "fallback_model": "local-fallback",
+    "language": "en",
+    "num_ctx": 32000,
     "temperature": 0.08,
-    "ollama_timeout_seconds": 3600,
-    "days_price_history": "3mo",
+    "ollama_timeout_seconds": 1800,
+    "days_price_history": "6mo",
     "output_folder": "reports",
     "archive_folder": "reports/archive",
     "cache_folder": "data/cache",
     "log_folder": "logs",
-    "max_news_per_asset": 10,
-    "max_news_per_asset_limit": 10,
+    "max_news_per_asset": 4,
     "max_forum_per_asset": 5,
     "max_web_per_asset": 5,
     "min_data_quality_for_signal": 60,
@@ -31,56 +29,174 @@
     "use_revolut_manual_research": true,
     "use_macro_news": true,
     "news_relevance_threshold": 60,
-    "buy_probability_threshold": 45,
-    "sell_probability_threshold": 55,
+    "buy_probability_threshold": 60,
+    "sell_probability_threshold": 65,
     "ai_max_assets": 10,
     "prioritize_manual_assets": true,
     "always_include_portfolio": true,
     "always_include_watchlist": true,
     "auto_discovery_limit": 8,
-    "max_news_age_days": 7,
+    "max_news_age_days": 2,
     "ignore_duplicate_news": true,
     "ignore_otc": true,
     "use_etf_analysis": true,
     "use_crypto_analysis": true,
-    "skip_global_news": true,
-    "skip_discovery_news": true,
+    "market_regime": {
+      "enabled": true,
+      "symbol": "EXI2.DE",
+      "cache_ttl_seconds": 3600,
+      "timeframes": {
+        "intraday_15m": {
+          "interval": "15m",
+          "period": "1d",
+          "lookback_bars": 96,
+          "enabled": true,
+          "weight": 0.5
+        },
+        "intraday_1h": {
+          "interval": "1h",
+          "period": "5d",
+          "lookback_bars": 120,
+          "enabled": true,
+          "weight": 0.7
+        },
+        "daily": {
+          "interval": "1d",
+          "period": "3mo",
+          "lookback_bars": 63,
+          "enabled": true,
+          "weight": 1.5
+        },
+        "weekly": {
+          "interval": "1wk",
+          "period": "2y",
+          "lookback_bars": 104,
+          "enabled": true,
+          "weight": 2.0
+        },
+        "monthly": {
+          "interval": "1mo",
+          "period": "max",
+          "lookback_bars": 120,
+          "enabled": true,
+          "weight": 1.0
+        }
+      },
+      "peak_valley": {
+        "prominence_pct": 2.0,
+        "min_distance": 5,
+        "cluster_threshold_pct": 1.0,
+        "min_prominence_bars": 3
+      },
+      "thresholds": {
+        "peak_hold_rsi_daily_min": 60,
+        "peak_hold_rsi_weekly_min": 55,
+        "peak_hold_price_above_sma20_daily": true,
+        "peak_hold_price_above_sma50_weekly": true,
+        "peak_hold_macd_hist_declining": true,
+        "peak_hold_consolidation_days_min": 5,
+        "peak_hold_consolidation_range_pct": 2.5,
+        "declining_price_below_sma20_daily": true,
+        "declining_price_below_sma50_daily": true,
+        "declining_macd_bearish_cross": true,
+        "declining_rsi_daily_max": 50,
+        "declining_adx_min": 25,
+        "declining_lower_highs": true,
+        "declining_lower_lows": true,
+        "must_buy_near_200dma_tolerance_pct": 2.0,
+        "must_buy_near_52w_low_tolerance_pct": 5.0,
+        "must_buy_rsi_daily_max": 35,
+        "must_buy_rsi_weekly_max": 40,
+        "must_buy_volume_spike_threshold": 2.0,
+        "must_buy_supertrend_flip_bullish": true,
+        "must_buy_macd_weekly_bullish": true,
+        "min_timeframes_agree": 2,
+        "confidence_threshold": 0.75
+      },
+      "news": {
+        "max_age_hours": 48,
+        "min_relevance_score": 60,
+        "max_articles_per_symbol": 5
+      },
+      "finviz": {
+        "enabled": true,
+        "get_fundamentals": true,
+        "get_sector_breadth": true,
+        "sectors": [
+          "Technology",
+          "Healthcare",
+          "Financial",
+          "Consumer Cyclical",
+          "Industrial",
+          "Energy",
+          "Utilities",
+          "Real Estate",
+          "Basic Materials",
+          "Consumer Defensive",
+          "Communication Services"
+        ]
+      },
+      "reporting": {
+        "include_in_main_report": true,
+        "include_charts": false,
+        "include_json": true
+      }
+    },
     "global_news_queries": [
-      "major global stock market news",
-      "AI semiconductor GPU datacenter latest",
-      "Federal Reserve ECB interest rates macro",
-      "major earnings surprises analyst upgrades",
-      "major mergers acquisitions technology sector"
+      "major global stock market news affecting long-term investors",
+      "AI semiconductor GPU datacenter cloud infrastructure latest developments",
+      "renewable energy battery storage nuclear grid modernization latest news",
+      "Federal Reserve ECB inflation interest rates macroeconomic news",
+      "major earnings surprises guidance changes analyst upgrades downgrades",
+      "major mergers acquisitions strategic partnerships technology sector",
+      "global lithium uranium hydrogen rare earth supply chain news",
+      "Bitcoin Ethereum institutional adoption ETF regulation news"
     ],
     "discovery_queries": [
-      "high quality growth stocks improving fundamentals",
-      "companies reporting strong earnings raising guidance",
-      "AI infrastructure companies datacenter expansion"
+      "high quality growth stocks with improving fundamentals",
+      "companies reporting strong earnings and raising guidance",
+      "AI infrastructure companies benefiting from datacenter expansion",
+      "semiconductor equipment suppliers with growing demand",
+      "battery materials lithium uranium hydrogen investment opportunities",
+      "renewable energy grid modernization electrification companies",
+      "companies with significant insider buying",
+      "companies with expanding margins and accelerating revenue growth",
+      "undervalued technology leaders after earnings selloff",
+      "emerging companies supplying Nvidia AMD TSMC Microsoft"
     ],
-    "odysseus_url": "http://127.0.0.1:7000",
+    "odysseus_url": "http://localhost:7000",
     "odysseus_model": "",
     "odysseus_probe_timeout": 10,
     "auto_discover_min_value": 1.0,
     "skip_no_data_auto_discovered": true,
-    "lm_studio_base_url": "http://127.0.0.1:1234/v1",
-    "lm_studio_model": "dolphin-mistral-24b-venice-edition-patched",
-    "lm_studio_timeout": 1800,
-    "max_tokens": 4096
+    "lm_studio_base_url": "http://localhost:1234/v1",
+    "lm_studio_model": "local-model",
+    "lm_studio_timeout": 7200,
+    "lm_studio_context_tokens": 32000,
+    "lm_studio_max_output_tokens": 8192,
+    "decision_model": "local-decision",
+    "writer_model": "local-writer",
+    "max_parallel_requests": 1,
+    "openrouter_base_url": "https://openrouter.ai/api/v1",
+    "openrouter_model": "openrouter/free",
+    "openrouter_context_tokens": 62000,
+    "openrouter_max_output_tokens": 8192,
+    "provider": "lmstudio"
   },
   "assets": [
     {
       "broker_symbol": "AAPL",
       "yahoo_symbol": "AAPL",
       "tradingview_symbol": "NASDAQ:AAPL",
-      "name": "Apple Inc.",
-      "group": "TECH_PIE",
+      "name": "Apple Inc. (example)",
+      "group": "EQUITY",
       "quantity": null,
       "average_price": null,
       "target_weight_pct": null,
-      "search_query": "Apple AAPL earnings guidance iPhone services",
+      "search_query": "AAPL Apple earnings guidance",
       "aliases": [
-        "Apple",
-        "AAPL"
+        "AAPL",
+        "Apple"
       ],
       "enabled": true
     },
@@ -88,111 +204,33 @@
       "broker_symbol": "MSFT",
       "yahoo_symbol": "MSFT",
       "tradingview_symbol": "NASDAQ:MSFT",
-      "name": "Microsoft Corporation",
-      "group": "TECH_PIE",
+      "name": "Microsoft Corp. (example)",
+      "group": "EQUITY",
       "quantity": null,
       "average_price": null,
       "target_weight_pct": null,
-      "search_query": "Microsoft MSFT earnings Azure cloud guidance",
+      "search_query": "MSFT Microsoft cloud earnings",
       "aliases": [
-        "Microsoft",
-        "MSFT"
+        "MSFT",
+        "Microsoft"
       ],
       "enabled": true
     },
     {
       "broker_symbol": "BTC-USD",
       "yahoo_symbol": "BTC-USD",
-      "tradingview_symbol": "BITSTAMP:BTCUSD",
-      "name": "Bitcoin",
+      "tradingview_symbol": "BINANCE:BTCUSD",
+      "name": "Bitcoin (example)",
       "group": "CRYPTO",
       "quantity": null,
       "average_price": null,
       "target_weight_pct": null,
-      "search_query": "Bitcoin BTC-USD price macro risk",
+      "search_query": "Bitcoin BTC-USD price macro",
       "aliases": [
-        "Bitcoin",
-        "BTC-USD"
+        "BTC",
+        "Bitcoin"
       ],
       "enabled": true
     }
-  ],
-  "portfolio_rules": {
-    "rule_1": "Nikdy nekupuj len preto, že grafík vyzerá pekne. Musí byť fundamentálny dôvod.",
-    "rule_2": "Ak buy probability > 50%, overuj či nie je to pump & dump.",
-    "rule_3": "Ak máš pozíciu a buy probability opäť > 50%, zvážiť add-on DCA.",
-    "rule_4": "Sell probability > 80% = exit bez emócií. Thesis môže byť zmenená.",
-    "rule_5": "Diverzifikácia - maximálne 20% v jednej akcii.",
-    "rule_6": "Profit taking: Keď je +10%, zvážiť take profit 50% pozície.",
-    "rule_7": "Stop loss: -5% pre growth stocks, -10% pre dividend plays."
-  },
-  "symbol_aliases": {
-    "VWS": "VWS.CO",
-    "ORSTED": "ORSTED.CO",
-    "BYD": "1211.HK"
-  },
-  "ai_backends": {
-    "alpha": {
-      "provider": "ollama",
-      "base_url": "http://127.0.0.1:11434",
-      "model": "oda-fin-rl-8b",
-      "timeout": 1800,
-      "num_ctx": 12288,
-      "temperature": 0.08,
-      "enabled": true,
-      "_note": "ODA Fin RL 8b reasoning model on Ollama"
-    },
-    "summary": {
-      "provider": "ollama",
-      "base_url": "http://127.0.0.1:11434",
-      "model": "google/gemma-4-12b",
-      "timeout": 300,
-      "num_ctx": 8192,
-      "temperature": 0.1,
-      "enabled": true,
-      "_note": "Gemma 4 12b for summary"
-    },
-    "fallback": {
-      "provider": "ollama",
-      "base_url": "http://127.0.0.1:11434",
-      "model": "openai/gpt-oss-20b",
-      "timeout": 600,
-      "num_ctx": 8192,
-      "temperature": 0.1,
-      "enabled": true,
-      "_note": "GPT-OSS 20b fallback"
-    },
-    "reasoning_deep": {
-      "provider": "ollama",
-      "base_url": "http://127.0.0.1:11434",
-      "model": "qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp",
-      "timeout": 3600,
-      "num_ctx": 16384,
-      "temperature": 0.08,
-      "enabled": true,
-      "_note": "Qwen3 27b aggressive MTP for deep reasoning"
-    }
-  },
-  "model_presets": {
-    "finance_fast": {
-      "model": "oda-fin-rl-8b",
-      "num_ctx": 8192
-    },
-    "reasoning_deep": {
-      "model": "qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp",
-      "num_ctx": 16384
-    },
-    "claude_distill": {
-      "model": "openai/gpt-oss-20b",
-      "num_ctx": 16384
-    },
-    "gemma_balanced": {
-      "model": "google/gemma-4-12b",
-      "num_ctx": 12288
-    },
-    "qwen_balanced": {
-      "model": "qwen/qwen3-4b-2507",
-      "num_ctx": 8192
-    }
-  }
+  ]
 }

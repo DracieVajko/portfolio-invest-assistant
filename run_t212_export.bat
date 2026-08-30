@@ -5,7 +5,7 @@ cd /d "%~dp0"
 if not exist reports mkdir reports
 
 echo Exporting Trading212 portfolio to JSON...
-python trading212\integration.py --export reports\t212_portfolio.json --config api.env
+py -3.12 trading212_integration.py --export reports\t212_portfolio.json --config api.env
 
 if errorlevel 1 (
     echo [ERROR] Export failed.

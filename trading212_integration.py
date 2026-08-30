@@ -20,8 +20,8 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from pathlib import Path
 
-from .auth import Trade212Client
-from .portfolio import PortfolioMonitor
+from trading212_auth import Trade212Client
+from trading212_portfolio import PortfolioMonitor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -224,7 +224,7 @@ class Trading212Integration:
             self.enabled = False
         else:
             self.enabled = True
-            logger.info(f"Trading212 inicializovaný (key: {self.api_key[:8]}… | secret: {self.api_secret[:4]}…)")
+            logger.info("Trading212 inicializovaný (credentials loaded)")
 
         if self.enabled:
             self.monitor = PortfolioMonitor(self.api_key, self.api_secret, self.account_id)

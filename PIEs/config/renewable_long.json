@@ -1,0 +1,15 @@
+{
+  "pie_id": "RenewablePieLong",
+  "display_name": "Renewable / Clean Energy Pie - Long Term",
+  "horizon": "long_term",
+  "purpose": "Long-term renewable and clean-energy transition exposure",
+  "default_execution_mode": "pie_only",
+  "allow_standalone_adds": false,
+  "allow_standalone_sells": false,
+  "max_standalone_add_pct_of_account": 0.0,
+  "max_total_ticker_pct_of_account": 6.0,
+  "rebalance_mode": "drift_allowed",
+  "analysis_mode": "aggregate_pie_and_standalone",
+  "default_action_scope": "pie",
+  "target_weights": null
+}
