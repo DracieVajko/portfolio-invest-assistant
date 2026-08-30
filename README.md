@@ -19,24 +19,26 @@ Local portfolio monitoring and reporting assistant. It collects market data (yfi
 
 ## Version history
 
-| Version | Tag | Status | Description | Release notes |
-|---|---|---|---|---|
-| v0.1.0 | [`v0.1.0`](../../tree/v0.1.0) | Historical baseline | Initial monolithic portfolio tracker baseline. | [v0.1.0](docs/releases/v0.1.0.md) |
-| v0.5.0 | [`v0.5.0`](../../tree/v0.5.0) | Historical milestone | Feature-rich monolithic milestone with multi-source research and portfolio auto-discovery. | [v0.5.0](docs/releases/v0.5.0.md) |
-| v0.6.0 | [`v0.6.0`](../../tree/v0.6.0) | **Current stable monolithic release** | Stable monolithic workflow used for regular local monitoring. No full automated suite; independent validation required. | [v0.6.0](docs/releases/v0.6.0.md) |
-| v1.0.0-beta.1 | [`v1.0.0-beta.1`](../../tree/v1.0.0-beta.1) | **Beta / WIP** | Experimental modular rewrite with market regime analysis and backtesting. Not production-ready. | [v1.0.0-beta.1](docs/releases/v1.0.0-beta.1.md) |
+| Version | Tag | Status | Summary |
+|---|---|---|---|
+| Initial baseline | [`v0.1.0`](../../tree/v0.1.0) | Historical | Initial monolithic portfolio tracker baseline |
+| Feature-rich monolith | [`v0.5.0`](../../tree/v0.5.0) | Historical | Multi-source research and broker-position auto-discovery |
+| Stable monolith | [`v0.6.0`](../../tree/v0.6.0) | Current stable | Regularly used local monitoring workflow; no comprehensive automated test suite |
+| Modular rewrite | [`v1.0.0-beta.1`](../../tree/v1.0.0-beta.1) | Beta / WIP | Experimental modular rewrite; not production-ready |
+
+Tags preserve selected architectural milestones, not every local backup.
 
 See [CHANGELOG.md](CHANGELOG.md) for a chronological summary and [docs/releases/](docs/releases/) for per-version notes.
 
 ## What this beta does
 
 - All features from `v0.5.0` plus modular architecture:
-  - **Modular investment engine** (`investment_engine/`, ~30 Python files): `config/settings.py` (`EngineSettings.from_mapping`), `main.py` (`run_engine`), `providers/` (factory/fallback for Ollama / LM Studio / OpenRouter), `research/`, `portfolio/`, `reporting/`, `schemas/`, `scoring/`, `prompts/`
-  - **Multi-timeframe market regime** (`research/market_regime.py`, `technical_analysis.py`, `peak_valley.py`): SMA/EMA/MACD/ADX/Supertrend/RSI/CCI/ATR/OBV/VWAP, Fibonacci levels, peak/valley detection, daily/weekly/monthly/15m/1h via `yfinance`
-  - **Pie-level exposure** (`portfolio/exposure.py`, `pie_metadata.py`, `sidecar.py`, `PIEs/config/*.json`, `PIEs/example_*.csv`): read-only aggregation of pie holdings; real PIE CSV exports are gitignored
-  - **Parallel news** (`research/news_engine.py`, 48h window, relevance threshold, `feedparser` + `finvizfinance`)
-  - **Provider fallback** (`providers/fallback.py`, `factory.py`): LM Studio → Ollama → OpenRouter with retry
-  - **Experimental backtest** (`experimental/backtest/`, isolated, advisory only): deterministic indicators, `tech_pie_pullback_v1` strategy, next-open execution, dated FX configs, no network calls in tests, no secrets — see [Limitations](#known-limitations-and-experimental-backtest)
+  - **Modular investment engine** (`investment_engine/`): settings, orchestration, providers (Ollama / LM Studio / OpenRouter fallback), research, portfolio, reporting, schemas, scoring, prompts, memory
+  - **Multi-timeframe market regime**: SMA/EMA/MACD/ADX/Supertrend/RSI/CCI/ATR/OBV/VWAP, Fibonacci levels, peak/valley detection, daily/weekly/monthly/15m/1h via `yfinance`
+  - **Pie-level exposure**: read-only aggregation of pie holdings; real PIE CSV exports are gitignored
+  - **Parallel news**: 48h window, relevance threshold, `feedparser` + `finvizfinance`
+  - **Provider fallback**: LM Studio → Ollama → OpenRouter with retry
+  - **Experimental backtest** (isolated, advisory only): deterministic indicators, `tech_pie_pullback_v1` strategy, next-open execution, dated FX configs, no network calls, no secrets — see [Limitations](#known-limitations-and-experimental-backtest)
 
 ## Trading 212 — read-only
 
@@ -117,20 +119,19 @@ portfolio_ai_assistant.py            — thin wrapper (EngineSettings, run_engin
 investment_engine/
   config/settings.py               — EngineSettings.from_mapping
   main.py                          — run_engine() orchestration (T212 + news + regime + AI)
-  providers/{base,factory,fallback,lmstudio,ollama,openrouter}.py
-  research/{market_data,market_regime,news_engine,peak_valley,pies,sector_templates,technical_analysis}.py
-  portfolio/{exposure,pie_metadata,sidecar}.py + README.md
-  reporting/regime_report.py
-  schemas/ai_recommendations.py
-  scoring/priority.py, pipeline/engine.py, etc.
-  prompts/{adrian_alpha,constraints,loader,research,style,summary,think}.md
-  memory/store.py                  — local memory (memory.json gitignored)
+  providers/                       — base, factory, fallback, LM Studio, Ollama, OpenRouter
+  research/                        — market data, market regime, news, peak/valley, technical analysis, pies, sector templates
+  portfolio/                       — exposure, pie metadata, sidecar
+  reporting/                       — regime report
+  schemas/                         — AI recommendations
+  scoring/, pipeline/              — priority, engine
+  prompts/                         — markdown prompt templates
+  memory/                          — local memory (memory.json gitignored)
 experimental/
-  backtest/{engine,indicators,benchmarks,compare,io,metrics,validate,costs}.py
-  backtest/strategy/{base,tech_pie_pullback_v1}.py + config/*.json
-  tests/ (backtest fixtures & 7 tests)
-  README.md                        — advisory warning, no-lookahead convention
-tests/{test_market_regime,test_pie_exposure,test_pie_hardening}.py
+  backtest/                        — engine, indicators, benchmarks, compare, io, metrics, validate, costs
+  backtest/strategy/               — base, tech_pie_pullback_v1 + configs
+  tests/                           — backtest fixtures & 7 tests
+tests/                             — market regime, pie exposure, pie hardening
 PIEs/config/*.json                 — pie strategy metadata (tracked, no holdings)
 PIEs/example_*.csv                 — safe CSV examples (real PIEs/*.csv gitignored)
 portfolio_config.example.json      — safe example (tracked)
@@ -165,7 +166,6 @@ api.env.example                    — placeholder env vars (tracked)
 - [v0.6.0](docs/releases/v0.6.0.md) — Current stable monolithic release
 - [v1.0.0-beta.1](docs/releases/v1.0.0-beta.1.md) — Beta / WIP modular rewrite (this branch)
 - [CHANGELOG.md](CHANGELOG.md) — Chronological summary
-- [EXI2_MARKET_REGIME_PLAN.md](EXI2_MARKET_REGIME_PLAN.md) and [ROBUST_EXI2_REGIME_SPEC.md](ROBUST_EXI2_REGIME_SPEC.md) — market-regime design notes (modular line)
 
 ## License
 
