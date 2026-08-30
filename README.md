@@ -1,80 +1,70 @@
-# Portfolio AI Assistant — v0.1.0-baseline (historical)
+# Portfolio AI Assistant — v0.5.0-monolith (historical feature milestone)
 
 > **Research/advisory tool only — not financial advice and not an automated trading system.**
 
-Historical baseline snapshot from `portfolio_ai_assistant_V1` (2026-06-30). Prepared for Git tag `v0.1.0`.
+Historical feature milestone snapshot from `portfolio_ai_assistant_V4` (2026-08-01). Prepared for optional Git tag `v0.5.0`.
 
 ## What this version does
 
-- Read-only Trading 212 portfolio sync (`GET /api/v0/equity/portfolio` + `/cash`)
-- Yahoo Finance price snapshots (`yfinance`, period `6mo`, session cache in `data/cache`)
-- DuckDuckGo news search with relevance filtering and keyword sentiment
-- Deterministic data-quality scoring (0–100) and rule-based BUY/SELL/WATCH signals
-- Optional TradingView public checks
-- Ollama local LLM validation (`/api/tags`, `/api/chat`) and prompt-based report generation
-- Markdown + JSON output (`reports/portfolio_analysis.*`) with timestamped archive
+Everything in `v0.1.0-baseline` plus:
 
-Single-file monolith: `portfolio_ai_assistant.py:1` contains config, broker, market data, signals and LLM logic. `trading212_auth.py`, `trading212_integration.py`, `trading212_portfolio.py` handle broker specifics.
+- Auto-discovery of unmatched Trading 212 positions (`auto_discover_unmatched_positions:355`)
+- Symbol-mismatch detection (`detect_symbol_mismatch:554`, `resolve_yahoo_symbol:570`)
+- Backend detection for Ollama vs LM Studio (`_detect_backend:585`, `build_ollama_url:602`)
+- Expanded news/sentiment: `use_reddit`, `use_x_sentiment`, `use_stocktwits`, `use_sector_news`, `use_macro_news`, `use_crypto_analysis`, `use_etf_analysis`
+- Separate recommendation and data-quality reasoning (`recommendation_label:537`, `data_quality_reason:543`, `calculate_recommendation:1379`)
+- Modular markdown rendering (`_asset_line:1614`, `_append_asset_block:1632`)
+- `max_news_age_days`, `ignore_duplicate_news`, `ignore_otc`, `prioritize_manual_assets`, `always_include_portfolio/watchlist`
+
+Still a monolith (`portfolio_ai_assistant.py:1`, 2720 lines, 54 defs) but the last feature-complete version before modularization.
 
 ## High-level architecture
 
 ```
-v0.1.0-baseline/
-├── portfolio_ai_assistant.py   — monolith (load_config, fetch_trading212_positions, get_price_snapshot, calculate_data_quality, calculate_signals, ask_ollama, generate_report)
-├── trading212_auth.py          — Trading 212 authentication helper
-├── trading212_integration.py   — portfolio/cash fetch
-├── trading212_portfolio.py     — P/L, FX, holdings calculations
-├── fetch_trading212_cash.py    — standalone cash API snippet (reference)
-├── portfolio_config.example.json — safe example config (3 assets)
-├── portfolio_config.json       — safe default (identical to example, gitignored in future repo)
+v0.5.0-monolith/
+├── portfolio_ai_assistant.py   — monolith with auto-discovery and multi-source research
+├── trading212_*.py             — identical to v0.1.0 (auth/integration/portfolio)
+├── portfolio_config.example.json — 52 settings keys, 3 example assets, localhost endpoints
+├── portfolio_config.json       — safe default (gitignored)
 ├── api.env.example             — placeholder env vars
-├── requirements.txt            — requests, yfinance, pandas, duckduckgo-search, python-dotenv
-└── run_*.bat                   — Windows helpers (%~dp0, no hardcoded paths)
+├── requirements.txt            — requests, yfinance, pandas, ddgs, python-dotenv (deduped)
+└── run_*.bat                   — Windows helpers
 ```
 
-Inputs: `portfolio_config.json:2` (settings + assets), `api.env` (env), T212 API, yfinance, DDGS. Outputs: `reports/` and `logs/` (both gitignored).
+Inputs/outputs same as `v0.1.0-baseline`. Additional LM Studio config: `lm_studio_base_url` (sanitized to `http://localhost:1234/v1`).
 
 ## Requirements
 
-- Python 3.11+ (original run on 3.11)
+- Python 3.11+
 - `pip install -r requirements.txt`
 
 ## Safe local setup
 
 ```bash
 python -m venv .venv
-# Windows: .venv\Scripts\activate  |  Linux/macOS: source .venv/bin/activate
+# Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp api.env.example api.env
-# edit api.env locally — never commit
 cp portfolio_config.example.json portfolio_config.json
-# edit portfolio_config.json locally — add your own symbols
+# fill api.env and portfolio_config.json locally
 ```
 
-Never commit `api.env`, `portfolio_config.json` with real holdings, `data/`, `logs/`, `reports/`.
-
-## How to run (typical)
+## How to run
 
 ```bash
-python portfolio_ai_assistant.py --config portfolio_config.json
-# or via batch (Windows):
-run_automated.bat        # no-interactive, writes logs/latest_run.log
-run_full_report.bat
+python portfolio_ai_assistant.py --config portfolio_config.json --no-interactive
+# or
+run_automated.bat
 ```
-
-The code validates Ollama availability before calling the model and falls back to deterministic reporting if the model is unavailable.
 
 ## Runtime outputs (gitignored)
 
-- `data/cache/*.db` — yfinance tz/cookie cache
-- `logs/latest_run.log` + timestamped logs
-- `reports/portfolio_analysis.md` / `.json` + `reports/archive/*`
+- `data/cache/*.db`
+- `logs/`
+- `reports/` + `reports/archive/` (previous versions generated 97 reports — all excluded here)
 
-All are excluded via `.gitignore` and must not be committed.
+## Notes
 
-## Notes on historical limitations
-
-- Monolith ~1926 lines, no test suite, no modular `investment_engine`
-- No pie-level handling (`PIEs/` absent)
-- No market-regime analysis
-- `fetch_trading212_cash.py` is a reference snippet already merged into the main flow
+- No `investment_engine/` yet; no `PIEs/` or `experimental/` directory
+- Last monolith before the `v1.0.0-current` modular refactor
+- `requirements.txt` previously contained duplicate `ddgs>=0.2.0` — deduped in this clean snapshot

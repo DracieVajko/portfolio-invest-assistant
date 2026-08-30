@@ -36,7 +36,10 @@ session = requests.Session()
 session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
 yf.set_tz_cache_location("data/cache") # voliteľné, pre stabilizáciu cache
 # Vynútenie session pre všetky požiadavky yfinance
-import requests_cache
+try:
+    import requests_cache
+except ImportError:
+    requests_cache = None
 # Ak nepoužívaš requests_cache, stačí povedať yfinance aby globálne používal túto session:
 yf.utils.get_http_session = lambda: session
 # -------------------------------------------------------------------------
@@ -48,10 +51,11 @@ except ImportError:
 
 try:
     from ddgs import DDGS
-except Exception:
+except ImportError:
     try:
+        # fallback for older environments still using the renamed package
         from duckduckgo_search import DDGS
-    except Exception:
+    except ImportError:
         DDGS = None
 
 
@@ -115,6 +119,36 @@ def load_environment_variables():
         "trading212_api_secret": os.getenv("TRADING212_API_SECRET"),
         "revolut_file": os.getenv("REVOLUT_MANUAL_RESEARCH_FILE", "data/revolut_research_notes.md"),
     }
+
+
+def normalize_t212_ticker(raw_ticker: Optional[str]) -> str:
+    """
+    T212 internal tickers have an exchange/type suffix, e.g.:
+      WDC_US_EQ → WDC
+      AAPL_US_EQ → AAPL
+      BTCUSD → BTCUSD   (crypto tickers usually have no suffix)
+      000660_KS_EQ → 000660.KS  (Korean exchange — T212 uses underscore, Yahoo uses dot)
+    Strips the trailing _XX_EQ / _XXX_EQ pattern and known suffixes.
+    """
+    if not raw_ticker:
+        return ""
+    t = raw_ticker.strip().upper()
+
+    # Common T212 suffix pattern: SYMBOL_EXCHANGE_EQ
+    if t.endswith("_EQ"):
+        parts = t.split("_")
+        if len(parts) >= 3:
+            symbol = parts[0]
+            exchange = parts[1]
+            # Korean / some Asian exchanges: T212 uses SYMBOL_KS_EQ, Yahoo uses SYMBOL.KS
+            if exchange in ("KS", "KQ", "L", "T", "HK", "SS", "SZ"):
+                return f"{symbol}.{exchange}"
+            return symbol
+        elif len(parts) == 2:
+            return parts[0]
+
+    # Crypto pairs and anything without a recognizable suffix: return as-is
+    return t
 
 
 def fetch_trading212_positions(api_key: str, api_secret: str = None, api_base: str = "https://live.trading212.com") -> Dict[str, Any]:
@@ -204,19 +238,36 @@ def fetch_trading212_positions(api_key: str, api_secret: str = None, api_base: s
             for item in raw_positions:
                 if not isinstance(item, dict):
                     continue
+                raw_ticker = (
+                    item.get("ticker")
+                    or item.get("symbol")
+                    or item.get("instrumentCode")
+                    or item.get("shortName")
+                )
+                qty    = item.get("quantity")
+                avg_p  = item.get("averagePrice") or item.get("average_price")
+                curr_p = item.get("currentPrice") or item.get("current_price")
+                pnl    = item.get("ppl") or item.get("pnl") or item.get("profitLoss")
+
+                pnl_pct = None
+                try:
+                    if avg_p and qty and pnl is not None:
+                        cost_basis = float(avg_p) * float(qty)
+                        if cost_basis:
+                            pnl_pct = float(pnl) / cost_basis * 100
+                except (TypeError, ValueError):
+                    pnl_pct = None
+
                 positions.append({
                     "broker": "Trading212",
-                    "broker_symbol": (
-                        item.get("ticker")
-                        or item.get("symbol")
-                        or item.get("instrumentCode")
-                        or item.get("shortName")
-                    ),
-                    "quantity": item.get("quantity"),
-                    "average_price": item.get("averagePrice") or item.get("average_price"),
-                    "current_price": item.get("currentPrice") or item.get("current_price"),
+                    "broker_symbol": raw_ticker,
+                    "broker_symbol_clean": normalize_t212_ticker(raw_ticker),
+                    "quantity": qty,
+                    "average_price": avg_p,
+                    "current_price": curr_p,
                     "market_value": item.get("value") or item.get("marketValue") or item.get("market_value"),
-                    "pnl": item.get("ppl") or item.get("pnl") or item.get("profitLoss"),
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
                     "currency": item.get("currencyCode") or item.get("currency"),
                 })
 
@@ -301,6 +352,64 @@ def fetch_tradingview_technical_data(symbol: str):
         return {"source": "TradingView", "symbol": symbol, "url": url, "trust_level": "LOW", "error": str(e)}
 
 
+def auto_discover_unmatched_positions(assets, broker_positions, settings):
+    """
+    Pre T212 pozície ktoré sa NEPODARILO spárovať so žiadnym assetom v configu
+    (napr. nový nákup, ktorý si ešte nepridal do portfolio_config.json),
+    vygeneruj dočasný minimálny asset záznam aby sa pre ne stiahli ceny aj novinky.
+
+    Tieto auto-discovered assety sa nezapisujú späť do portfolio_config.json —
+    sú iba pre tento jeden beh reportu.
+    """
+    if not settings.get("auto_discover_t212_positions", True):
+        return assets
+
+    matched_clean = set()
+    for asset in assets:
+        if asset.get("trading212"):
+            t = asset["trading212"]
+            clean = t.get("broker_symbol_clean") or t.get("broker_symbol", "")
+            matched_clean.add(clean.upper())
+
+    discovered = []
+    seen_raw = set()
+    for pos in broker_positions.get("trading212", []):
+        raw = (pos.get("broker_symbol") or "").upper()
+        clean = (pos.get("broker_symbol_clean") or raw).upper()
+        if not raw or raw in seen_raw or clean in matched_clean:
+            continue
+        seen_raw.add(raw)
+
+        qty = pos.get("quantity") or 0
+        # Voliteľný filter: ignoruj prachové/zanedbateľné pozície (default off)
+        min_value = float(settings.get("auto_discover_min_value", 0))
+        val = pos.get("market_value") or 0
+        if min_value and val and val < min_value:
+            continue
+
+        discovered.append({
+            "broker_symbol":      clean,
+            "yahoo_symbol":       settings.get("symbol_aliases", {}).get(clean, clean),
+            "tradingview_symbol": None,
+            "name":               clean,
+            "group":              "T212_AUTO_DISCOVERED",
+            "quantity":           qty,
+            "average_price":      pos.get("average_price"),
+            "target_weight_pct":  None,
+            "search_query":       f"{clean} stock news",
+            "aliases":            [clean],
+            "enabled":            True,
+            "trading212":         pos,
+            "auto_discovered":    True,
+        })
+
+    if discovered:
+        print(f"[BROKER] Auto-discovered {len(discovered)} T212 position(s) not in config: "
+              f"{', '.join(d['broker_symbol'] for d in discovered)}")
+
+    return assets + discovered
+
+
 def merge_broker_data(assets, broker_positions):
     """Merge broker position data with portfolio assets."""
     enhanced_assets = []
@@ -310,7 +419,12 @@ def merge_broker_data(assets, broker_positions):
         enhanced = asset.copy()
         
         for pos in broker_positions.get("trading212", []):
-            if pos.get("broker_symbol", "").upper() == broker_symbol:
+            clean = (pos.get("broker_symbol_clean") or pos.get("broker_symbol", "")).upper()
+            raw   = (pos.get("broker_symbol") or "").upper()
+            # 1) exact match on normalized ticker (WDC == WDC, from WDC_US_EQ)
+            # 2) exact match on raw ticker (legacy / crypto pairs without suffix)
+            # 3) prefix match as last resort (handles edge-case suffix variants)
+            if clean == broker_symbol or raw == broker_symbol or raw.startswith(broker_symbol + "_"):
                 enhanced["trading212"] = pos
                 break
         
@@ -420,46 +534,111 @@ def fmt(v, digits=2, suffix=""):
     return f"{v:.{digits}f}{suffix}"
 
 
+def recommendation_label(asset: Dict[str, Any]) -> str:
+    rec = asset.get("recommendation") or {}
+    label = (rec.get("recommendation") or "WATCH").upper()
+    return label if label in {"BUY", "SELL", "WATCH"} else "WATCH"
+
+
+def data_quality_reason(asset: Dict[str, Any]) -> str:
+    reason = asset.get("dq_status") or asset.get("data_quality_reason") or "UNKNOWN"
+    price = asset.get("price") or {}
+    mismatch = asset.get("symbol_mismatch") or {}
+    if mismatch.get("flag"):
+        return f"SYMBOL_MISMATCH ({mismatch.get('ratio_text','n/a')})"
+    if price.get("error"):
+        return str(price.get("error"))
+    return str(reason)
+
+
+def detect_symbol_mismatch(asset: Dict[str, Any], ratio_limit: float = 3.0) -> Dict[str, Any]:
+    t = asset.get("trading212") or {}
+    p = asset.get("price") or {}
+    t_price = safe_float(t.get("current_price"))
+    y_price = safe_float(p.get("price"))
+    out = {"flag": False, "ratio": None, "ratio_text": None}
+    if not t_price or not y_price or t_price <= 0 or y_price <= 0:
+        return out
+    ratio = max(t_price / y_price, y_price / t_price)
+    out["ratio"] = ratio
+    out["ratio_text"] = f"{ratio:.2f}x"
+    if ratio > ratio_limit:
+        out["flag"] = True
+    return out
+
+
+def resolve_yahoo_symbol(asset: Dict[str, Any], settings: Dict[str, Any]) -> str:
+    aliases = settings.get("symbol_aliases", {}) or {}
+    broker_symbol = (asset.get("broker_symbol") or "").upper()
+    current = asset.get("yahoo_symbol") or broker_symbol
+    mapped = aliases.get(broker_symbol)
+    if mapped:
+        asset["yahoo_symbol"] = mapped
+        return mapped
+    return current
+
+
 # ============================================================================
 # OLLAMA/MODEL MANAGEMENT
 # ============================================================================
 
+def _detect_backend(settings: Dict[str, Any]) -> str:
+    """
+    Zistí aktívny AI backend.
+    Priorita: lm_studio_base_url (ak je nastavená a dostupná) → Ollama
+    Vracia: 'lmstudio' alebo 'ollama'
+    """
+    lms_url = (settings.get("lm_studio_base_url") or "").strip()
+    if lms_url:
+        try:
+            r = requests.get(f"{lms_url.rstrip('/')}/models", timeout=4)
+            if r.status_code == 200:
+                return "lmstudio"
+        except Exception:
+            pass
+    return "ollama"
+
+
 def build_ollama_url(settings: Dict[str, Any], endpoint: str = "chat") -> str:
-    """Build full Ollama API URL from settings."""
-    base_url = (
-        settings.get("ollama_base_url")
-        or settings.get("ollama_url")
-        or "http://127.0.0.1:11434"
-    ).rstrip("/")
+    """
+    Build full API URL — podporuje Ollama aj LM Studio.
+    LM Studio: /v1/chat/completions, /v1/models
+    Ollama:    /api/chat,            /api/tags
+    """
+    backend = _detect_backend(settings)
 
-    if endpoint == "chat":
-        ep = settings.get("ollama_chat_endpoint", "/api/chat")
-    elif endpoint == "tags":
-        ep = settings.get("ollama_tags_endpoint", "/api/tags")
+    if backend == "lmstudio":
+        base = settings.get("lm_studio_base_url", "http://localhost:1234/v1").rstrip("/")
+        if endpoint == "chat":   return base + "/chat/completions"
+        if endpoint == "tags":   return base + "/models"
+        return base + "/" + endpoint.lstrip("/")
     else:
-        ep = endpoint
-
-    if not ep.startswith("/"):
-        ep = "/" + ep
-
-    return base_url + ep
+        base = (settings.get("ollama_base_url") or settings.get("ollama_url")
+                or "http://127.0.0.1:11434").rstrip("/")
+        ep = ("/api/chat" if endpoint == "chat" else
+              "/api/tags" if endpoint == "tags" else endpoint)
+        if not ep.startswith("/"): ep = "/" + ep
+        return base + ep
 
 
 def list_ollama_models(settings: Dict[str, Any]) -> Optional[List[str]]:
-    """Fetch list of available Ollama models."""
+    """Vráti dostupné modely (Ollama alebo LM Studio)."""
     try:
+        backend = _detect_backend(settings)
         url = build_ollama_url(settings, "tags")
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
-        models = [m.get("name", "") for m in data.get("models", [])]
-        return sorted(models)
-    except Exception as e:
+        if backend == "lmstudio":
+            # LM Studio OpenAI format: {"data": [{"id": "model-name"}, ...]}
+            return sorted(m.get("id", "") for m in data.get("data", []))
+        else:
+            return sorted(m.get("name", "") for m in data.get("models", []))
+    except Exception:
         return None
 
 
 def validate_model_available(settings: Dict[str, Any], model_name: str) -> bool:
-    """Check if a specific model is available in Ollama."""
     models = list_ollama_models(settings)
     if models is None:
         return False
@@ -467,40 +646,35 @@ def validate_model_available(settings: Dict[str, Any], model_name: str) -> bool:
 
 
 def check_ollama_available(settings: Dict[str, Any]) -> Tuple[bool, str]:
-    """
-    Check if Ollama is reachable. Returns (is_available, message).
-    """
+    """Skontroluje dostupnosť AI backendu (Ollama alebo LM Studio)."""
     try:
+        backend = _detect_backend(settings)
         url = build_ollama_url(settings, "tags")
         r = requests.get(url, timeout=5)
         r.raise_for_status()
-        return True, "Ollama reachable"
-    except requests.ConnectionError:
-        return False, f"Cannot connect to Ollama at {settings.get('ollama_url')}"
+        return True, f"{backend.upper()} reachable at {url}"
+    except requests.ConnectionError as e:
+        return False, f"Cannot connect: {e}"
     except Exception as e:
-        return False, f"Ollama check failed: {e}"
+        return False, f"Check failed: {e}"
 
 
 def get_working_model(settings: Dict[str, Any]) -> Optional[str]:
-    """
-    Find a working model (primary or fallback).
-    Returns model name if found, None otherwise.
-    """
-    primary = settings.get("model")
+    """Nájde funkčný model (primárny → fallback → prvý dostupný)."""
+    primary  = settings.get("model")
     fallback = settings.get("fallback_model")
-    
+
     if primary and validate_model_available(settings, primary):
         return primary
-    
     if fallback and validate_model_available(settings, fallback):
         return fallback
-    
-    # List all available and pick first
     models = list_ollama_models(settings)
     if models:
         return models[0]
-    
     return None
+
+
+
 
 
 # ============================================================================
@@ -838,7 +1012,7 @@ def filter_and_score_news(results: List[Dict[str, Any]], asset: Dict[str, Any],
 def ddg_search(query: str, max_results: int = 10, news: bool = False):
     """Search using DuckDuckGo."""
     if DDGS is None:
-        return [{"title": "Missing duckduckgo-search", "snippet": "Install: pip install duckduckgo-search"}]
+        return [{"title": "Missing ddgs", "snippet": "Install: pip install ddgs"}]
     
     results = []
     try:
@@ -858,12 +1032,69 @@ def ddg_search(query: str, max_results: int = 10, news: bool = False):
     return results
 
 
+def resolve_company_name(ticker: str, price_data: Dict[str, Any]) -> str:
+    """
+    Pokúsi sa zistiť skutočný názov firmy z yfinance info.
+    Používa sa pre T212_AUTO_DISCOVERED tickery kde máme len kód,
+    nie ľudský názov.  Vráti ticker ak info nie je dostupné.
+    """
+    try:
+        used_sym = price_data.get("resolved_symbol") or ticker
+        if not used_sym or used_sym == ticker:
+            return ticker
+        import yfinance as yf
+        info = yf.Ticker(used_sym).fast_info
+        # fast_info is lightweight, doesn't hit the heavy info endpoint
+        # Try to get longName via regular info if fast_info has nothing useful
+        name = getattr(info, "display_name", None) or getattr(info, "name", None)
+        if not name:
+            full_info = yf.Ticker(used_sym).info
+            name = (full_info.get("longName") or full_info.get("shortName") or "").strip()
+        return name if name else ticker
+    except Exception:
+        return ticker
+
+
+def build_search_query(broker_symbol: str, name: str, is_auto_discovered: bool,
+                        resolved_company: str = "") -> str:
+    """
+    Zostrojí optimálny vyhľadávací dotaz.
+    
+    Priorita:
+    1. Ak je manuálne nastavený search_query v configu → použij ho (bez zmeny).
+    2. Ak je auto-discovered a resolved_company je dostupná → "{company} {ticker} stock news"
+    3. Ak ticker je príliš krátky (1-2 znaky) alebo generický → pridaj plné meno
+    4. Inak → "{name or broker_symbol} {ticker} stock"
+    
+    Cieľ: zabrániť garbage novinkám pre jednoznakové tickery ako O, C, ES, BE.
+    """
+    sym = broker_symbol.strip()
+    
+    # Ak existuje resolved company name (z yfinance), použi ho ako základ
+    company = resolved_company if resolved_company and resolved_company != sym else name
+    
+    # Krátky ticker (1-3 znaky) je VŽDY nejednoznačný → vyžaduje názov firmy
+    if len(sym) <= 3 and company and company != sym:
+        return f"{company} {sym} stock news"
+    
+    # Auto-discovered bez názvu → použi resolvedcompany
+    if is_auto_discovered and company and company != sym:
+        return f"{company} {sym} stock"
+    
+    # Štandardný prípad
+    base = company if company and company != sym else sym
+    return f"{base} stock news"
+
+
 def collect_asset_data(asset: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
     """Collect all data for an asset."""
     broker_symbol = asset.get("broker_symbol", "")
     yahoo_symbol = asset.get("yahoo_symbol", "")
     name = asset.get("name", "")
-    search_query = asset.get("search_query", name or broker_symbol)
+    is_auto = asset.get("auto_discovered", False)
+    # Použijeme manuálny search_query ak existuje a nie je len symbolom
+    manual_sq = asset.get("search_query", "")
+    has_manual_sq = manual_sq and manual_sq != f"{broker_symbol} stock news" and manual_sq != broker_symbol
 
     symbol_candidates = []
 
@@ -895,8 +1126,22 @@ def collect_asset_data(asset: Dict[str, Any], settings: Dict[str, Any]) -> Dict[
     )
     price_data["used_yahoo_symbol"] = used_yahoo_symbol
 
-    news_raw = ddg_search(f"{search_query} stock news earnings", max_results=max_news * 2, news=True)
-    web_raw = ddg_search(f"{search_query} financial analysis", max_results=max_web * 2, news=False)
+    # Rozlíšenie skutočného názvu firmy pre auto-discovered tickery
+    # (T212 nám dá len ticker, nie názov → yfinance info)
+    resolved_company = ""
+    if is_auto and (not name or name == broker_symbol):
+        resolved_company = resolve_company_name(broker_symbol, price_data)
+        if resolved_company and resolved_company != broker_symbol:
+            name = resolved_company  # update name for prompt/report
+
+    # Zostrojenie optimálneho search query
+    if has_manual_sq:
+        search_query = manual_sq
+    else:
+        search_query = build_search_query(broker_symbol, name, is_auto, resolved_company)
+
+    news_raw = ddg_search(f"{search_query} earnings", max_results=max_news * 2, news=True)
+    web_raw = ddg_search(f"{search_query} analysis price target", max_results=max_web * 2, news=False)
 
     news, news_excluded = filter_and_score_news(news_raw, asset, max_news)
     web, web_excluded = filter_and_score_news(web_raw, asset, max_web)
@@ -905,7 +1150,7 @@ def collect_asset_data(asset: Dict[str, Any], settings: Dict[str, Any]) -> Dict[
         "broker_symbol": broker_symbol,
         "yahoo_symbol": used_yahoo_symbol or yahoo_symbol,
         "configured_yahoo_symbol": yahoo_symbol,
-        "name": name,
+        "name": name or resolved_company or broker_symbol,
         "group": asset.get("group", "PORTFOLIO"),
         "price": price_data,
         "news": news,
@@ -914,7 +1159,11 @@ def collect_asset_data(asset: Dict[str, Any], settings: Dict[str, Any]) -> Dict[
         "web_excluded": web_excluded,
         "symbol_candidates": symbol_candidates,
         "tradingview": fetch_tradingview_technical_data(asset.get("tradingview_symbol", "")) if settings.get("use_tradingview_public_data", True) else None,
-        "collected_at": datetime.now().isoformat()
+        "collected_at": datetime.now().isoformat(),
+        # Pass-through broker position data so generate_report() can build the holdings table
+        "trading212": asset.get("trading212"),
+        "revolut": asset.get("revolut"),
+        "auto_discovered": asset.get("auto_discovered", False),
     }
 
 
@@ -946,44 +1195,54 @@ def compact(items: List[Dict[str, Any]], limit: int = 3) -> str:
 def calculate_data_quality(asset_data: Dict[str, Any]) -> int:
     """
     Calculate data quality score (0-100) based on availability and completeness.
+    Also sets asset_data["dq_status"] string flag:
+      "OK"          — full data, safe for scoring
+      "PARTIAL"     — price exists but incomplete (no MAs, low candle count)
+      "NO_PRICE_DATA" — no usable price feed
+      "BROKER_ONLY" — T212 position exists but no external data at all
     """
     score = 0
-    price = asset_data.get("price", {})
-    
-    # Price available: +25
-    if price.get("price"):
-        score += 25
-    
-    # Sufficient historical data (100+ candles): +15
-    if price.get("candle_count", 0) >= 100:
-        score += 15
-    elif price.get("candle_count", 0) >= 50:
-        score += 8
-    
-    # Company identity confirmed: +10
-    if price.get("currency") or asset_data.get("name"):
-        score += 10
-    
-    # Market cap or volume: +10
-    if price.get("market_cap") or price.get("volume"):
-        score += 10
-    
-    # All moving averages present: +10
-    if all(price.get(ma) for ma in ["ma20", "ma50", "ma100"]):
-        score += 10
-    
-    # Relevant news found: +15
-    news_count = len(asset_data.get("news", []))
-    if news_count >= 2:
-        score += 15
-    elif news_count >= 1:
-        score += 8
-    
-    # No obvious data issues: +10
-    if not price.get("error"):
-        score += 10
-    
-    return min(100, max(0, score))
+    price = asset_data.get("price", {}) or {}
+
+    has_price      = bool(price.get("price"))
+    candle_count   = price.get("candle_count", 0)
+    has_identity   = bool(price.get("currency") or asset_data.get("name"))
+    has_volume     = bool(price.get("market_cap") or price.get("volume"))
+    has_mas        = all(price.get(ma) for ma in ["ma20", "ma50", "ma100"])
+    news_count     = len(asset_data.get("news", []) or [])
+    has_error      = bool(price.get("error"))
+    has_t212       = bool(asset_data.get("trading212"))
+
+    if has_price:    score += 25
+    if candle_count >= 100: score += 15
+    elif candle_count >= 50: score += 8
+    if has_identity: score += 10
+    if has_volume:   score += 10
+    if has_mas:      score += 10
+    if news_count >= 2: score += 15
+    elif news_count >= 1: score += 8
+    if not has_error: score += 10
+    score = min(100, max(0, score))
+
+    # --- dq_status string ---
+    if not has_price and has_t212:
+        dq_status = "BROKER_ONLY"
+    elif not has_price:
+        dq_status = "NO_PRICE_DATA"
+    elif score < 45 or (has_price and not has_mas):
+        dq_status = "PARTIAL"
+    else:
+        dq_status = "OK"
+
+    asset_data["dq_status"] = dq_status
+    return score
+
+
+def dq_label(asset_data: Dict[str, Any]) -> str:
+    """Return dq_status string, falling back to numeric score."""
+    return asset_data.get("dq_status") or (
+        "OK" if asset_data.get("data_quality", 0) >= 60 else "PARTIAL"
+    )
 
 
 def calculate_signals(price_data: Dict[str, Any], news_data: List[Dict], 
@@ -1117,196 +1376,410 @@ def calculate_signals(price_data: Dict[str, Any], news_data: List[Dict],
 # OLLAMA ANALYSIS
 # ============================================================================
 
+def calculate_recommendation(asset_data: Dict[str, Any],
+                             signals: Dict[str, Any] = None,
+                             settings: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    3-stavové odporúčanie: BUY / SELL / WATCH
+    score_value (-2..+2): risk_level vs price, PE fallback, buy/sell_prob fallback
+    score_momentum (-2..+2): MA50/MA200 crossover + RSI
+    score_sentiment (-1..+1): aggregated news sentiment
+    """
+    signals    = signals or asset_data.get("signals", {}) or {}
+    price_data = asset_data.get("price",  {}) or {}
+    news       = asset_data.get("news",   []) or []
+    dq_str     = asset_data.get("dq_status") or dq_label(asset_data)
+
+    current_price = price_data.get("price")
+    ma50          = price_data.get("ma50")
+    ma200         = price_data.get("ma200")
+    rsi           = price_data.get("rsi")
+    risk_level    = price_data.get("risk_level") or price_data.get("risk_hint_value")
+    pe            = price_data.get("pe_ratio") or price_data.get("trailingPE")
+    eps_growth    = price_data.get("earnings_growth")
+
+    # score_value
+    score_value = 0; value_note = ""
+    if current_price and risk_level:
+        fair_low = float(risk_level); fair_high = fair_low * 1.30
+        if   current_price < fair_low * 0.90:  score_value = 2;  value_note = f"cena pod fair zone (<{fair_low*0.9:.2f})"
+        elif current_price <= fair_high:        score_value = 1;  value_note = f"cena v fair zone ({fair_low:.2f}-{fair_high:.2f})"
+        else:                                   score_value = -2; value_note = f"cena nad fair zone (>{fair_high:.2f})"
+    elif pe is not None:
+        try:
+            pe_f = float(pe); growing = eps_growth and float(eps_growth) > 0
+            if   pe_f < 15 and growing:         score_value = 2;  value_note = f"PE={pe_f:.1f} nizke+rast"
+            elif pe_f <= 30:                    score_value = 1;  value_note = f"PE={pe_f:.1f} OK"
+            elif pe_f > 40 and not growing:     score_value = -2; value_note = f"PE={pe_f:.1f} predrazene"
+            else:                               score_value = 0;  value_note = f"PE={pe_f:.1f} neutral"
+        except (TypeError, ValueError): pass
+    else:
+        bp = signals.get("buy_probability", 0); sp = signals.get("sell_probability", 0)
+        if   bp >= 60: score_value =  2; value_note = f"buy_prob={bp:.0f}%"
+        elif bp >= 35: score_value =  1; value_note = f"buy_prob={bp:.0f}%"
+        elif sp >= 60: score_value = -2; value_note = f"sell_prob={sp:.0f}%"
+        elif sp >= 35: score_value = -1; value_note = f"sell_prob={sp:.0f}%"
+        else:          score_value =  0; value_note = "no valuation data"
+
+    # score_momentum
+    score_momentum = 0; mom_note = ""
+    if ma50 and ma200 and current_price:
+        if   ma50 > ma200 and current_price > ma50:  score_momentum = 2;  mom_note = "MA50>MA200,price>MA50"
+        elif ma50 > ma200:                            score_momentum = 1;  mom_note = "MA50>MA200,pullback"
+        elif ma50 < ma200 and current_price < ma50:  score_momentum = -2; mom_note = "MA50<MA200,price<MA50"
+        else:                                         score_momentum = -1; mom_note = "MA50<MA200"
+    elif ma50 and current_price:
+        score_momentum = 1 if current_price > ma50 else -1; mom_note = "vs MA50"
+    else:
+        ts = signals.get("technical_score", 50)
+        if   ts >= 70: score_momentum =  2; mom_note = f"tech={ts}"
+        elif ts >= 55: score_momentum =  1; mom_note = f"tech={ts}"
+        elif ts <= 30: score_momentum = -2; mom_note = f"tech={ts}"
+        elif ts <= 45: score_momentum = -1; mom_note = f"tech={ts}"
+        else:          score_momentum =  0; mom_note = f"tech={ts}"
+    if rsi:
+        if   rsi < 30: score_momentum += 1; mom_note += f",RSI={rsi:.0f}(os)"
+        elif rsi > 70: score_momentum -= 1; mom_note += f",RSI={rsi:.0f}(ob)"
+        score_momentum = max(-3, min(3, score_momentum))
+
+    # score_sentiment
+    SMAP = {"POSITIVE": 1, "NEGATIVE": -1, "NEUTRAL": 0, "MIXED": 0}
+    vals  = [SMAP.get((n.get("sentiment") or "NEUTRAL").upper(), 0) for n in news]
+    avg_s = (sum(vals) / len(vals)) if vals else 0.0
+    if   avg_s >  0.3: score_sentiment = 1;  sent_note = f"sent={avg_s:.2f}(+)"
+    elif avg_s < -0.3: score_sentiment = -1; sent_note = f"sent={avg_s:.2f}(-)"
+    else:              score_sentiment = 0;  sent_note = f"sent={avg_s:.2f}(n)"
+
+    total_score   = score_value + score_momentum + score_sentiment
+    fair_high_val = (float(risk_level) * 1.30) if risk_level else None
+
+    # Agresívny short-term signál — nezávislý od value (pre short-run trading)
+    short_term_buy  = (score_momentum >= 2 and score_sentiment >= 1 and dq_str in ("OK", "PARTIAL"))
+    short_term_sell = (score_momentum <= -2 and score_sentiment <= -1 and dq_str in ("OK", "PARTIAL"))
+
+    if dq_str not in ("OK", "PARTIAL"):
+        recommendation = "WATCH"
+        comment = f"Data quality: {dq_str}. Chybaju cenove data — nedokupovat."
+    elif (total_score >= 3 and score_value >= 1) or short_term_buy:
+        recommendation = "BUY"
+        trigger = "SHORT-TERM" if short_term_buy and not (total_score >= 3 and score_value >= 1) else "LONG+SHORT"
+        comment = (f"[{trigger}] Score {total_score:+d} (V{score_value} M{score_momentum} S{score_sentiment}): "
+                   f"{value_note}; {mom_note}; {sent_note}. BUY.")
+    elif (total_score <= -3
+          or short_term_sell
+          or (fair_high_val and current_price and current_price > fair_high_val
+              and score_sentiment <= 0 and score_momentum <= 0)):
+        recommendation = "SELL"
+        trigger = "SHORT-TERM" if short_term_sell and total_score > -3 else "score"
+        comment = (f"[{trigger}] Score {total_score:+d} (V{score_value} M{score_momentum} S{score_sentiment}): "
+                   f"{value_note}; {mom_note}; {sent_note}. SELL/REDUCE.")
+    else:
+        if total_score >= 2:    quality = "BUY-WATCH"
+        elif total_score <= -2: quality = "SELL-WATCH"
+        else:                   quality = "NEUTRAL"
+        recommendation = "WATCH"
+        comment = (f"[{quality}] Score {total_score:+d} (V{score_value} M{score_momentum} S{score_sentiment}): "
+                   f"{value_note}; {mom_note}; {sent_note}.")
+
+    return {
+        "recommendation":    recommendation,
+        "score_value":       score_value,
+        "score_momentum":    score_momentum,
+        "score_sentiment":   score_sentiment,
+        "total_score":       total_score,
+        "data_quality":      dq_str,
+        "avg_sentiment":     round(avg_s, 2),
+        "rsi":               round(rsi, 1) if rsi else None,
+        "comment":           comment,
+        "short_term_signal": "BUY" if short_term_buy else ("SELL" if short_term_sell else None),
+    }
+
+
+
+
 def ask_ollama(prompt: str, settings: Dict[str, Any]) -> str:
-    """Call Ollama with prompt."""
+    """
+    Volá AI model — podporuje Ollama aj LM Studio (OpenAI-compatible).
+    Backend sa detekuje automaticky podľa lm_studio_base_url dostupnosti.
+    """
     model = get_working_model(settings)
     if not model:
-        return "ERROR: No Ollama model available. Please check installation."
-    
-    payload = {
-        "model": model,
-        "stream": False,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a strict, factual investment analyst. "
-                    "You NEVER invent probabilities, prices, company names, or earnings. "
-                    "You NEVER change calculated scores. "
-                    "You NEVER override Python-computed buy_probability or sell_probability. "
-                    "If data quality is low, you say 'neoverené' (unverified). "
-                    "You work only with structured data provided. "
-                    "Speak in Slovak."
-                )
-            },
-            {"role": "user", "content": prompt}
-        ],
-        "options": {
-            "temperature": float(settings.get("temperature", 0.15)),
-            "num_ctx": int(settings.get("num_ctx", 16384))
+        return "ERROR: No AI model available. Check Ollama/LM Studio connection."
+
+    backend = _detect_backend(settings)
+    url = build_ollama_url(settings, "chat")
+    timeout = int(settings.get("ollama_timeout_seconds", 1800))
+
+    SYSTEM = ("""
+### Role: Portfolio Intelligence Engine
+Think internally in English.
+Always answer in Slovak.
+Never optimize your answer for politeness.
+Optimize for correctness.
+If the portfolio contains weak positions,
+identify them clearly.
+If the user appears emotionally attached to an asset,
+ignore that and evaluate only the evidence.
+Identity
+Adrian Alpha analyzes structured portfolio data generated by external software. His role is to transform numerical results into rational investment decisions. He acts as an independent second opinion, not as a passive summarizer.
+Core Principles
+- Facts over narratives.
+- Data over emotions.
+- Capital preservation before return maximization.
+- Risk-adjusted return over absolute return.
+- Long-term discipline over short-term market noise.
+Data Policy
+Treat Python-generated values as authoritative.
+Never modify or reinterpret calculated metrics.
+Never fabricate:
+- prices
+- earnings
+- analyst ratings
+- financial statements
+- news
+- corporate events
+Probability scores are supporting evidence.
+They must never be treated as absolute truth.
+If probability and fundamentals disagree,
+explain why.
+Missing information must be explicitly marked as "Neoverené".
+Use external financial knowledge only to interpret the provided data, never to invent missing facts.
+Analysis Workflow
+For every execution:
+1. Validate input.
+2. Detect inconsistencies.
+3. Analyze overall portfolio.
+4. Analyze every position individually.
+5. Rank opportunities.
+6. Rank risks.
+7. Produce actionable conclusions.
+Return exactly ONE verdict for each position.
+Allowed verdicts:
+- Strong Buy
+- Buy
+- Accumulate
+- Hold
+- Reduce
+- Sell
+- Exit
+Never invent additional verdicts.
+Goal
+Think like the Chief Investment Officer reviewing a real investment portfolio. Your objective is to improve capital allocation through disciplined, evidence-based decisions while avoiding emotional bias and unsupported conclusions.
+""")
+
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user",   "content": prompt},
+    ]
+
+    if backend == "lmstudio":
+        # OpenAI-compatible format (LM Studio)
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": float(settings.get("temperature", 0.08)),
+            "max_tokens": int(settings.get("max_tokens", 16384)),
+            "stream": False,
         }
-    }
-    
-    try:
-        url = build_ollama_url(settings, "chat")
-        r = requests.post(url, json=payload, timeout=int(settings.get("ollama_timeout_seconds", 600)))
-        r.raise_for_status()
-        return r.json().get("message", {}).get("content", "").strip()
-    except Exception as e:
-        return f"ERROR calling Ollama: {e}"
 
+        try:
+            r = requests.post(url, json=payload, timeout=timeout)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError) as e:
+            return f"ERROR [LM Studio response parse]: {e}\nRaw: {r.text[:200]}"
+        except Exception as e:
+            return f"ERROR [LM Studio]: {e}"
 
-def build_asset_summary(asset_data: Dict[str, Any], signals: Dict[str, Any], 
-                       data_quality: int, settings: Dict[str, Any]) -> Dict[str, Any]:
-    """Build structured summary for one asset."""
-    price = asset_data.get("price", {})
-    min_dq = settings.get("min_data_quality_for_signal", 60)
-    buy_threshold = settings.get("buy_probability_threshold", 60)
-    sell_threshold = settings.get("sell_probability_threshold", 70)
-    
-    summary = {
-        "broker_symbol": asset_data.get("broker_symbol"),
-        "yahoo_symbol": asset_data.get("yahoo_symbol"),
-        "name": asset_data.get("name"),
-        "group": asset_data.get("group"),
-        "current_price": price.get("price"),
-        "currency": price.get("currency"),
-        "change_1d_pct": price.get("change_1d_pct"),
-        "change_5d_pct": price.get("change_5d_pct"),
-        "trend": price.get("trend_hint"),
-        "risk": price.get("risk_hint"),
-        "technical_score": signals.get("technical_score", 0),
-        "fundamental_score": signals.get("fundamental_score", 0),
-        "sentiment_score": signals.get("sentiment_score", 0),
-        "risk_score": signals.get("risk_score", 0),
-        "buy_probability": signals.get("buy_probability", 0),
-        "sell_probability": signals.get("sell_probability", 0),
-        "data_quality_score": data_quality,
-        "confidence_level": signals.get("confidence_level", "LOW"),
-        "status": "NO_SIGNAL"
-    }
-    
-    # Determine status
-    if data_quality < min_dq:
-        summary["status"] = "NO_SIGNAL_LOW_DATA_QUALITY"
-    elif price.get("error"):
-        summary["status"] = "DATA_ERROR"
-    elif summary["buy_probability"] >= buy_threshold:
-        summary["status"] = "BUY_CANDIDATE"
-    elif summary["sell_probability"] >= sell_threshold:
-        summary["status"] = "SELL_CANDIDATE"
-    elif summary["buy_probability"] >= 40:
-        summary["status"] = "WATCH_BUY"
-    elif summary["sell_probability"] >= 50:
-        summary["status"] = "WATCH_SELL"
     else:
-        summary["status"] = "HOLD"
-    
-    return summary
+        # Ollama native format
+        payload = {
+            "model": model,
+            "stream": False,
+            "messages": messages,
+            "options": {
+                "temperature": float(settings.get("temperature", 0.08)),
+                "num_ctx": int(settings.get("num_ctx", 16384)),
+            },
+        }
+
+        try:
+            r = requests.post(url, json=payload, timeout=timeout)
+            r.raise_for_status()
+            return r.json().get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return f"ERROR [Ollama]: {e}"
+
+
+def _asset_line(data: Dict[str, Any]) -> str:
+    """Compact 1-line for T212 positions with no signal/news."""
+    t212  = data.get("trading212") or {}
+    price = data.get("price") or {}
+    rec   = data.get("recommendation") or {}
+    sym   = data.get("broker_symbol", "?")
+    name  = data.get("name", "")
+    pnl   = t212.get("pnl")
+    pct   = t212.get("pnl_pct")
+    p     = price.get("price") or t212.get("current_price")
+    sign  = "+" if (pnl or 0) >= 0 else ""
+    label = (f"P&L={sign}{fmt(pnl)} ({sign}{pct:.1f}%)" if pnl is not None and pct is not None
+             else f"cena={fmt(p)}" if p else "")
+    verdict = rec.get("recommendation", "WATCH")
+    n     = f" — {name}" if name and name != sym else ""
+    return f"- {sym}{n}: {label} | {verdict}"
+
+
+def _append_asset_block(lines: list, data: Dict[str, Any],
+                        include_all_news: bool = True) -> None:
+    """Full block for assets with signal/news data — for AI prompt."""
+    ACTIONABLE = [
+        "earnings","revenue","profit","loss","guidance","forecast",
+        "acquisition","merger","deal","lawsuit","fine","penalty",
+        "upgrade","downgrade","price target","beat","miss",
+        "CEO","CFO","layoff","restructur","dividend","buyback",
+        "trump","tariff","sanction","ban","regulation","recall",
+    ]
+    sym   = data.get("broker_symbol", "?")
+    name  = data.get("name") or sym
+    price = data.get("price") or {}
+    sigs  = data.get("signals") or {}
+    rec   = data.get("recommendation") or {}
+    t212  = data.get("trading212")
+    news  = data.get("news") or []
+
+    hdr = f"## {sym}" + (f" — {name}" if name and name != sym else "")
+    lines.append(hdr)
+
+    p = price.get("price")
+    if p:
+        lines.append(
+            f"Cena: {fmt(p)} | 1D: {fmt(price.get('change_1d_pct'),2,'%')} | "
+            f"5D: {fmt(price.get('change_5d_pct'),2,'%')} | Trend: {price.get('trend_hint','?')}"
+        )
+
+    bp = sigs.get("buy_probability", 0)
+    sp = sigs.get("sell_probability", 0)
+    if bp or sp:
+        lines.append(f"Signál: BUY {bp}% | SELL {sp}% | Tech: {sigs.get('technical_score',0)} | "
+                     f"Sent: {sigs.get('sentiment_score',0)} | DQ: {data.get('data_quality',0)}")
+
+    if rec:
+        lines.append(f"Score: V{rec.get('score_value',0)} M{rec.get('score_momentum',0)} "
+                     f"S{rec.get('score_sentiment',0)} = {rec.get('total_score',0):+d} "
+                     f"| Python rec: {rec.get('recommendation','WATCH')} | DQ: {rec.get('data_quality','?')}")
+
+    if t212:
+        qty   = t212.get("quantity")
+        avg_p = t212.get("average_price")
+        pnl   = t212.get("pnl")
+        pct   = t212.get("pnl_pct")
+        live  = price.get("price") or t212.get("current_price") or 0
+        val   = (live * qty) if (live and qty) else t212.get("market_value")
+        sign  = "+" if (pnl or 0) >= 0 else ""
+        pct_s = f" ({sign}{pct:.1f}%)" if pct is not None else ""
+        lines.append(f"Pozícia: qty={fmt(qty,4)} | avg={fmt(avg_p)} | "
+                     f"val≈{fmt(val)} EUR | P&L={sign}{fmt(pnl)}{pct_s}")
+
+    filtered = [n for n in news if any(
+        kw in (n.get("title","") + n.get("snippet","")).lower() for kw in ACTIONABLE)]
+    to_show = news[:3] if include_all_news else filtered[:2]
+    if to_show:
+        lines.append("Správy:")
+        for n in to_show:
+            lines.append(f"  • [{n.get('sentiment','')}] {n.get('title','')}")
+    lines.append("")
 
 
 def build_prompt(collected_data: List[Dict[str, Any]], portfolio_rules: Dict[str, str],
-                 settings: Dict[str, Any]) -> str:
-    """Build analysis prompt for Ollama."""
-    lines = [
-        "You are a careful investment analyst. Use ONLY the structured data provided.",
-        "CRITICAL: Never override the calculated buy_probability or sell_probability.",
-        "CRITICAL: Never invent probabilities, prices, or earnings data.",
-        "If data quality is low, mark it as 'neoverené' (unverified).",
-        "Speak in Slovak.",
-        ""
+                 settings: Dict[str, Any] = None,
+                 trump_news_ctx: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Zostav prompt pre Plutus — štruktúrovaný vstup.
+    T212 holdings s udalosťou → plný blok.
+    T212 holdings bez udalosti → kompaktný 1-riadok.
+    Watchlist → len s BUY/SELL signálom.
+    """
+    settings = settings or {}
+    lines = []
+
+    if portfolio_rules:
+        lines.append("# Portfolio Rules")
+        for v in portfolio_rules.values():
+            lines.append(f"- {v}")
+        lines.append("")
+
+    ACTIONABLE = [
+        "earnings","revenue","profit","loss","guidance","forecast",
+        "acquisition","merger","deal","lawsuit","fine","penalty",
+        "upgrade","downgrade","price target","beat","miss",
+        "CEO","CFO","dividend","buyback","trump","tariff",
+        "sanction","ban","regulation",
     ]
-    
-    lines.append("# Portfolio Rules")
-    for k, v in portfolio_rules.items():
-        lines.append(f"- {v}")
-    
-    lines.append("\n# Assets Analysis\n")
 
-    # Keep the local model prompt small. Raw data stays in JSON.
-    ai_max_assets = int(settings.get("ai_max_assets", 12))
-    ranked_data = sorted(
-        collected_data,
-        key=lambda d: (
-            d.get("data_quality", 0),
-            abs(d.get("summary", {}).get("change_1d_pct") or 0),
-            d.get("summary", {}).get("sentiment_score", 0),
-            len(d.get("news", [])),
-        ),
-        reverse=True,
-    )[:ai_max_assets]
+    def has_data(d):
+        s = d.get("signals") or {}
+        n = d.get("news") or []
+        rec = d.get("recommendation") or {}
+        return (s.get("buy_probability", 0) >= 30
+                or s.get("sell_probability", 0) >= 30
+                or rec.get("recommendation") in ("BUY", "SELL")
+                or any(kw in (i.get("title","") + i.get("snippet","")).lower()
+                       for i in n for kw in ACTIONABLE))
 
-    for data in ranked_data:
-        broker_sym = data.get("broker_symbol", "?")
-        yahoo_sym = data.get("yahoo_symbol", "?")
-        name = data.get("name", "?")
-        
-        lines.append(f"## {broker_sym} ({name})")
-        lines.append(f"**Yahoo Symbol: {yahoo_sym}**\n")
-        
-        price = data.get("price", {})
-        if price.get("error"):
-            lines.append(f"⚠️ DATA ERROR: {price.get('error')}\n")
-            continue
-        
-        lines.append(f"- Price: {fmt(price.get('price'))} {price.get('currency', '')}")
-        lines.append(f"- 1D: {fmt(price.get('change_1d_pct'), 2, '%')} | 5D: {fmt(price.get('change_5d_pct'), 2, '%')}")
-        lines.append(f"- Trend: {price.get('trend_hint', 'N/A')}")
-        lines.append(f"- Risk: {price.get('risk_hint', 'N/A')}\n")
-        
-        signals = data.get("signals", {})
-        dq = data.get("data_quality", 0)
-        
-        lines.append(f"**Scores:**")
-        lines.append(f"- Technical: {signals.get('technical_score', 0)}/100")
-        lines.append(f"- Sentiment: {signals.get('sentiment_score', 0)}/100")
-        lines.append(f"- Risk: {signals.get('risk_score', 0)}/100")
-        lines.append(f"- Data Quality: {dq}/100")
-        lines.append(f"- **BUY Probability: {signals.get('buy_probability', 0)}%**")
-        lines.append(f"- **SELL Probability: {signals.get('sell_probability', 0)}%**\n")
-        
-        if signals.get("technical_signals"):
-            lines.append("Technical Signals:")
-            for sig in signals.get("technical_signals", []):
-                lines.append(f"  • {sig}")
-            lines.append("")
-        
-        # --- T212 actual holdings ---
-        t212 = data.get("trading212")
-        if t212:
-            qty     = t212.get("quantity")
-            avg_p   = t212.get("average_price")
-            curr_p  = t212.get("current_price")
-            pnl     = t212.get("pnl")
-            pnl_pct = t212.get("pnl_pct")
-            val     = t212.get("market_value") or ((curr_p * qty) if curr_p and qty else None)
-            lines.append("**Moja pozícia (Trading212):**")
-            if qty    is not None: lines.append(f"  \u2022 Qty      : {qty}")
-            if avg_p  is not None: lines.append(f"  \u2022 Avg cena : {avg_p:.4f}")
-            if curr_p is not None: lines.append(f"  \u2022 Aktuálna : {curr_p:.4f}")
-            if val    is not None: lines.append(f"  \u2022 Hodnota  : {val:.2f}")
-            if pnl    is not None:
-                sign    = "+" if pnl >= 0 else ""
-                pct_str = f" ({sign}{pnl_pct:.1f}%)" if pnl_pct is not None else ""
-                lines.append(f"  \u2022 P&L      : {sign}{pnl:.2f}{pct_str}")
-            lines.append("")
+    # 1. T212 holdings
+    t212_all = [d for d in collected_data
+                if d.get("trading212")
+                and (d.get("summary") or {}).get("label") != "T212_INTERNAL_TICKER"]
+    rich  = sorted([d for d in t212_all if has_data(d)],
+                   key=lambda d: abs((d.get("trading212") or {}).get("pnl") or 0), reverse=True)
+    quiet = sorted([d for d in t212_all if not has_data(d)],
+                   key=lambda d: abs((d.get("trading212") or {}).get("pnl") or 0), reverse=True)
 
-        if data.get("news"):
-            lines.append("Top News:")
-            for item in data.get("news", [])[:2]:
-                lines.append(f"  \u2022 {item.get('title', '')}")
-            lines.append("")
-    
-    lines.append("\n# Your Task")
-    lines.append("1. Analyze each asset based on the scores above.")
-    lines.append("2. DO NOT change any calculated probability.")
-    lines.append("3. Give a compact Slovak tidy-up: today\'s catalysts, long-run watch, short-run watch, risk review.")
-    lines.append("4. Do not create fake buy/sell candidates if Python score is low.")
-    lines.append("5. Mention concrete news/catalysts and invalidation levels when available.")
-    lines.append("6. Pre každú pozíciu kde mám reálne holdings (T212 sekcia): okomentuj P&L a či má zmysel držať, doložiť, alebo zvážiť výstup.")
-    lines.append("7. Ak je pozícia vo výraznej strate (pnl_pct < -15%), explicitne to zmieň a navrhni postup.")
-    
+    if rich:
+        lines.append("# T212 POZÍCIE — aktívne / so signálom (povinná analýza)")
+        lines.append("")
+        for d in rich:
+            _append_asset_block(lines, d, include_all_news=True)
+
+    if quiet:
+        lines.append("# T212 POZÍCIE — bez signálu (krátky verdikt stačí)")
+        for d in quiet:
+            lines.append(_asset_line(d))
+        lines.append("")
+
+    # 2. Watchlist — len BUY/SELL signál
+    non_hold = [d for d in collected_data
+                if not d.get("trading212")
+                and (d.get("summary") or {}).get("label") != "T212_INTERNAL_TICKER"
+                and d.get("data_quality", 0) >= 60
+                and (d.get("recommendation") or {}).get("recommendation") in ("BUY", "SELL")]
+    if non_hold:
+        lines.append("\n# WATCHLIST — BUY/SELL signál")
+        lines.append("")
+        for d in sorted(non_hold,
+                        key=lambda d: abs((d.get("recommendation") or {}).get("total_score", 0)),
+                        reverse=True):
+            _append_asset_block(lines, d, include_all_news=False)
+
+    # 3. Trump context
+    t_market    = (trump_news_ctx or {}).get("market_impact", [])
+    t_companies = (trump_news_ctx or {}).get("company_hits", {})
+    if t_market or t_companies:
+        lines.append("\n# Trump / Makro kontext")
+        for item in t_market[:4]:
+            lines.append(f"- {item.get('title','')} [{item.get('sentiment','')}]")
+        for sym, hits in list(t_companies.items())[:6]:
+            for h in hits[:1]:
+                lines.append(f"- [{sym}] {h.get('title','')} [{h.get('sentiment','')}]")
+        lines.append("")
+
+    lines.append("\n# ÚLOHA")
+    lines.append("Pre každú T212 pozíciu: verdikt BUY/SELL/WATCH + 1-2 konkrétne vety.")
+    lines.append("Watchlist BUY/SELL: potvrď alebo vyvrať Python signál.")
+    lines.append("Správy: len ZMENY s číslami. Žiadne generické sektorové komentáre.")
+
     return "\n".join(lines)
+
 
 
 def collect_global_news(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1371,6 +1844,76 @@ def collect_discovery_news(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
             })
 
     return out[:max_items]
+
+
+def build_asset_summary(asset_data: Dict[str, Any], signals: Dict[str, Any],
+                        data_quality: int, settings: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    Build a flat summary dict for an asset.
+    Used by generate_report for the scores table and per-asset sections.
+    """
+    settings   = settings or {}
+    price      = asset_data.get("price", {}) or {}
+    news       = asset_data.get("news",  []) or []
+    dq_str     = asset_data.get("dq_status") or dq_label(asset_data)
+
+    current_price  = price.get("price")
+    change_1d_pct  = price.get("change_1d_pct")
+    change_5d_pct  = price.get("change_5d_pct")
+    currency       = price.get("currency", "")
+    trend_hint     = price.get("trend_hint", "")
+    risk_level     = price.get("risk_level") or price.get("risk_hint_value")
+
+    # Risk levels for report
+    risk_levels = {}
+    if risk_level:
+        risk_levels["invalidation"] = f"long-run thesis review below ~{float(risk_level):.2f}"
+
+    # Sentiment aggregate
+    SMAP = {"POSITIVE": 1, "NEGATIVE": -1, "NEUTRAL": 0, "MIXED": 0}
+    vals = [SMAP.get((n.get("sentiment") or "NEUTRAL").upper(), 0) for n in news]
+    avg_sentiment = (sum(vals) / len(vals)) if vals else 0.0
+
+    # Status
+    buy_p  = signals.get("buy_probability", 0)
+    sell_p = signals.get("sell_probability", 0)
+    if buy_p >= int(settings.get("buy_probability_threshold", 60)):
+        status = "BUY_CANDIDATE"
+    elif sell_p >= int(settings.get("sell_probability_threshold", 70)):
+        status = "SELL_CANDIDATE"
+    elif data_quality < 40:
+        status = "LOW_DATA_QUALITY"
+    else:
+        status = "HOLD_OR_WAIT"
+
+    return {
+        # identity (duplicated from asset for convenience)
+        "broker_symbol":      asset_data.get("broker_symbol", "?"),
+        "name":               asset_data.get("name", ""),
+        "group":              asset_data.get("group", ""),
+        # price
+        "current_price":      current_price,
+        "change_1d_pct":      change_1d_pct,
+        "change_5d_pct":      change_5d_pct,
+        "currency":           currency,
+        "trend_hint":         trend_hint,
+        # signals
+        "technical_score":    signals.get("technical_score", 0),
+        "sentiment_score":    signals.get("sentiment_score", 0),
+        "buy_probability":    buy_p,
+        "sell_probability":   sell_p,
+        "avg_news_sentiment": round(avg_sentiment, 2),
+        # quality
+        "data_quality_score": data_quality,
+        "dq_status":          dq_str,
+        # risk
+        "risk_levels":        risk_levels,
+        "risk_level_value":   float(risk_level) if risk_level else None,
+        # status
+        "status":             status,
+        "action_label":       "",   # filled by action_label_for_asset later
+        "label":              status,
+    }
 
 
 def action_label_for_asset(data: Dict[str, Any]) -> str:
@@ -1449,52 +1992,227 @@ def format_news_items(items: List[Dict[str, Any]], limit: int = 3) -> List[str]:
 
 def generate_report(
     collected_data: List[Dict[str, Any]],
-    analysis: str,
+    analysis_text: str,
     settings: Dict[str, Any],
     global_news: Optional[List[Dict[str, Any]]] = None,
     discovery_news: Optional[List[Dict[str, Any]]] = None,
     broker_status: Optional[Dict[str, Any]] = None,
+    trump_news: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Generate final markdown report focused on actions, news, and risk."""
-    global_news = global_news or []
+    """
+    Generate final Markdown report.
+    Strict split: tradable assets with market data vs broker_only assets.
+    """
+    global_news    = global_news    or []
     discovery_news = discovery_news or []
-    broker_status = broker_status or {}
+    broker_status  = broker_status  or {}
+    trump_news     = trump_news     or {}
+    lines          = []
 
-    lines = [
-        "# Portfolio Analysis Report",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "Data Sources: yfinance, DuckDuckGo news search, optional TradingView public checks, optional Trading 212 read-only API",
-        "",
-        "## Broker Sync Status",
-    ]
+    # ----------------------------------------------------------------
+    # Split data
+    # ----------------------------------------------------------------
+    GOOD_DQ = ("OK", "PARTIAL", "SYMBOL_MISMATCH")
+    tradable     = [d for d in collected_data if d.get("dq_status") in GOOD_DQ]
+    broker_only  = [d for d in collected_data if d.get("dq_status") not in GOOD_DQ]
 
-    if broker_status:
-        ok = "OK" if broker_status.get("ok") else "FAILED/DISABLED"
-        lines.append(f"- Trading 212: **{ok}**")
-        if broker_status.get("endpoint_used"):
-            lines.append(f"- Endpoint used: `{broker_status.get('endpoint_used')}`")
+    buy_list   = [d for d in tradable if d.get("recommendation", {}).get("recommendation") == "BUY"]
+    sell_list  = [d for d in tradable if d.get("recommendation", {}).get("recommendation") == "SELL"]
+    watch_list = [d for d in tradable if d.get("recommendation", {}).get("recommendation") == "WATCH"]
+    buy_strict  = [d for d in tradable if d.get("summary", {}).get("status") == "BUY_CANDIDATE"]
+    sell_strict = [d for d in tradable if d.get("summary", {}).get("status") == "SELL_CANDIDATE"]
+
+    # ----------------------------------------------------------------
+    # Header
+    # ----------------------------------------------------------------
+    lines.append(f"# Portfolio Analysis Report")
+    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"Data Sources: yfinance, DuckDuckGo news search, optional TradingView public checks, "
+                 f"optional Trading 212 read-only API")
+    lines.append("")
+
+    # ----------------------------------------------------------------
+    # Broker Sync Status
+    # ----------------------------------------------------------------
+    lines.append("## Broker Sync Status")
+    t212_ok = broker_status.get("ok", False)
+    lines.append(f"- Trading 212: **{'OK' if t212_ok else 'FAILED'}**")
+    if t212_ok:
+        lines.append(f"- Endpoint used: `/api/v0/equity/portfolio`")
         lines.append(f"- Positions loaded: {broker_status.get('positions_count', 0)}")
-        if broker_status.get("error"):
-            lines.append(f"- Warning: {broker_status.get('error')}")
+        if broker_status.get("account_total"):
+            lines.append(f"- Celková hodnota účtu (T212 cash API): **{broker_status['account_total']:,.2f} EUR**")
+            lines.append(f"- P&L: {broker_status.get('account_pnl', 0):+,.2f} EUR | "
+                         f"Voľná hotovosť: {broker_status.get('cash_free', 0):,.2f} EUR")
     else:
-        lines.append("- Trading 212: not attempted / disabled")
+        lines.append(f"- Error: {broker_status.get('error', 'unknown')}")
     lines.append("")
 
-    # Summary statistics
-    total = len(collected_data)
-    buy_count = sum(1 for d in collected_data if d.get("summary", {}).get("status") == "BUY_CANDIDATE")
-    sell_count = sum(1 for d in collected_data if d.get("summary", {}).get("status") == "SELL_CANDIDATE")
-    low_dq = sum(1 for d in collected_data if d.get("data_quality", 100) < 60)
-
+    # ----------------------------------------------------------------
+    # Summary
+    # ----------------------------------------------------------------
     lines.append("## Summary")
-    lines.append(f"- Total assets monitored: {total}")
-    lines.append(f"- Strong BUY candidates by strict Python score: {buy_count}")
-    lines.append(f"- Strong SELL candidates by strict Python score: {sell_count}")
-    lines.append(f"- Low data quality assets: {low_dq}")
-    lines.append("- Note: low BUY count does not mean no opportunities; this score is intentionally conservative.")
+    lines.append(f"- Total broker positions loaded: {broker_status.get('positions_count', 0)}")
+    lines.append(f"- Assets analyzed with market data: **{len(tradable)}**")
+    lines.append(f"- Broker-only / low-data assets: {len(broker_only)}")
+    lines.append(f"- **BUY candidates (soft): {len(buy_list)}**")
+    lines.append(f"- **SELL candidates (soft): {len(sell_list)}**")
+    lines.append(f"- WATCH candidates: {len(watch_list)}")
+    lines.append(f"- Strong BUY (strict Python): {len(buy_strict)}")
+    lines.append(f"- Strong SELL (strict Python): {len(sell_strict)}")
+    lines.append("- Note: soft BUY/SELL = AI score-based; strict = Python probability threshold.")
     lines.append("")
 
-    # General market/news section
+    # ----------------------------------------------------------------
+    # Moje pozície (Trading212)
+    # ----------------------------------------------------------------
+    lines.append("## Moje pozície (Trading212)")
+    positions_shown = [d for d in tradable if d.get("trading212")]
+    broker_only_pos = [d for d in broker_only if d.get("trading212")]
+
+    if positions_shown:
+        total_value = 0.0; total_pnl = 0.0
+        lines.append("| Symbol | Názov | Qty | Avg cena | T212 cena | Yahoo cena | Hodnota | P&L | P&L % | Rec |")
+        lines.append("|--------|-------|-----|----------|-----------|------------|---------|-----|-------|-----|")
+        for d in sorted(positions_shown,
+                        key=lambda x: (x.get("trading212") or {}).get("current_price", 0)
+                                      * (x.get("trading212") or {}).get("quantity", 0),
+                        reverse=True):
+            t       = d.get("trading212") or {}
+            sym     = d.get("broker_symbol", "?")
+            dname   = (d.get("name") or sym)[:20]
+            qty     = t.get("quantity")
+            avg_p   = t.get("average_price")
+            t212_p  = t.get("current_price")
+            yahoo_p = (d.get("price") or {}).get("price")
+            live_p  = yahoo_p if yahoo_p else None
+            val     = (live_p * qty) if (live_p and qty) else None
+            pnl     = t.get("pnl")
+            pnl_pct = t.get("pnl_pct")
+            rec     = recommendation_label(d)
+            if val: total_value += val
+            if pnl: total_pnl  += pnl
+            lines.append(
+                f"| {sym} | {dname} | {fmt(qty,4)} | {fmt(avg_p)} "
+                f"| {fmt(t212_p)} | {fmt(yahoo_p) if yahoo_p else 'N/A'} "
+                f"| {fmt(val) if val else 'N/A'} | {fmt(pnl)} "
+                f"| {fmt(pnl_pct,1,'%')} | {rec} |"
+            )
+        lines.append("")
+        t212_total = broker_status.get("account_total", 0)
+        if t212_total > 0:
+            pnl_result = broker_status.get("account_pnl", 0)
+            lines.append(f"**Účet T212 (cash API):** Celková hodnota = **{t212_total:,.2f} EUR** | "
+                         f"P&L = **{pnl_result:+,.2f} EUR**")
+        else:
+            lines.append(f"**Spolu (Yahoo-resolveble):** Hodnota ≈ {total_value:,.2f} EUR | "
+                         f"P&L = {total_pnl:+,.2f} EUR")
+        if broker_only_pos:
+            lines.append(f"⚠️ {len(broker_only_pos)} ďalších T212 pozícií nemá Yahoo dáta "
+                         f"(T212 interné kódy — pozri sekciu Broker-only nižšie).")
+        lines.append("")
+
+    # ----------------------------------------------------------------
+    # Unresolved tickers / broker-only
+    # ----------------------------------------------------------------
+    if broker_only:
+        lines.append("## Unresolved tickers")
+        lines.append("| Symbol | Name | DQ | Reason |")
+        lines.append("|--------|------|----|--------|")
+        for d in broker_only:
+            sym = d.get("broker_symbol") or "?"
+            name = (d.get("name") or sym).replace("|", "/")
+            dq = d.get("data_quality") or d.get("data_quality_score") or 0
+            reason = data_quality_reason(d).replace("|", "/")
+            lines.append(f"| {sym} | {name} | {dq} | {reason} |")
+        lines.append("")
+
+    # ----------------------------------------------------------------
+    # Main Asset Scores Table (iba tradable)
+    # ----------------------------------------------------------------
+    lines.append("## Asset Scores Table")
+    lines.append("| Symbol | Name | Group | Price | 1D | Tech | Sent | Buy% | Sell% | DQ | Rec | Total |")
+    lines.append("|--------|------|-------|-------|----|------|------|------|-------|----|-----|-------|")
+    for d in tradable:
+        s   = d.get("summary") or {}
+        rec = d.get("recommendation") or {}
+        sym    = d.get("broker_symbol") or s.get("broker_symbol") or "?"
+        name   = (d.get("name") or s.get("name") or sym or "?").replace("|", "/")
+        grp    = (d.get("group") or "?").replace("T212_AUTO_DISCOVERED", "T212 HOLDING").replace("|", "/")
+        price  = fmt(s.get("current_price") or (d.get("price") or {}).get("price"), 2)
+        ch1d   = fmt(s.get("change_1d_pct") or (d.get("price") or {}).get("change_1d_pct"), 1, "%")
+        tech   = s.get("technical_score", 0)
+        sent   = s.get("sentiment_score", 0)
+        bp     = s.get("buy_probability", 0)
+        sp     = s.get("sell_probability", 0)
+        dq     = s.get("data_quality_score") or d.get("data_quality") or 0
+        label  = rec.get("recommendation") or s.get("action_label") or s.get("status") or "WATCH"
+        total  = rec.get("total_score", "")
+        lines.append(f"| {sym} | {name} | {grp} | {price} | {ch1d} | {tech} | {sent} | "
+                     f"{bp:.0f} | {sp:.0f} | {dq} | {label} | {total} |")
+    lines.append("")
+
+    # ----------------------------------------------------------------
+    # BUY / SELL / WATCH sections
+    # ----------------------------------------------------------------
+    if buy_list:
+        lines.append("## BUY Candidates")
+        for d in sorted(buy_list, key=lambda x: (x.get("recommendation") or {}).get("total_score", 0), reverse=True):
+            rec = d.get("recommendation") or {}
+            sym = d.get("broker_symbol", "?")
+            nm  = d.get("name", "") or sym
+            sv, sm, ss, tot = rec.get("score_value",0), rec.get("score_momentum",0), rec.get("score_sentiment",0), rec.get("total_score",0)
+            lines.append(f"- **{sym}** ({nm}) | Score: V{sv} M{sm} S{ss} = **{tot:+d}** | {rec.get('comment','')[:150]}")
+        lines.append("")
+
+    if sell_list:
+        lines.append("## SELL Candidates")
+        for d in sorted(sell_list, key=lambda x: (x.get("recommendation") or {}).get("total_score", 0)):
+            rec = d.get("recommendation") or {}
+            sym = d.get("broker_symbol", "?")
+            nm  = d.get("name", "") or sym
+            sv, sm, ss, tot = rec.get("score_value",0), rec.get("score_momentum",0), rec.get("score_sentiment",0), rec.get("total_score",0)
+            lines.append(f"- **{sym}** ({nm}) | Score: V{sv} M{sm} S{ss} = **{tot:+d}** | {rec.get('comment','')[:150]}")
+        lines.append("")
+
+    if watch_list:
+        lines.append("## WATCH — Top pozície vyžadujúce pozornosť")
+        t212_watch = [d for d in watch_list if d.get("trading212")]
+        show = sorted(t212_watch, key=lambda d: abs((d.get("recommendation") or {}).get("total_score", 0)), reverse=True)[:15]
+        for d in show:
+            rec = d.get("recommendation") or {}
+            sym = d.get("broker_symbol", "?")
+            nm  = d.get("name", "") or sym
+            lines.append(f"- **{sym}** ({nm}) | Score: {rec.get('total_score',0):+d} | {rec.get('comment','')[:120]}")
+        lines.append("")
+
+    # ----------------------------------------------------------------
+    # Broker-only / low-data assets
+    # ----------------------------------------------------------------
+    if broker_only:
+        lines.append("## Broker-only / Low-data Assets")
+        lines.append("Tieto symboly sú T212 interné kódy bez Yahoo Finance dát. "
+                     "Nemôžu byť hodnotené — slúžia len na evidenciu pozícií.")
+        lines.append("")
+        lines.append("| Symbol | Qty | Avg cena | T212 cena | P&L | P&L % | DQ Status |")
+        lines.append("|--------|-----|----------|-----------|-----|-------|-----------|")
+        for d in sorted(broker_only,
+                        key=lambda x: abs((x.get("trading212") or {}).get("pnl") or 0),
+                        reverse=True):
+            t   = d.get("trading212") or {}
+            sym = d.get("broker_symbol", "?")
+            qty = t.get("quantity"); avg = t.get("average_price")
+            cp  = t.get("current_price"); pnl = t.get("pnl"); pct = t.get("pnl_pct")
+            dqs = d.get("dq_status", "?")
+            sign = "+" if (pnl or 0) >= 0 else ""
+            pct_s = f"{sign}{pct:.1f}%" if pct is not None else "?"
+            lines.append(f"| {sym} | {fmt(qty,4)} | {fmt(avg)} | {fmt(cp)} | "
+                         f"{sign}{fmt(pnl)} | {pct_s} | {dqs} |")
+        lines.append("")
+
+    # ----------------------------------------------------------------
+    # Market radar / global news
+    # ----------------------------------------------------------------
     lines.append("## Dnešné všeobecné novinky / market radar")
     if global_news:
         lines.extend(format_news_items(global_news, limit=8))
@@ -1502,7 +2220,25 @@ def generate_report(
         lines.append("- No broad market news collected.")
     lines.append("")
 
-    # Discovery ideas
+    # Trump radar
+    t_market    = trump_news.get("market_impact", [])
+    t_companies = trump_news.get("company_hits", {})
+    if t_market or t_companies:
+        lines.append("## 🇺🇸 Trump Market Radar")
+        if t_market:
+            lines.append("### Všeobecný vplyv na trhy")
+            for item in t_market[:6]:
+                lines.append(f"- {item.get('title','')} ({item.get('source_domain','')}) "
+                             f"— sentiment: {item.get('sentiment','NEUTRAL')}")
+            lines.append("")
+        if t_companies:
+            lines.append("### Zmienky o firmách z portfólia")
+            for sym, hits in sorted(t_companies.items()):
+                for item in hits:
+                    lines.append(f"  - **{sym}**: {item.get('title','')} — sentiment: {item.get('sentiment','')}")
+            lines.append("")
+
+    # Discovery news
     lines.append("## Nové / externé watchlist nápady")
     lines.append("Tieto položky nie sú automatické odporúčania. Sú to iba katalyzátory na manuálne overenie.")
     if discovery_news:
@@ -1511,127 +2247,91 @@ def generate_report(
         lines.append("- No external discovery items collected.")
     lines.append("")
 
-    # Enrich each asset with action labels/levels
-    for d in collected_data:
-        d.setdefault("summary", {})
-        d["summary"]["action_label"] = action_label_for_asset(d)
-        d["summary"]["risk_levels"] = compute_stop_levels(d)
-
-    # Long-run/DCA watchlist
-    long_run = [
-        d for d in collected_data
-        if d.get("group") in {"LONG_RUN_DCA", "TECH_PIE"}
-        and d.get("data_quality", 0) >= 60
-    ]
-    long_run.sort(
-        key=lambda d: (
-            d.get("summary", {}).get("buy_probability", 0),
-            d.get("summary", {}).get("sentiment_score", 0),
-            d.get("data_quality", 0)
-        ),
-        reverse=True
-    )
-
-    lines.append("## LONG-RUN / DCA watchlist")
-    for d in long_run[:8]:
-        s = d.get("summary", {})
-        levels = s.get("risk_levels", {})
-        lines.append(
-            f"- **{s.get('broker_symbol')} / {s.get('name')}** — label: `{s.get('action_label')}`, "
-            f"BUY {s.get('buy_probability')}%, SELL {s.get('sell_probability')}%, "
-            f"Data QA {s.get('data_quality_score')}/100, "
-            f"invalidation: {levels.get('invalidation')}"
-        )
-    lines.append("")
-
-    # Short-term/intraday watchlist
-    short_term = [
-        d for d in collected_data
-        if d.get("data_quality", 0) >= 60 and (
-            d.get("group") == "SHORT_TERM_TRADING"
-            or abs(d.get("summary", {}).get("change_1d_pct") or 0) >= 4
-            or d.get("summary", {}).get("buy_probability", 0) >= 20
-        )
-    ]
-    short_term.sort(
-        key=lambda d: (
-            abs(d.get("summary", {}).get("change_1d_pct") or 0),
-            d.get("summary", {}).get("sentiment_score", 0),
-            d.get("summary", {}).get("buy_probability", 0),
-        ),
-        reverse=True
-    )
-
-    lines.append("## SHORT-RUN / intraday watchlist")
-    for d in short_term[:8]:
-        s = d.get("summary", {})
-        levels = s.get("risk_levels", {})
-        lines.append(
-            f"- **{s.get('broker_symbol')}** — 1D {fmt(s.get('change_1d_pct'), 1, '%')}, "
-            f"label: `{s.get('action_label')}`, stop/invalidation: {levels.get('stop_loss')}, "
-            f"take-profit watch: {levels.get('take_profit')}"
-        )
-    lines.append("")
-
-    # Asset scores table
-    lines.append("## Asset Scores Table")
-    lines.append("| Symbol | Name | Group | Price | 1D | Technical | Sentiment | Buy % | Sell % | Data QA | Label |")
-    lines.append("|--------|------|-------|-------|----|-----------|-----------|-------|--------|---------|-------|")
-
-    for d in collected_data:
-        s = d.get("summary", {})
-        symbol = s.get("broker_symbol", "?")
-        name = (s.get("name") or "?").replace("|", "/")
-        group = (s.get("group") or "?").replace("|", "/")
-        price = fmt(s.get("current_price"), 2)
-        change_1d = fmt(s.get("change_1d_pct"), 1, "%")
-        tech = s.get("technical_score", 0)
-        sentiment = s.get("sentiment_score", 0)
-        buy_prob = s.get("buy_probability", 0)
-        sell_prob = s.get("sell_probability", 0)
-        dq = s.get("data_quality_score", 0)
-        label = s.get("action_label", "")
-        lines.append(f"| {symbol} | {name} | {group} | {price} | {change_1d} | {tech} | {sentiment} | {buy_prob:.0f} | {sell_prob:.0f} | {dq} | {label} |")
-
-    lines.append("")
-
-    # Per-asset news
+    # ----------------------------------------------------------------
+    # Per-ticker news sections (iba tradable)
+    # ----------------------------------------------------------------
     lines.append("## Novinky podľa sledovaných aktív")
-    for d in collected_data:
-        s = d.get("summary", {})
-        news = d.get("news", [])
-        if not news:
+    for d in tradable:
+        s    = d.get("summary") or {}
+        news = d.get("news") or []
+        rec  = d.get("recommendation") or {}
+        if not news and not rec.get("recommendation"):
             continue
-        lines.append(f"### {s.get('broker_symbol')} — {s.get('name')}")
-        lines.extend(format_news_items(news, limit=3))
+        sym  = d.get("broker_symbol") or s.get("broker_symbol") or "?"
+        nm   = d.get("name") or s.get("name") or sym
+        lines.append(f"### {sym} — {nm}")
+        ai_rec = rec.get("recommendation", "")
+        if ai_rec:
+            emoji = {"BUY": "🟢", "SELL": "🔴", "WATCH": "🟡"}.get(ai_rec, "")
+            sv = rec.get("score_value", 0); sm = rec.get("score_momentum", 0)
+            ss = rec.get("score_sentiment", 0); tot = rec.get("total_score", 0)
+            lines.append(f"- **AI Recommendation: {emoji} {ai_rec}** "
+                         f"| Score: V{sv} M{sm} S{ss} = {tot:+d} | DQ: {rec.get('data_quality','?')}")
+            cmt = rec.get("comment", "")
+            if cmt:
+                lines.append(f"- AI Comment: {cmt}")
+        if news:
+            lines.extend(format_news_items(news, limit=3))
         levels = s.get("risk_levels", {})
-        lines.append(f"- Risk level: {levels.get('invalidation')}")
+        if levels.get("invalidation"):
+            lines.append(f"- Risk level: {levels.get('invalidation')}")
         lines.append("")
 
-    # AI Analysis
-    lines.append("## Qwen/Ollama tidy-up")
-    lines.append(analysis)
-    lines.append("")
-
-    # Data quality notes
-    lines.append("## Data Quality Notes")
-    low_quality_assets = [d for d in collected_data if d.get("data_quality", 100) < 60]
-    if low_quality_assets:
-        lines.append("⚠️ Low data quality assets (excluded from top candidates):")
-        for d in low_quality_assets:
-            s = d.get("summary", {})
-            tried = ", ".join(d.get("price", {}).get("symbols_tried", []) or d.get("symbol_candidates", []))
-            err = d.get("price", {}).get("error", "Low news coverage")
-            lines.append(f"- {s.get('broker_symbol')}: {s.get('data_quality_score')}/100 — {err}. Tried: {tried}")
+    # ----------------------------------------------------------------
+    # Ollama tidy-up (with ticker validation)
+    # ----------------------------------------------------------------
+    if analysis_text and analysis_text.strip():
+        lines.append("## Ollama tidy-up")
+        allowed = set(d.get("broker_symbol", "").upper() for d in tradable if d.get("broker_symbol"))
+        # Validate: check if model mentioned unknown tickers
+        import re
+        mentioned = set(re.findall(r"\b([A-Z]{1,6})\b", analysis_text))
+        unknown   = mentioned - allowed - {"BUY", "SELL", "WATCH", "EUR", "USD", "MA", "RSI",
+                                           "OK", "DQ", "T212", "ETF", "AI", "PE", "EPS",
+                                           "N", "A", "B", "C", "V", "M", "S"}
+        suspicious_unknown = [t for t in unknown if len(t) >= 2 and t not in {"THE", "AND", "FOR", "NOT"}]
+        # Flag obvious hallucination markers
+        hallucinated = [t for t in suspicious_unknown
+                        if t in {"AAPL", "GOOG", "MSFT", "AMZN", "META", "NFLX", "BIDU", "TSLA"}
+                        and t not in allowed]
+        if hallucinated:
+            lines.append(f"⚠️ Model tidy-up omitted due to validation failure.")
+            lines.append(f"Hallucinated tickers detected: {', '.join(sorted(hallucinated))}")
+            print(f"[WARNING] Ollama hallucinated tickers: {hallucinated} — output discarded")
+        else:
+            lines.append(analysis_text)
+        lines.append("")
     else:
+        lines.append("## Ollama tidy-up")
+        lines.append("(AI analysis not available or empty)")
+        lines.append("")
+
+    # ----------------------------------------------------------------
+    # Data Quality Notes
+    # ----------------------------------------------------------------
+    lines.append("## Data Quality Notes")
+    low_q = [d for d in collected_data if d.get("data_quality", 100) < 60
+             and d.get("dq_status") != "BROKER_ONLY"]
+    if low_q:
+        lines.append("⚠️ Low data quality assets (excluded from BUY/SELL scoring):")
+        for d in low_q:
+            s   = d.get("summary") or {}
+            sym = d.get("broker_symbol") or s.get("broker_symbol") or "UNKNOWN"
+            dq  = d.get("data_quality") or 0
+            dqs = d.get("dq_status", "PARTIAL")
+            err = (d.get("price") or {}).get("error", "No historical price data")
+            tried = (d.get("price") or {}).get("symbol_tried", sym)
+            lines.append(f"- {sym}: {dq}/100 ({dqs}) — {err}. Tried: {tried}")
+    if broker_only:
+        lines.append(f"- {len(broker_only)} T212 interné kódy (BROKER_ONLY) — "
+                     f"detaily v sekcii 'Broker-only / Low-data Assets' vyššie.")
+    if not low_q and not broker_only:
         lines.append("- No low data quality assets.")
+    lines.append("")
 
     return "\n".join(lines)
 
 
-# ============================================================================
-# OUTPUT & STORAGE
-# ============================================================================
 
 def save_report(markdown_text: str, json_data: Dict[str, Any], folder: str) -> Tuple[Path, Path]:
     """Save reports to markdown and JSON files."""
@@ -1766,6 +2466,29 @@ def main():
         broker_sync_status = sync.get("status", broker_sync_status)
         if broker_sync_status.get("ok"):
             print(f"[BROKER] Trading 212 positions loaded: {len(broker_positions['trading212'])}")
+
+            # Fetch authoritative EUR total from cash API
+            try:
+                import base64
+                _key    = env.get("trading212_api_key", "")
+                _secret = env.get("trading212_api_secret", "")
+                _creds  = base64.b64encode(f"{_key}:{_secret}".encode()).decode()
+                _base   = env.get("trading212_api_base", "https://live.trading212.com").rstrip("/")
+                _r = requests.get(
+                    f"{_base}/api/v0/equity/account/cash",
+                    headers={"Authorization": f"Basic {_creds}"},
+                    timeout=10
+                )
+                if _r.status_code == 200:
+                    _cash = _r.json()
+                    broker_sync_status["account_total"] = float(_cash.get("total", 0))
+                    broker_sync_status["account_pnl"]   = float(_cash.get("result", 0))
+                    broker_sync_status["cash_free"]      = float(_cash.get("free", 0))
+                    print(f"[BROKER] Účet: {_cash.get('total', 0):.2f} EUR | "
+                          f"P&L: {_cash.get('result', 0):+.2f} EUR | "
+                          f"Free cash: {_cash.get('free', 0):.2f} EUR")
+            except Exception as _e:
+                print(f"[BROKER] Cash API fetch failed: {_e}")
         else:
             print(f"[BROKER WARNING] Trading 212 sync failed: {broker_sync_status.get('error')}")
     else:
@@ -1780,6 +2503,7 @@ def main():
             print(f"[BROKER WARNING] Revolut manual import failed: {e}")
 
     assets = merge_broker_data(assets, broker_positions)
+    assets = auto_discover_unmatched_positions(assets, broker_positions, settings)
 
     # === STEP 4: CHECK OLLAMA ===
     print("[STEP 2] Checking Ollama availability...")
@@ -1825,73 +2549,135 @@ def main():
         print(f"  [{i}/{len(assets)}] {broker_sym}...", end=" ", flush=True)
         try:
             data = collect_asset_data(asset, settings)
-            signals = calculate_signals(data.get("price", {}), data.get("news", []), settings)
-            data_quality = calculate_data_quality(data)
-            
+            signals      = calculate_signals(data.get("price", {}), data.get("news", []), settings)
+            data_quality = calculate_data_quality(data)  # also sets data["dq_status"]
+            dq_str       = data.get("dq_status", "PARTIAL")
+
+            # T212 internal codes bez Yahoo dát — SKIP scoring pipeline
+            if (data.get("auto_discovered")
+                    and settings.get("skip_no_data_auto_discovered", True)
+                    and data_quality < 20
+                    and not data.get("price", {}).get("price")
+                    and dq_str in ("NO_PRICE_DATA", "BROKER_ONLY")):
+                data["signals"]     = signals
+                data["data_quality"] = data_quality
+                data["summary"]     = {"status": "NO_YAHOO_DATA", "label": "T212_INTERNAL_TICKER",
+                                       "reason": "T212 internal ticker — not listed on Yahoo Finance"}
+                data["recommendation"] = {
+                    "recommendation": "WATCH",
+                    "data_quality":   "BROKER_ONLY",
+                    "total_score":    0, "score_value": 0, "score_momentum": 0, "score_sentiment": 0,
+                    "comment":        "Žiadne cenové dáta (T212 interný kód). Nedokupovať.",
+                }
+                collected_data.append(data)
+                print("[SKIP — T212 internal ticker, no Yahoo data]")
+                continue
+
+            # Crypto/iné tickery kde yfinance vrátil čiastočné/žiadne dáta
+            has_price = bool(data.get("price", {}).get("price"))
+            if not has_price and dq_str == "NO_PRICE_DATA":
+                log_suffix = "[OK_WITH_WARNINGS — no yfinance price, treated as WATCH only]"
+            else:
+                log_suffix = "[OK]"
+
             summary = build_asset_summary(data, signals, data_quality, settings)
-            data["signals"] = signals
+            data["signals"]      = signals
             data["data_quality"] = data_quality
-            data["summary"] = summary
-            
+            data["summary"]      = summary
+            data["recommendation"] = calculate_recommendation(data, signals, settings)
+
             collected_data.append(data)
-            print("[OK]")
+            print(log_suffix)
         except Exception as e:
             print(f"[ERROR: {e}]")
-    
-    # === STEP 7: GENERATE REPORTS ===
-    print(f"\n[STEP 5] Collecting broad market/discovery news...")
-    global_news = collect_global_news(settings)
+
+    # === STEP 5: SCORES & RECOMMENDATIONS ===
+    buy_soft   = [d for d in collected_data if d.get("recommendation", {}).get("recommendation") == "BUY"]
+    sell_soft  = [d for d in collected_data if d.get("recommendation", {}).get("recommendation") == "SELL"]
+    watch_soft = [d for d in collected_data if d.get("recommendation", {}).get("recommendation") == "WATCH"]
+    low_dq     = [d for d in collected_data if d.get("dq_status") not in ("OK", "PARTIAL")]
+    print(f"\n[STEP 5] Scores & recommendations...")
+    print(f"  AI recommendations generated for {len(collected_data)} assets "
+          f"({len(low_dq)} low data quality skipped from BUY/SELL scoring).")
+    print(f"  BUY: {len(buy_soft)} | SELL: {len(sell_soft)} | WATCH: {len(watch_soft)}")
+
+    print(f"\n[STEP 6] Collecting broad market/discovery news...")
+    global_news    = collect_global_news(settings)
     discovery_news = collect_discovery_news(settings)
+    trump_news     = {}   # Trump radar — add collect_trump_news() call here to enable
     print(f"  Global news: {len(global_news)} | Discovery ideas: {len(discovery_news)}")
 
-    print(f"\n[STEP 6] Generating reports...")
+    print(f"\n[STEP 7] Generating reports...")
     
-    # Build JSON output
+    # Build JSON output — clean split: analyzed_assets vs broker_only_assets
+    GOOD_DQ = ("OK", "PARTIAL", "SYMBOL_MISMATCH")
+    tradable_json    = [d for d in collected_data if d.get("dq_status") in GOOD_DQ]
+    broker_only_json = [d for d in collected_data if d.get("dq_status") not in GOOD_DQ]
+
+    def _asset_to_json(data: Dict[str, Any]) -> Dict[str, Any]:
+        rec  = data.get("recommendation") or {}
+        s    = data.get("summary") or {}
+        pr   = data.get("price") or {}
+        t212 = data.get("trading212") or {}
+        return {
+            "ticker":             data.get("broker_symbol"),
+            "name":               data.get("name"),
+            "group":              data.get("group"),
+            "current_price":      pr.get("price"),
+            "t212_price":         t212.get("current_price"),
+            "change_1d_pct":      pr.get("change_1d_pct"),
+            "currency":           pr.get("currency"),
+            "data_quality":       rec.get("data_quality") or data.get("dq_status", "PARTIAL"),
+            "data_quality_num":   data.get("data_quality", 0),
+            "ai_recommendation":  rec.get("recommendation", "WATCH"),
+            "score_value":        rec.get("score_value", 0),
+            "score_momentum":     rec.get("score_momentum", 0),
+            "score_sentiment":    rec.get("score_sentiment", 0),
+            "total_score":        rec.get("total_score", 0),
+            "comment":            rec.get("comment", ""),
+            "buy_probability":    s.get("buy_probability", 0),
+            "sell_probability":   s.get("sell_probability", 0),
+            "technical_score":    s.get("technical_score", 0),
+            "avg_sentiment":      rec.get("avg_sentiment"),
+            "rsi":                rec.get("rsi"),
+            "news_count":         len(data.get("news", [])),
+            "news":               data.get("news", []),
+            "t212_position": {
+                "quantity":       t212.get("quantity"),
+                "average_price":  t212.get("average_price"),
+                "pnl":            t212.get("pnl"),
+                "pnl_pct":        t212.get("pnl_pct"),
+            } if t212 else None,
+        }
+
     json_output = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp":  datetime.now().isoformat(),
         "config": {
-            "model": get_working_model(settings) or settings.get("model"),
-            "min_data_quality": settings.get("min_data_quality_for_signal", 60),
+            "model":         get_working_model(settings) or settings.get("model"),
             "buy_threshold": settings.get("buy_probability_threshold", 60),
-            "sell_threshold": settings.get("sell_probability_threshold", 70)
+            "sell_threshold":settings.get("sell_probability_threshold", 70),
         },
         "summary": {
-            "total_assets": len(collected_data),
-            "buy_candidates": len([d for d in collected_data if d.get("summary", {}).get("status") == "BUY_CANDIDATE"]),
-            "sell_candidates": len([d for d in collected_data if d.get("summary", {}).get("status") == "SELL_CANDIDATE"]),
-            "low_data_quality": len([d for d in collected_data if d.get("data_quality", 100) < 60])
+            "broker_positions_loaded":  broker_sync_status.get("positions_count", 0),
+            "assets_analyzed":          len(tradable_json),
+            "broker_only_assets":       len(broker_only_json),
+            "buy_candidates_soft":      len([d for d in tradable_json if (d.get("recommendation") or {}).get("recommendation") == "BUY"]),
+            "sell_candidates_soft":     len([d for d in tradable_json if (d.get("recommendation") or {}).get("recommendation") == "SELL"]),
+            "watch_candidates":         len([d for d in tradable_json if (d.get("recommendation") or {}).get("recommendation") == "WATCH"]),
+            "buy_candidates_strict":    len([d for d in tradable_json if (d.get("summary") or {}).get("status") == "BUY_CANDIDATE"]),
+            "sell_candidates_strict":   len([d for d in tradable_json if (d.get("summary") or {}).get("status") == "SELL_CANDIDATE"]),
         },
+        "buy_candidates":   [_asset_to_json(d) for d in tradable_json if (d.get("recommendation") or {}).get("recommendation") == "BUY"],
+        "sell_candidates":  [_asset_to_json(d) for d in tradable_json if (d.get("recommendation") or {}).get("recommendation") == "SELL"],
+        "watch_candidates": [_asset_to_json(d) for d in tradable_json if (d.get("recommendation") or {}).get("recommendation") == "WATCH"],
+        "analyzed_assets":  [_asset_to_json(d) for d in tradable_json],
+        "broker_only_assets":[_asset_to_json(d) for d in broker_only_json],
+        "data_quality_notes": [],
         "broker_sync_status": broker_sync_status,
-        "global_news": global_news,
-        "discovery_news": discovery_news,
-        "assets": []
+        "assets": [_asset_to_json(d) for d in collected_data],  # backwards compat
     }
-    
-    for data in collected_data:
-        asset_json = {
-            "broker_symbol": data.get("broker_symbol"),
-            "yahoo_symbol": data.get("yahoo_symbol"),
-            "name": data.get("name"),
-            "group": data.get("group"),
-            "summary": data.get("summary", {}),
-            "price_data": {k: v for k, v in data.get("price", {}).items() if k != "error"},
-            "news_count": len(data.get("news", [])),
-            "news": data.get("news", []),
-            "web": data.get("web", []),
-            "news_excluded": data.get("news_excluded", []),
-            "web_excluded": data.get("web_excluded", []),
-            "tradingview": data.get("tradingview"),
-            "symbol_candidates": data.get("symbol_candidates", []),
-            "signals": data.get("signals", {})
-        }
-        
-        if args.debug:
-            asset_json["price_error"] = data.get("price", {}).get("error")
-            asset_json["top_news"] = [{"title": n.get("title"), "domain": n.get("source_domain")} 
-                                      for n in data.get("news", [])[:2]]
-        
-        json_output["assets"].append(asset_json)
-    
+
+
     # Build markdown report (without AI analysis if not using AI)
     if args.no_ai:
         analysis_text = "[AI analysis disabled]\n\nScores are calculated deterministically."
@@ -1900,11 +2686,13 @@ def main():
         prompt = build_prompt(collected_data, portfolio_rules, settings)
         analysis_text = ask_ollama(prompt, settings)
     
-    markdown_report = generate_report(collected_data, analysis_text, settings, global_news, discovery_news, broker_sync_status)
+    markdown_report = generate_report(collected_data, analysis_text, settings,
+                                       global_news, discovery_news, broker_sync_status,
+                                       trump_news)
     
     # === STEP 8: SAVE FILES ===
     if not args.dry_run:
-        print(f"\n[STEP 6] Saving reports...")
+        print(f"\n[STEP 8] Saving reports...")
         output_folder = settings.get("output_folder", "reports")
         md_path, json_path = save_report(markdown_report, json_output, output_folder)
         
@@ -1916,9 +2704,15 @@ def main():
     # === SUMMARY ===
     print("\n" + "=" * 70)
     print("[ANALYSIS COMPLETE]")
-    print(f"Buy candidates: {json_output['summary']['buy_candidates']}")
-    print(f"Sell candidates: {json_output['summary']['sell_candidates']}")
-    print(f"Low data quality: {json_output['summary']['low_data_quality']}")
+    smry = json_output.get("summary", {})
+    print(f"Broker positions loaded:        {smry.get('broker_positions_loaded', 0)}")
+    print(f"Assets analyzed (market data):  {smry.get('assets_analyzed', 0)}")
+    print(f"Broker-only / low-data:         {smry.get('broker_only_assets', 0)}")
+    print(f"BUY candidates (soft):          {smry.get('buy_candidates_soft', 0)}")
+    print(f"SELL candidates (soft):         {smry.get('sell_candidates_soft', 0)}")
+    print(f"WATCH candidates:               {smry.get('watch_candidates', 0)}")
+    print(f"Strong BUY (strict Python):     {smry.get('buy_candidates_strict', 0)}")
+    print(f"Strong SELL (strict Python):    {smry.get('sell_candidates_strict', 0)}")
     print("=" * 70 + "\n")
 
 
