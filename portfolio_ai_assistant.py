@@ -18,45 +18,134 @@ Key features:
 - Machine-readable JSON + human-readable Markdown output
 """
 
+# --------------------------------------------------------------------
+# Imports
+# --------------------------------------------------------------------
+
 import argparse
 import json
+import logging
 import math
+import os
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import numpy as np
 import requests
-import os
 import yfinance as yf
 
-# --- POISTKA PRE SUI A TAO (Napodobnenie prehliadača pre Yahoo Finance) ---
+# python-dotenv is optional — graceful fallback if not installed
+try:
+    from dotenv import load_dotenv  # type: ignore
+    _HAS_DOTENV = True
+except ImportError:  # pragma: no cover
+    load_dotenv = None  # type: ignore
+    _HAS_DOTENV = False
+
+# --------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+latest_log = LOG_DIR / "latest_run.log"
+
+logger = logging.getLogger("PortfolioAI")
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+latest_handler = logging.FileHandler(latest_log, encoding="utf-8")
+latest_handler.setFormatter(formatter)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+
+logger.addHandler(latest_handler)
+logger.addHandler(console_handler)
+
+logger.info("=" * 70)
+logger.info("Portfolio AI Assistant started")
+logger.info("Working directory: %s", Path.cwd())
+logger.info("Python version: %s", sys.version.split()[0])
+logger.info("=" * 70)
+
+# --------------------------------------------------------------------
+# HTTP Session for yfinance (browser-like headers)
+# --------------------------------------------------------------------
+
 session = requests.Session()
-session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
-yf.set_tz_cache_location("data/cache") # voliteľné, pre stabilizáciu cache
-# Vynútenie session pre všetky požiadavky yfinance
-try:
-    import requests_cache
-except ImportError:
-    requests_cache = None
-# Ak nepoužívaš requests_cache, stačí povedať yfinance aby globálne používal túto session:
-yf.utils.get_http_session = lambda: session
-# -------------------------------------------------------------------------
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+})
+yf.set_tz_cache_location("data/cache")  # optional, for cache stability
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
+# DuckDuckGo search - single import attempt
 try:
     from ddgs import DDGS
 except ImportError:
     try:
-        # fallback for older environments still using the renamed package
         from duckduckgo_search import DDGS
     except ImportError:
         DDGS = None
+
+
+def ddg_search(query: str, max_results: int = 5, news: bool = False) -> List[Dict[str, Any]]:
+    """Search DuckDuckGo for news or general results.
+    
+    Args:
+        query: Search query
+        max_results: Maximum number of results
+        news: If True, search news; otherwise general web
+        
+    Returns:
+        List of result dictionaries with keys: title, url, snippet, date
+    """
+    if not DDGS:
+        return []
+    try:
+        results = []
+        ddgs = DDGS()
+        if news:
+            gen = ddgs.news(query, max_results=max_results, region='us', safesearch='moderate')
+        else:
+            gen = ddgs.text(query, max_results=max_results, region='us', safesearch='moderate')
+        
+        for r in gen:
+            # Handle different return formats from DDGS library
+            if isinstance(r, dict):
+                # Normalize keys
+                result = {
+                    'title': r.get('title') or r.get('headline') or '',
+                    'url': r.get('url') or r.get('link') or '',
+                    'snippet': r.get('body') or r.get('snippet') or r.get('description') or '',
+                    'date': r.get('date') or r.get('published') or '',
+                }
+                if result['title'] and result['url']:
+                    results.append(result)
+            elif isinstance(r, (list, tuple)) and len(r) >= 2:
+                # Handle tuple/list format (title, url, ...)
+                results.append({
+                    'title': str(r[0]),
+                    'url': str(r[1]),
+                    'snippet': str(r[2]) if len(r) > 2 else '',
+                    'date': '',
+                })
+        return results
+    except Exception as e:
+        # DDGS library has known issues with unpacking, but often returns partial results
+        # Only log at debug level to avoid noise
+        logger.debug(f"ddg_search partial failure: {e}")
+        return results if 'results' in locals() and results else []
 
 
 # ============================================================================
@@ -67,6 +156,111 @@ def load_config(path: str = "portfolio_config.json") -> Dict[str, Any]:
     """Load and validate portfolio configuration."""
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     return config
+
+
+
+
+# --------------------------------------------------------------------
+# Data Collection
+# --------------------------------------------------------------------
+
+# Simple in-memory cache for yfinance ticker data
+_yf_cache = {}
+
+def collect_asset_data(asset: Dict[str, Any], settings: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Retrieve price, basic info, technical indicators, and news for an asset.
+    Returns a dict with keys: price (dict with current, MA, RSI), market_cap, volume, news, info.
+    Missing values are None.
+    """
+    settings = settings or {}
+    symbol = asset.get("yahoo_symbol") or asset.get("broker_symbol")
+    if not symbol:
+        return {}
+
+    try:
+        # Use cached ticker data if available
+        cache_key = symbol.upper()
+        if cache_key in _yf_cache:
+            cached = _yf_cache[cache_key]
+            ticker = cached['ticker']
+            info = cached['info']
+            hist = cached['hist']
+        else:
+            ticker = yf.Ticker(symbol)
+            info = ticker.info
+            hist_period = settings.get("days_price_history", "3mo")
+            hist = ticker.history(period=hist_period, interval="1d")
+            _yf_cache[cache_key] = {'ticker': ticker, 'info': info, 'hist': hist}
+        info = ticker.info
+
+        # Current price
+        price = info.get('regularMarketPrice')
+        market_cap = info.get('marketCap')
+        volume = info.get('volume')
+
+        # Historical data for technical indicators
+        hist_period = settings.get("days_price_history", "3mo")
+        hist = ticker.history(period=hist_period, interval="1d")
+        technicals = {}
+        if not hist.empty:
+            close = hist['Close']
+            technicals['change_1d_pct'] = ((close.iloc[-1] / close.iloc[-2]) - 1) * 100 if len(close) > 1 else None
+            technicals['change_5d_pct'] = ((close.iloc[-1] / close.iloc[-6]) - 1) * 100 if len(close) > 5 else None
+
+            # Moving averages
+            technicals['ma20'] = close.rolling(20).mean().iloc[-1] if len(close) >= 20 else None
+            technicals['ma50'] = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
+            technicals['ma200'] = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else None
+
+            # RSI (14)
+            delta = close.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss.replace(0, np.nan)
+            technicals['rsi'] = (100 - (100 / (1 + rs))).iloc[-1] if len(close) >= 14 else None
+
+            # Trend hint
+            if technicals.get('ma20') and technicals.get('ma50'):
+                technicals['trend_hint'] = "UP" if technicals['ma20'] > technicals['ma50'] else "DOWN"
+            else:
+                technicals['trend_hint'] = "NEUTRAL"
+
+            # Currency
+            technicals['currency'] = info.get('currency', 'USD')
+
+        # Return price as dict for compatibility with existing code
+        price_dict = {
+            'price': price,
+            'change_1d_pct': technicals.get('change_1d_pct'),
+            'change_5d_pct': technicals.get('change_5d_pct'),
+            'currency': technicals.get('currency', 'USD'),
+            'trend_hint': technicals.get('trend_hint'),
+            'ma20': technicals.get('ma20'),
+            'ma50': technicals.get('ma50'),
+            'ma200': technicals.get('ma200'),
+            'rsi': technicals.get('rsi'),
+        }
+        
+        # Collect per-ticker news (2-5 items, last 48h)
+        aliases = asset.get("aliases", []) + [asset.get("name", ""), symbol]
+        ticker_news = collect_ticker_news(
+            symbol, 
+            aliases=aliases, 
+            max_items=int(settings.get("max_news_per_asset", 5)),
+            max_age_hours=int(settings.get("max_news_age_hours", 48))
+        )
+        
+        return {
+            'price': price_dict,
+            'market_cap': market_cap,
+            'volume': volume,
+            'info': info,
+            'technicals': technicals,
+            'news': ticker_news
+        }
+    except Exception as e:
+        logger.warning(f"collect_asset_data failed for {symbol}: {e}")
+        return {}
 
 
 
@@ -109,8 +303,11 @@ def load_environment_variables():
             # api.env should override stale shell variables for this project.
             if key:
                 os.environ[key] = value
-    elif load_dotenv:
-        load_dotenv(override=True)
+    elif _HAS_DOTENV and load_dotenv:
+        try:
+            load_dotenv(override=True)
+        except Exception:
+            pass
 
     return {
         "trading212_enabled": env_bool(os.getenv("TRADING212_ENABLED"), False),
@@ -352,7 +549,7 @@ def fetch_tradingview_technical_data(symbol: str):
         return {"source": "TradingView", "symbol": symbol, "url": url, "trust_level": "LOW", "error": str(e)}
 
 
-def auto_discover_unmatched_positions(assets, broker_positions, settings):
+def auto_discover_unmatched_positions(assets, broker_positions, settings, symbol_aliases=None):
     """
     Pre T212 pozície ktoré sa NEPODARILO spárovať so žiadnym assetom v configu
     (napr. nový nákup, ktorý si ešte nepridal do portfolio_config.json),
@@ -364,6 +561,8 @@ def auto_discover_unmatched_positions(assets, broker_positions, settings):
     if not settings.get("auto_discover_t212_positions", True):
         return assets
 
+    symbol_aliases = symbol_aliases or {}
+    
     matched_clean = set()
     for asset in assets:
         if asset.get("trading212"):
@@ -389,7 +588,7 @@ def auto_discover_unmatched_positions(assets, broker_positions, settings):
 
         discovered.append({
             "broker_symbol":      clean,
-            "yahoo_symbol":       settings.get("symbol_aliases", {}).get(clean, clean),
+            "yahoo_symbol":       symbol_aliases.get(clean, clean),
             "tradingview_symbol": None,
             "name":               clean,
             "group":              "T212_AUTO_DISCOVERED",
@@ -414,22 +613,36 @@ def merge_broker_data(assets, broker_positions):
     """Merge broker position data with portfolio assets."""
     enhanced_assets = []
     
+    # Build lookup maps for T212 positions
+    t212_by_clean = {}
+    t212_by_raw = {}
+    for pos in broker_positions.get("trading212", []):
+        clean = (pos.get("broker_symbol_clean") or "")
+        raw = (pos.get("broker_symbol") or "")
+        if clean:
+            t212_by_clean[clean.upper()] = pos
+        if raw:
+            t212_by_raw[raw.upper()] = pos
+    
     for asset in assets:
-        broker_symbol = asset.get("broker_symbol", "").upper()
+        broker_symbol = (asset.get("broker_symbol", "") or "").upper()
         enhanced = asset.copy()
         
-        for pos in broker_positions.get("trading212", []):
-            clean = (pos.get("broker_symbol_clean") or pos.get("broker_symbol", "")).upper()
-            raw   = (pos.get("broker_symbol") or "").upper()
-            # 1) exact match on normalized ticker (WDC == WDC, from WDC_US_EQ)
-            # 2) exact match on raw ticker (legacy / crypto pairs without suffix)
-            # 3) prefix match as last resort (handles edge-case suffix variants)
-            if clean == broker_symbol or raw == broker_symbol or raw.startswith(broker_symbol + "_"):
-                enhanced["trading212"] = pos
-                break
+        # Try exact match on normalized ticker first
+        if broker_symbol in t212_by_clean:
+            enhanced["trading212"] = t212_by_clean[broker_symbol]
+        elif broker_symbol in t212_by_raw:
+            enhanced["trading212"] = t212_by_raw[broker_symbol]
+        else:
+            # Try prefix match for edge cases
+            for raw_sym, pos in t212_by_raw.items():
+                if raw_sym.startswith(broker_symbol + "_"):
+                    enhanced["trading212"] = pos
+                    break
         
+        # Revolut
         for pos in broker_positions.get("revolut", []):
-            if pos.get("broker_symbol", "").upper() == broker_symbol:
+            if (pos.get("broker_symbol", "") or "").upper() == broker_symbol:
                 enhanced["revolut"] = pos
                 break
         
@@ -582,1033 +795,169 @@ def resolve_yahoo_symbol(asset: Dict[str, Any], settings: Dict[str, Any]) -> str
 # OLLAMA/MODEL MANAGEMENT
 # ============================================================================
 
-def _detect_backend(settings: Dict[str, Any]) -> str:
+def _call_provider(base_url: str, provider: str, model: str,
+                   messages: list, temperature: float,
+                   num_ctx: int, max_tokens: int, timeout: int) -> str:
+    if provider == "lmstudio":
+        payload = {"model": model, "messages": messages, "temperature": temperature,
+                   "max_tokens": max_tokens or num_ctx, "stream": False}
+        r = requests.post(base_url.rstrip("/") + "/chat/completions", json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    else:
+        payload = {"model": model, "stream": False, "messages": messages,
+                   "options": {"temperature": temperature, "num_ctx": num_ctx}}
+        r = requests.post(base_url.rstrip("/") + "/api/chat", json=payload, timeout=timeout)
+        r.raise_for_status()
+        return r.json().get("message", {}).get("content", "").strip()
+
+
+def _probe_backend(base_url: str, provider: str, timeout: int = 5) -> bool:
+    try:
+        ep = "/models" if provider == "lmstudio" else "/api/tags"
+        return requests.get(base_url.rstrip("/") + ep, timeout=timeout).status_code == 200
+    except Exception:
+        return False
+
+
+def _get_backend_models(base_url: str, provider: str) -> List[str]:
+    try:
+        ep = "/models" if provider == "lmstudio" else "/api/tags"
+        r = requests.get(base_url.rstrip("/") + ep, timeout=8); r.raise_for_status()
+        if provider == "lmstudio": return [m.get("id","") for m in r.json().get("data",[])]
+        return [m.get("name","") for m in r.json().get("models",[])]
+    except Exception:
+        return []
+
+
+def call_stage(stage: str, system_prompt: str, user_prompt: str,
+               settings: Dict[str, Any]) -> str:
+    """Route prompt to correct backend for the given stage.
+    ai_backends config: alpha / summary / fallback
+    Each entry: {provider, base_url, model, timeout, num_ctx, temperature, enabled}
     """
-    Zistí aktívny AI backend.
-    Priorita: lm_studio_base_url (ak je nastavená a dostupná) → Ollama
-    Vracia: 'lmstudio' alebo 'ollama'
-    """
-    lms_url = (settings.get("lm_studio_base_url") or "").strip()
-    if lms_url:
+    backends = settings.get("ai_backends", {})
+    candidates = []
+    for key in (stage, "fallback"):
+        cfg = backends.get(key, {})
+        if cfg and cfg.get("enabled", True): candidates.append(cfg)
+    
+    if not candidates:
+        return f"ERROR: No enabled backends configured for stage '{stage}' or fallback."
+
+    messages = [{"role":"system","content":system_prompt},{"role":"user","content":user_prompt}]
+
+    for cfg in candidates:
+        base_url = cfg.get("base_url",""); provider = cfg.get("provider","ollama")
+        model = cfg.get("model",""); timeout = int(cfg.get("timeout",3600))
+        num_ctx = int(cfg.get("num_ctx",8192)); temp = float(cfg.get("temperature",0.08))
+        max_tok = int(cfg.get("max_tokens", num_ctx // 2))
+        if not base_url or not model: continue
+        if not _probe_backend(base_url, provider):
+            print(f"  [AI] {provider.upper()} {base_url} unreachable — next"); continue
+        print(f"  [AI] {stage.upper()} -> {provider.upper()} | {model[:40]} | ctx={num_ctx}")
         try:
-            r = requests.get(f"{lms_url.rstrip('/')}/models", timeout=4)
-            if r.status_code == 200:
-                return "lmstudio"
-        except Exception:
-            pass
-    return "ollama"
+            return _call_provider(base_url, provider, model, messages, temp, num_ctx, max_tok, timeout)
+        except Exception as e:
+            print(f"  [AI] {stage} error ({e}) — next backend")
+    return f"ERROR: All backends failed for stage '{stage}'."
 
 
 def build_ollama_url(settings: Dict[str, Any], endpoint: str = "chat") -> str:
-    """
-    Build full API URL — podporuje Ollama aj LM Studio.
-    LM Studio: /v1/chat/completions, /v1/models
-    Ollama:    /api/chat,            /api/tags
-    """
-    backend = _detect_backend(settings)
-
-    if backend == "lmstudio":
-        base = settings.get("lm_studio_base_url", "http://localhost:1234/v1").rstrip("/")
-        if endpoint == "chat":   return base + "/chat/completions"
-        if endpoint == "tags":   return base + "/models"
-        return base + "/" + endpoint.lstrip("/")
-    else:
-        base = (settings.get("ollama_base_url") or settings.get("ollama_url")
-                or "http://127.0.0.1:11434").rstrip("/")
-        ep = ("/api/chat" if endpoint == "chat" else
-              "/api/tags" if endpoint == "tags" else endpoint)
-        if not ep.startswith("/"): ep = "/" + ep
-        return base + ep
+    lms = settings.get("lm_studio_base_url","").strip()
+    if lms: return lms.rstrip("/") + ("/chat/completions" if endpoint=="chat" else "/models")
+    base = settings.get("ollama_base_url","http://127.0.0.1:11434").rstrip("/")
+    return base + ("/api/chat" if endpoint=="chat" else "/api/tags")
 
 
-def list_ollama_models(settings: Dict[str, Any]) -> Optional[List[str]]:
-    """Vráti dostupné modely (Ollama alebo LM Studio)."""
-    try:
-        backend = _detect_backend(settings)
-        url = build_ollama_url(settings, "tags")
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if backend == "lmstudio":
-            # LM Studio OpenAI format: {"data": [{"id": "model-name"}, ...]}
-            return sorted(m.get("id", "") for m in data.get("data", []))
-        else:
-            return sorted(m.get("name", "") for m in data.get("models", []))
-    except Exception:
-        return None
+def _detect_backend(settings: Dict[str, Any]) -> str:
+    lms = settings.get("lm_studio_base_url","").strip()
+    return "lmstudio" if lms and _probe_backend(lms,"lmstudio") else "ollama"
 
 
-def validate_model_available(settings: Dict[str, Any], model_name: str) -> bool:
-    models = list_ollama_models(settings)
-    if models is None:
-        return False
-    return any(model_name in m for m in models)
-
-
-def check_ollama_available(settings: Dict[str, Any]) -> Tuple[bool, str]:
-    """Skontroluje dostupnosť AI backendu (Ollama alebo LM Studio)."""
-    try:
-        backend = _detect_backend(settings)
-        url = build_ollama_url(settings, "tags")
-        r = requests.get(url, timeout=5)
-        r.raise_for_status()
-        return True, f"{backend.upper()} reachable at {url}"
-    except requests.ConnectionError as e:
-        return False, f"Cannot connect: {e}"
-    except Exception as e:
-        return False, f"Check failed: {e}"
-
-
-def get_working_model(settings: Dict[str, Any]) -> Optional[str]:
-    """Nájde funkčný model (primárny → fallback → prvý dostupný)."""
-    primary  = settings.get("model")
-    fallback = settings.get("fallback_model")
-
-    if primary and validate_model_available(settings, primary):
-        return primary
-    if fallback and validate_model_available(settings, fallback):
-        return fallback
-    models = list_ollama_models(settings)
-    if models:
-        return models[0]
+def list_lmstudio_models(settings: Dict[str, Any]) -> Optional[List[str]]:
+    lms = settings.get("lm_studio_base_url","").strip()
+    if lms and _probe_backend(lms, "lmstudio"):
+        return _get_backend_models(lms, "lmstudio")
     return None
 
 
+def check_lmstudio_available(settings: Dict[str, Any]) -> Tuple[bool, str]:
+    lms = settings.get("lm_studio_base_url","").strip()
+    if not lms:
+        return False, "LM Studio base URL not configured"
+    if _probe_backend(lms, "lmstudio"):
+        return True, f"LM Studio OK at {lms}"
+    return False, f"LM Studio unreachable at {lms}"
+
+
+def get_working_model(settings: Dict[str, Any]) -> Optional[str]:
+    for k in ("model","fallback_model"):
+        m = settings.get(k,"")
+        if m and validate_model_available(settings, m): return m
+    models = list_lmstudio_models(settings)
+    return models[0] if models else None
+
+
+def check_ollama_available(settings: Dict[str, Any]) -> Tuple[bool, str]:
+    # Kept for backward compatibility
+    return check_lmstudio_available(settings)
+
+
+def list_ollama_models(settings: Dict[str, Any]) -> Optional[List[str]]:
+    # Kept for backward compatibility
+    return list_lmstudio_models(settings)
+
+
+def validate_model_available(settings: Dict[str, Any], model_name: str) -> bool:
+    return any(model_name in m for m in (list_ollama_models(settings) or []))
+
+
+def check_ollama_available(settings: Dict[str, Any]) -> Tuple[bool, str]:
+    p = _detect_backend(settings)
+    base = settings.get("lm_studio_base_url") if p=="lmstudio" else settings.get("ollama_base_url","http://127.0.0.1:11434")
+    if _probe_backend(base or "", p): return True, f"{p.upper()} OK at {base}"
+    return False, f"{p.upper()} unreachable at {base}"
+
+
+def get_working_model(settings: Dict[str, Any]) -> Optional[str]:
+    for k in ("model","fallback_model"):
+        m = settings.get(k,"")
+        if m and validate_model_available(settings, m): return m
+    models = list_ollama_models(settings)
+    return models[0] if models else None
+
+
+_SYSTEM_ALPHA = (
+    "You are the Chief Investment Officer. Think in English, respond in Slovak.\n"
+    "Make clear portfolio decisions based ONLY on the provided data.\n"
+    "For EVERY holding: one verdict — DOKUPOVAT / DRZAT / ZVAZUJ PREDAJ / PREDAJ.\n"
+    "For Pie holdings: recommend allocation % changes or stock substitutions.\n"
+    "NEWS: only concrete CHANGES with numbers. Skip generic sector commentary.\n"
+    "Never fabricate prices, earnings, ratings, or events not in the data.\n"
+    "Missing data → write 'neoverene'. Be direct and actionable."
+)
+
+_SYSTEM_SUMMARY = (
+    "You are a portfolio briefing writer. Think in English, respond in Slovak.\n"
+    "Compress the analysis into max 400 words.\n"
+    "Structure: 1) Top 3 actions  2) Top risk  3) Top opportunity  4) Portfolio health.\n"
+    "No fluff. Institutional tone."
+)
+
+
+def run_ai_pipeline(prompt: str, settings: Dict[str, Any],
+                    use_summary: bool = True) -> str:
+    """Alpha -> optional Summary stage on Raspi."""
+    alpha_out = call_stage("alpha", _SYSTEM_ALPHA, prompt, settings)
+    if alpha_out.startswith("ERROR:") or not use_summary:
+        return alpha_out
+    summary_out = call_stage("summary", _SYSTEM_SUMMARY,
+                             f"Compress this analysis:\n\n{alpha_out}", settings)
+    if summary_out.startswith("ERROR:"):
+        return alpha_out
+    return f"{alpha_out}\n\n---\n## Executive Brief\n{summary_out}"
 
-
-
-# ============================================================================
-# YFINANCE DATA COLLECTION
-# ============================================================================
-
-def get_price_snapshot(symbol: str, period: str = "6mo") -> Dict[str, Any]:
-    """Fetch price data from yfinance with comprehensive metrics."""
-    out = {
-        "symbol": symbol,
-        "price": None,
-        "currency": None,
-        "previous_close": None,
-        "change_1d_pct": None,
-        "change_5d_pct": None,
-        "change_20d_pct": None,
-        "change_3mo_pct": None,
-        "change_from_6mo_high_pct": None,
-        "market_cap": None,
-        "pe_trailing": None,
-        "pe_forward": None,
-        "beta": None,
-        "volume": None,
-        "avg_volume_20d": None,
-        "volume_vs_avg_pct": None,
-        "ma20": None,
-        "ma50": None,
-        "ma100": None,
-        "ma200": None,
-        "week_52_high": None,
-        "week_52_low": None,
-        "trend_hint": "N/A",
-        "risk_hint": "N/A",
-        "candle_count": 0,
-        "timestamp": datetime.now().isoformat(),
-        "error": None
-    }
-    
-    if not symbol:
-        out["error"] = "Empty symbol"
-        return out
-    
-    try:
-        ticker = yf.Ticker(symbol)
-        
-        # Fetch historical prices
-        hist = ticker.history(period=period, interval="1d", auto_adjust=False)
-        if hist.empty or "Close" not in hist:
-            out["error"] = "No historical price data"
-            return out
-        
-        close = hist["Close"].dropna()
-        volume = hist["Volume"].dropna() if "Volume" in hist else None
-        
-        if len(close) < 2:
-            out["error"] = f"Insufficient data: only {len(close)} candles"
-            return out
-        
-        out["candle_count"] = len(close)
-        
-        # Current and previous close
-        last = safe_float(close.iloc[-1])
-        out["price"] = last
-        out["previous_close"] = safe_float(close.iloc[-2]) if len(close) >= 2 else None
-        out["change_1d_pct"] = pct(last, out["previous_close"])
-        
-        # Multi-period changes
-        if len(close) >= 6:
-            out["change_5d_pct"] = pct(last, safe_float(close.iloc[-6]))
-        if len(close) >= 21:
-            out["change_20d_pct"] = pct(last, safe_float(close.iloc[-21]))
-        if len(close) >= 63:
-            out["change_3mo_pct"] = pct(last, safe_float(close.iloc[-63]))
-        
-        # 52-week metrics
-        high = safe_float(close.max())
-        low = safe_float(close.min())
-        out["week_52_high"] = high
-        out["week_52_low"] = low
-        if last and high:
-            out["change_from_6mo_high_pct"] = (last / high - 1) * 100
-        
-        # Moving averages
-        if len(close) >= 20:
-            out["ma20"] = safe_float(close.tail(20).mean())
-        if len(close) >= 50:
-            out["ma50"] = safe_float(close.tail(50).mean())
-        if len(close) >= 100:
-            out["ma100"] = safe_float(close.tail(100).mean())
-        if len(close) >= 200:
-            out["ma200"] = safe_float(close.tail(200).mean())
-        
-        # Volume metrics
-        if volume is not None and len(volume) > 0:
-            out["volume"] = safe_float(volume.iloc[-1])
-            if len(volume) >= 20:
-                out["avg_volume_20d"] = safe_float(volume.tail(20).mean())
-                out["volume_vs_avg_pct"] = pct(out["volume"], out["avg_volume_20d"])
-        
-        # Company info
-        try:
-            info = ticker.fast_info or {}
-            out["currency"] = info.get("currency") if isinstance(info, dict) else None
-            out["market_cap"] = safe_float(info.get("marketCap"))
-            out["beta"] = safe_float(info.get("beta"))
-            
-            # Try info dict for PE ratios
-            if hasattr(ticker, 'info'):
-                out["pe_trailing"] = safe_float(ticker.info.get("trailingPE"))
-                out["pe_forward"] = safe_float(ticker.info.get("forwardPE"))
-        except Exception:
-            pass
-        
-        # Trend hint
-        last, ma20, ma50, ma100 = out["price"], out["ma20"], out["ma50"], out["ma100"]
-        if last and ma20 and ma50:
-            if ma100 and last > ma20 > ma50 > ma100:
-                out["trend_hint"] = "Strong uptrend: price > MA20 > MA50 > MA100"
-            elif last > ma20 > ma50:
-                out["trend_hint"] = "Uptrend: price > MA20 > MA50"
-            elif last < ma20 < ma50:
-                out["trend_hint"] = "Downtrend: price < MA20 < MA50"
-            elif last > ma20:
-                out["trend_hint"] = "Short-term positive, trend unclear"
-            else:
-                out["trend_hint"] = "Weakness or below MA20"
-        
-        # Risk hint
-        d1, d5, highdrop = out["change_1d_pct"], out["change_5d_pct"], out["change_from_6mo_high_pct"]
-        if d1 is not None and d1 < -7:
-            out["risk_hint"] = "Sharp 1-day decline"
-        elif d5 is not None and d5 < -12:
-            out["risk_hint"] = "Sharp 5-day decline"
-        elif highdrop is not None and highdrop < -25:
-            out["risk_hint"] = "Deep below 6M high"
-        elif d1 is not None and d1 > 7:
-            out["risk_hint"] = "Sharp 1-day rally, FOMO risk"
-        else:
-            out["risk_hint"] = "No extreme price signal"
-    
-    except Exception as e:
-        out["error"] = str(e)
-    
-    return out
-
-
-def get_price_snapshot_with_candidates(symbols: List[str], period: str = "6mo") -> Dict[str, Any]:
-    """
-    Try multiple Yahoo Finance symbols and return the first valid price snapshot.
-    Useful for broker symbols like CATL/C7A0 where exchange suffixes differ.
-    """
-    tried = []
-    for sym in [s for s in symbols if s]:
-        if sym in tried:
-            continue
-        tried.append(sym)
-        snap = get_price_snapshot(sym, period)
-        snap["symbol_tried"] = sym
-        snap["symbols_tried"] = tried.copy()
-        if snap.get("price") is not None and not snap.get("error"):
-            snap["resolved_symbol"] = sym
-            return snap
-
-    # Return last failure but keep diagnostics
-    if tried:
-        snap = get_price_snapshot(tried[-1], period)
-        snap["symbol_tried"] = tried[-1]
-        snap["symbols_tried"] = tried
-        snap["resolved_symbol"] = None
-        if not snap.get("error"):
-            snap["error"] = "No valid price found from symbol candidates"
-        return snap
-
-    return get_price_snapshot("", period)
-
-
-# ============================================================================
-# NEWS & SENTIMENT ANALYSIS
-# ============================================================================
-
-TRUSTED_DOMAINS = {
-    "reuters.com", "cnbc.com", "marketwatch.com", "barrons.com",
-    "morningstar.com", "nasdaq.com", "finance.yahoo.com", "stockanalysis.com",
-    "seekingalpha.com", "fool.com", "investor.gov", "sec.gov",
-    "benzinga.com", "thestreet.com", "investor.com"
-}
-
-BULLISH_KEYWORDS = {
-    "beat", "raised", "guidance", "growth", "expand", "strong", "surge",
-    "upgrade", "record", "rally", "bull", "earn", "revenue", "margin",
-    "profit", "backlog", "buyback", "acquisition", "partnership", "demand",
-    "accelerat", "outperform"
-}
-
-BEARISH_KEYWORDS = {
-    "miss", "lowered", "decline", "fall", "weak", "warning", "miss",
-    "downgrade", "loss", "lawsuit", "debt", "burn", "dilution", "bankruptcy",
-    "delisting", "recall", "scandal", "risk", "bear", "short", "concern",
-    "compress", "deteriorat", "headwind"
-}
-
-
-def extract_domain(url: str) -> str:
-    """Extract domain from URL."""
-    try:
-        return urlparse(url).netloc.replace("www.", "")
-    except Exception:
-        return ""
-
-
-def classify_source(url: str, domain: str = "") -> str:
-    """Classify news source: official/news/finance/forum/low_quality."""
-    if not domain:
-        domain = extract_domain(url)
-    
-    domain_lower = domain.lower()
-    
-    if any(x in domain_lower for x in ["sec.gov", "investor.com", "ir."]):
-        return "official"
-    elif any(x in domain_lower for x in TRUSTED_DOMAINS):
-        return "news"
-    elif any(x in domain_lower for x in ["bloomberg", "reuters", "cnbc", "ft.com"]):
-        return "news"
-    elif any(x in domain_lower for x in ["reddit", "stocktwits", "seeking", "forum"]):
-        return "forum"
-    elif any(x in domain_lower for x in ["finance", "stock", "market"]):
-        return "finance_data"
-    else:
-        return "low_quality"
-
-
-def classify_sentiment(text: str) -> Tuple[str, float]:
-    """
-    Classify sentiment using keyword scoring.
-    Returns (sentiment, confidence) where sentiment in [POSITIVE, NEGATIVE, NEUTRAL, MIXED, UNKNOWN]
-    """
-    if not text:
-        return "UNKNOWN", 0.0
-    
-    text_lower = text.lower()
-    
-    # Count keywords
-    bullish_count = sum(1 for kw in BULLISH_KEYWORDS if kw in text_lower)
-    bearish_count = sum(1 for kw in BEARISH_KEYWORDS if kw in text_lower)
-    
-    total = bullish_count + bearish_count
-    if total == 0:
-        return "NEUTRAL", 0.5
-    
-    bullish_ratio = bullish_count / total
-    
-    if bullish_ratio >= 0.75:
-        return "POSITIVE", min(0.95, bullish_count / 5)
-    elif bullish_ratio <= 0.25:
-        return "NEGATIVE", min(0.95, bearish_count / 5)
-    elif bullish_ratio >= 0.4 and bullish_ratio <= 0.6:
-        return "MIXED", 0.6
-    else:
-        return "NEUTRAL", 0.7
-
-
-def is_relevant_to_asset(title: str, snippet: str, asset: Dict[str, Any]) -> Tuple[bool, float]:
-    """
-    Check if search result is relevant to the asset.
-    Returns (is_relevant, relevance_score 0-100)
-    """
-    text = (title + " " + snippet).lower()
-    
-    broker_sym = asset.get("broker_symbol", "").lower()
-    yahoo_sym = asset.get("yahoo_symbol", "").lower().split(".")[0]  # Without .DE suffix
-    company_name = asset.get("name", "").lower()
-    search_query = asset.get("search_query", "").lower()
-    
-    # Keywords that should be present
-    required_keywords = [broker_sym, yahoo_sym]
-    if company_name and len(company_name) > 3:
-        required_keywords.append(company_name.split()[0])  # First word of company name
-    
-    # Check presence
-    match_count = sum(1 for kw in required_keywords if kw and kw in text)
-    
-    # Negative keywords that disqualify
-    irrelevant_phrases = [
-        "ringcentral", "national debt", "rtx", "lockheed", "netflix",
-        "general electric", "general motors", "random forum", "unrelated",
-        "cryptocurrency", "bitcoin", "ethereum"
-    ]
-    
-    for phrase in irrelevant_phrases:
-        if phrase in text and broker_sym not in phrase:
-            return False, 10
-    
-    if match_count >= 1:
-        # Has at least one required keyword
-        return True, min(95, match_count * 40)
-    else:
-        return False, 20
-
-
-def filter_and_score_news(results: List[Dict[str, Any]], asset: Dict[str, Any], 
-                          max_results: int = 6) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Filter news results by relevance. Returns (relevant_results, excluded_results)
-    """
-    relevant = []
-    excluded = []
-    
-    for result in results:
-        title = result.get("title", "")
-        snippet = result.get("snippet", "")
-        url = result.get("url", "")
-        
-        is_relevant, relevance_score = is_relevant_to_asset(title, snippet, asset)
-        source_type = classify_source(url)
-        
-        enriched = {
-            **result,
-            "relevance_score": relevance_score,
-            "source_type": source_type,
-            "is_relevant": is_relevant,
-            "source_domain": extract_domain(url)
-        }
-        
-        if is_relevant and relevance_score >= 50:
-            relevant.append(enriched)
-        else:
-            excluded.append(enriched)
-    
-    # Sort by relevance
-    relevant.sort(key=lambda x: x["relevance_score"], reverse=True)
-    
-    return relevant[:max_results], excluded
-
-
-def ddg_search(query: str, max_results: int = 10, news: bool = False):
-    """Search using DuckDuckGo."""
-    if DDGS is None:
-        return [{"title": "Missing ddgs", "snippet": "Install: pip install ddgs"}]
-    
-    results = []
-    try:
-        with DDGS() as ddgs:
-            raw = ddgs.news(query, max_results=max_results) if news else ddgs.text(query, max_results=max_results)
-            for r in raw:
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("url", r.get("href", "")),
-                    "snippet": r.get("body", ""),
-                    "date": r.get("date", ""),
-                    "source": r.get("source", "")
-                })
-    except Exception as e:
-        results.append({"title": "Search error", "snippet": str(e)})
-    
-    return results
-
-
-def resolve_company_name(ticker: str, price_data: Dict[str, Any]) -> str:
-    """
-    Pokúsi sa zistiť skutočný názov firmy z yfinance info.
-    Používa sa pre T212_AUTO_DISCOVERED tickery kde máme len kód,
-    nie ľudský názov.  Vráti ticker ak info nie je dostupné.
-    """
-    try:
-        used_sym = price_data.get("resolved_symbol") or ticker
-        if not used_sym or used_sym == ticker:
-            return ticker
-        import yfinance as yf
-        info = yf.Ticker(used_sym).fast_info
-        # fast_info is lightweight, doesn't hit the heavy info endpoint
-        # Try to get longName via regular info if fast_info has nothing useful
-        name = getattr(info, "display_name", None) or getattr(info, "name", None)
-        if not name:
-            full_info = yf.Ticker(used_sym).info
-            name = (full_info.get("longName") or full_info.get("shortName") or "").strip()
-        return name if name else ticker
-    except Exception:
-        return ticker
-
-
-def build_search_query(broker_symbol: str, name: str, is_auto_discovered: bool,
-                        resolved_company: str = "") -> str:
-    """
-    Zostrojí optimálny vyhľadávací dotaz.
-    
-    Priorita:
-    1. Ak je manuálne nastavený search_query v configu → použij ho (bez zmeny).
-    2. Ak je auto-discovered a resolved_company je dostupná → "{company} {ticker} stock news"
-    3. Ak ticker je príliš krátky (1-2 znaky) alebo generický → pridaj plné meno
-    4. Inak → "{name or broker_symbol} {ticker} stock"
-    
-    Cieľ: zabrániť garbage novinkám pre jednoznakové tickery ako O, C, ES, BE.
-    """
-    sym = broker_symbol.strip()
-    
-    # Ak existuje resolved company name (z yfinance), použi ho ako základ
-    company = resolved_company if resolved_company and resolved_company != sym else name
-    
-    # Krátky ticker (1-3 znaky) je VŽDY nejednoznačný → vyžaduje názov firmy
-    if len(sym) <= 3 and company and company != sym:
-        return f"{company} {sym} stock news"
-    
-    # Auto-discovered bez názvu → použi resolvedcompany
-    if is_auto_discovered and company and company != sym:
-        return f"{company} {sym} stock"
-    
-    # Štandardný prípad
-    base = company if company and company != sym else sym
-    return f"{base} stock news"
-
-
-def collect_asset_data(asset: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect all data for an asset."""
-    broker_symbol = asset.get("broker_symbol", "")
-    yahoo_symbol = asset.get("yahoo_symbol", "")
-    name = asset.get("name", "")
-    is_auto = asset.get("auto_discovered", False)
-    # Použijeme manuálny search_query ak existuje a nie je len symbolom
-    manual_sq = asset.get("search_query", "")
-    has_manual_sq = manual_sq and manual_sq != f"{broker_symbol} stock news" and manual_sq != broker_symbol
-
-    symbol_candidates = []
-
-    if yahoo_symbol:
-        symbol_candidates.append(yahoo_symbol)
-
-    # Support all naming variants used in configs.
-    for key in ("yahoo_symbol_candidates", "yahoo_symbol_fallbacks", "symbol_candidates"):
-        for alt in asset.get(key, []):
-            if alt and alt not in symbol_candidates:
-                symbol_candidates.append(alt)
-
-    if not symbol_candidates and broker_symbol:
-        symbol_candidates.append(broker_symbol)
-
-    max_news = int(settings.get("max_news_per_asset", 6))
-    max_web = int(settings.get("max_web_per_asset", 4))
-
-    price_data = get_price_snapshot_with_candidates(
-        symbol_candidates,
-        settings.get("days_price_history", "6mo")
-    )
-
-    used_yahoo_symbol = (
-        price_data.get("resolved_symbol")
-        or price_data.get("used_yahoo_symbol")
-        or price_data.get("symbol_tried")
-        or yahoo_symbol
-    )
-    price_data["used_yahoo_symbol"] = used_yahoo_symbol
-
-    # Rozlíšenie skutočného názvu firmy pre auto-discovered tickery
-    # (T212 nám dá len ticker, nie názov → yfinance info)
-    resolved_company = ""
-    if is_auto and (not name or name == broker_symbol):
-        resolved_company = resolve_company_name(broker_symbol, price_data)
-        if resolved_company and resolved_company != broker_symbol:
-            name = resolved_company  # update name for prompt/report
-
-    # Zostrojenie optimálneho search query
-    if has_manual_sq:
-        search_query = manual_sq
-    else:
-        search_query = build_search_query(broker_symbol, name, is_auto, resolved_company)
-
-    news_raw = ddg_search(f"{search_query} earnings", max_results=max_news * 2, news=True)
-    web_raw = ddg_search(f"{search_query} analysis price target", max_results=max_web * 2, news=False)
-
-    news, news_excluded = filter_and_score_news(news_raw, asset, max_news)
-    web, web_excluded = filter_and_score_news(web_raw, asset, max_web)
-
-    return {
-        "broker_symbol": broker_symbol,
-        "yahoo_symbol": used_yahoo_symbol or yahoo_symbol,
-        "configured_yahoo_symbol": yahoo_symbol,
-        "name": name or resolved_company or broker_symbol,
-        "group": asset.get("group", "PORTFOLIO"),
-        "price": price_data,
-        "news": news,
-        "news_excluded": news_excluded,
-        "web": web,
-        "web_excluded": web_excluded,
-        "symbol_candidates": symbol_candidates,
-        "tradingview": fetch_tradingview_technical_data(asset.get("tradingview_symbol", "")) if settings.get("use_tradingview_public_data", True) else None,
-        "collected_at": datetime.now().isoformat(),
-        # Pass-through broker position data so generate_report() can build the holdings table
-        "trading212": asset.get("trading212"),
-        "revolut": asset.get("revolut"),
-        "auto_discovered": asset.get("auto_discovered", False),
-    }
-
-
-def compact(items: List[Dict[str, Any]], limit: int = 3) -> str:
-    """Format news items for display."""
-    lines = []
-    for i, r in enumerate(items[:limit], 1):
-        title = (r.get("title") or "").strip()
-        relevance = r.get("relevance_score", 0)
-        domain = r.get("source_domain", "")
-        
-        lines.append(f"{i}. {title}")
-        if relevance:
-            lines.append(f"   Relevance: {relevance:.0f}%")
-        if domain:
-            lines.append(f"   Source: {domain}")
-        
-        snippet = (r.get("snippet") or "").strip().replace("\n", " ")
-        if snippet:
-            lines.append(f"   {snippet[:300]}")
-    
-    return "\n".join(lines) if lines else "No relevant data found"
-
-
-# ============================================================================
-# DATA QUALITY & SCORING
-# ============================================================================
-
-def calculate_data_quality(asset_data: Dict[str, Any]) -> int:
-    """
-    Calculate data quality score (0-100) based on availability and completeness.
-    Also sets asset_data["dq_status"] string flag:
-      "OK"          — full data, safe for scoring
-      "PARTIAL"     — price exists but incomplete (no MAs, low candle count)
-      "NO_PRICE_DATA" — no usable price feed
-      "BROKER_ONLY" — T212 position exists but no external data at all
-    """
-    score = 0
-    price = asset_data.get("price", {}) or {}
-
-    has_price      = bool(price.get("price"))
-    candle_count   = price.get("candle_count", 0)
-    has_identity   = bool(price.get("currency") or asset_data.get("name"))
-    has_volume     = bool(price.get("market_cap") or price.get("volume"))
-    has_mas        = all(price.get(ma) for ma in ["ma20", "ma50", "ma100"])
-    news_count     = len(asset_data.get("news", []) or [])
-    has_error      = bool(price.get("error"))
-    has_t212       = bool(asset_data.get("trading212"))
-
-    if has_price:    score += 25
-    if candle_count >= 100: score += 15
-    elif candle_count >= 50: score += 8
-    if has_identity: score += 10
-    if has_volume:   score += 10
-    if has_mas:      score += 10
-    if news_count >= 2: score += 15
-    elif news_count >= 1: score += 8
-    if not has_error: score += 10
-    score = min(100, max(0, score))
-
-    # --- dq_status string ---
-    if not has_price and has_t212:
-        dq_status = "BROKER_ONLY"
-    elif not has_price:
-        dq_status = "NO_PRICE_DATA"
-    elif score < 45 or (has_price and not has_mas):
-        dq_status = "PARTIAL"
-    else:
-        dq_status = "OK"
-
-    asset_data["dq_status"] = dq_status
-    return score
-
-
-def dq_label(asset_data: Dict[str, Any]) -> str:
-    """Return dq_status string, falling back to numeric score."""
-    return asset_data.get("dq_status") or (
-        "OK" if asset_data.get("data_quality", 0) >= 60 else "PARTIAL"
-    )
-
-
-def calculate_signals(price_data: Dict[str, Any], news_data: List[Dict], 
-                      settings: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Calculate BUY and SELL signals with deterministic scoring.
-    """
-    signals = {
-        "technical_signals": [],
-        "technical_score": 0,
-        "fundamental_signals": [],
-        "fundamental_score": 0,
-        "sentiment_signals": [],
-        "sentiment_score": 0,
-        "risk_signals": [],
-        "risk_score": 0,
-        "buy_probability": 0.0,
-        "sell_probability": 0.0,
-        "confidence_level": "LOW"
-    }
-    
-    if price_data.get("error"):
-        return signals
-    
-    # === TECHNICAL SIGNALS ===
-    technical_max_score = 100.0
-    technical_triggered_score = 0.0
-    
-    price = price_data.get("price")
-    ma20 = price_data.get("ma20")
-    ma50 = price_data.get("ma50")
-    ma100 = price_data.get("ma100")
-    
-    if price and ma20 and ma50 and ma100:
-        # Golden cross
-        if price > ma20 > ma50 > ma100:
-            signals["technical_signals"].append("Golden cross (price > MA20 > MA50 > MA100)")
-            technical_triggered_score += 0.75 * 1.5  # confidence * weight
-        # MA20 > MA50
-        elif price > ma20 > ma50:
-            signals["technical_signals"].append("Price > MA20 > MA50")
-            technical_triggered_score += 0.70 * 1.2
-        
-        # Death cross
-        if price < ma20 < ma50 < ma100:
-            signals["technical_signals"].append("Death cross (price < MA20 < MA50 < MA100)")
-            technical_triggered_score -= 0.75 * 1.5
-        elif price < ma20 < ma50:
-            signals["technical_signals"].append("Price < MA20 < MA50")
-            technical_triggered_score -= 0.70 * 1.2
-    
-    # Volume surge
-    vol_vs_avg = price_data.get("volume_vs_avg_pct")
-    if vol_vs_avg and vol_vs_avg > 50:
-        signals["technical_signals"].append(f"Volume surge ({vol_vs_avg:.0f}% vs avg)")
-        technical_triggered_score += 0.65 * 0.8
-    
-    # Price extremes
-    change_1d = price_data.get("change_1d_pct")
-    if change_1d and change_1d < -8:
-        signals["technical_signals"].append(f"Sharp 1D decline ({change_1d:.1f}%)")
-        technical_triggered_score -= 0.90 * 3.0
-    elif change_1d and change_1d > 7:
-        signals["technical_signals"].append(f"Sharp 1D rally ({change_1d:.1f}%)")
-        technical_triggered_score += 0.60 * 0.8
-    
-    signals["technical_score"] = round((technical_triggered_score / technical_max_score) * 100, 1)
-    
-    # === SENTIMENT SIGNALS ===
-    sentiment_max_score = 50.0
-    sentiment_triggered_score = 0.0
-    positive_news = 0
-    negative_news = 0
-    
-    for item in news_data:
-        sentiment, confidence = classify_sentiment(item.get("title", "") + " " + item.get("snippet", ""))
-        if sentiment == "POSITIVE":
-            positive_news += 1
-            sentiment_triggered_score += confidence * 1.0
-        elif sentiment == "NEGATIVE":
-            negative_news += 1
-            sentiment_triggered_score -= confidence * 1.0
-    
-    if positive_news >= 2:
-        signals["sentiment_signals"].append(f"Multiple positive articles ({positive_news})")
-    if negative_news >= 2:
-        signals["sentiment_signals"].append(f"Multiple negative articles ({negative_news})")
-    
-    signals["sentiment_score"] = round((sentiment_triggered_score / sentiment_max_score) * 100, 1) if sentiment_max_score > 0 else 0
-    
-    # === RISK SIGNALS ===
-    risk_max_score = 60.0
-    risk_triggered_score = 0.0
-    
-    change_20d = price_data.get("change_20d_pct")
-    change_6mo_high = price_data.get("change_from_6mo_high_pct")
-    
-    if change_20d and change_20d < -12:
-        signals["risk_signals"].append(f"20D drawdown ({change_20d:.1f}%)")
-        risk_triggered_score += 0.80 * 2.0
-    
-    if change_6mo_high and change_6mo_high < -25:
-        signals["risk_signals"].append(f"Deep from 6M high ({change_6mo_high:.1f}%)")
-        risk_triggered_score += 0.60 * 1.5
-    
-    signals["risk_score"] = round((risk_triggered_score / risk_max_score) * 100, 1) if risk_max_score > 0 else 0
-    
-    # === FINAL PROBABILITIES ===
-    # BUY = technical + sentiment (if positive)
-    # SELL = risk + sentiment (if negative)
-    
-    buy_score = max(0, signals["technical_score"] + (signals["sentiment_score"] if signals["sentiment_score"] > 0 else 0))
-    sell_score = signals["risk_score"] + (abs(signals["sentiment_score"]) if signals["sentiment_score"] < 0 else 0)
-    
-    signals["buy_probability"] = round(min(100, buy_score / 2), 1)
-    signals["sell_probability"] = round(min(100, sell_score / 2), 1)
-    
-    # Confidence level
-    data_quality = len(news_data) + int(bool(price_data.get("candle_count", 0)))
-    if data_quality >= 3:
-        signals["confidence_level"] = "HIGH"
-    elif data_quality >= 1:
-        signals["confidence_level"] = "MEDIUM"
-    else:
-        signals["confidence_level"] = "LOW"
-    
-    return signals
-
-
-# ============================================================================
-# OLLAMA ANALYSIS
-# ============================================================================
-
-def calculate_recommendation(asset_data: Dict[str, Any],
-                             signals: Dict[str, Any] = None,
-                             settings: Dict[str, Any] = None) -> Dict[str, Any]:
-    """
-    3-stavové odporúčanie: BUY / SELL / WATCH
-    score_value (-2..+2): risk_level vs price, PE fallback, buy/sell_prob fallback
-    score_momentum (-2..+2): MA50/MA200 crossover + RSI
-    score_sentiment (-1..+1): aggregated news sentiment
-    """
-    signals    = signals or asset_data.get("signals", {}) or {}
-    price_data = asset_data.get("price",  {}) or {}
-    news       = asset_data.get("news",   []) or []
-    dq_str     = asset_data.get("dq_status") or dq_label(asset_data)
-
-    current_price = price_data.get("price")
-    ma50          = price_data.get("ma50")
-    ma200         = price_data.get("ma200")
-    rsi           = price_data.get("rsi")
-    risk_level    = price_data.get("risk_level") or price_data.get("risk_hint_value")
-    pe            = price_data.get("pe_ratio") or price_data.get("trailingPE")
-    eps_growth    = price_data.get("earnings_growth")
-
-    # score_value
-    score_value = 0; value_note = ""
-    if current_price and risk_level:
-        fair_low = float(risk_level); fair_high = fair_low * 1.30
-        if   current_price < fair_low * 0.90:  score_value = 2;  value_note = f"cena pod fair zone (<{fair_low*0.9:.2f})"
-        elif current_price <= fair_high:        score_value = 1;  value_note = f"cena v fair zone ({fair_low:.2f}-{fair_high:.2f})"
-        else:                                   score_value = -2; value_note = f"cena nad fair zone (>{fair_high:.2f})"
-    elif pe is not None:
-        try:
-            pe_f = float(pe); growing = eps_growth and float(eps_growth) > 0
-            if   pe_f < 15 and growing:         score_value = 2;  value_note = f"PE={pe_f:.1f} nizke+rast"
-            elif pe_f <= 30:                    score_value = 1;  value_note = f"PE={pe_f:.1f} OK"
-            elif pe_f > 40 and not growing:     score_value = -2; value_note = f"PE={pe_f:.1f} predrazene"
-            else:                               score_value = 0;  value_note = f"PE={pe_f:.1f} neutral"
-        except (TypeError, ValueError): pass
-    else:
-        bp = signals.get("buy_probability", 0); sp = signals.get("sell_probability", 0)
-        if   bp >= 60: score_value =  2; value_note = f"buy_prob={bp:.0f}%"
-        elif bp >= 35: score_value =  1; value_note = f"buy_prob={bp:.0f}%"
-        elif sp >= 60: score_value = -2; value_note = f"sell_prob={sp:.0f}%"
-        elif sp >= 35: score_value = -1; value_note = f"sell_prob={sp:.0f}%"
-        else:          score_value =  0; value_note = "no valuation data"
-
-    # score_momentum
-    score_momentum = 0; mom_note = ""
-    if ma50 and ma200 and current_price:
-        if   ma50 > ma200 and current_price > ma50:  score_momentum = 2;  mom_note = "MA50>MA200,price>MA50"
-        elif ma50 > ma200:                            score_momentum = 1;  mom_note = "MA50>MA200,pullback"
-        elif ma50 < ma200 and current_price < ma50:  score_momentum = -2; mom_note = "MA50<MA200,price<MA50"
-        else:                                         score_momentum = -1; mom_note = "MA50<MA200"
-    elif ma50 and current_price:
-        score_momentum = 1 if current_price > ma50 else -1; mom_note = "vs MA50"
-    else:
-        ts = signals.get("technical_score", 50)
-        if   ts >= 70: score_momentum =  2; mom_note = f"tech={ts}"
-        elif ts >= 55: score_momentum =  1; mom_note = f"tech={ts}"
-        elif ts <= 30: score_momentum = -2; mom_note = f"tech={ts}"
-        elif ts <= 45: score_momentum = -1; mom_note = f"tech={ts}"
-        else:          score_momentum =  0; mom_note = f"tech={ts}"
-    if rsi:
-        if   rsi < 30: score_momentum += 1; mom_note += f",RSI={rsi:.0f}(os)"
-        elif rsi > 70: score_momentum -= 1; mom_note += f",RSI={rsi:.0f}(ob)"
-        score_momentum = max(-3, min(3, score_momentum))
-
-    # score_sentiment
-    SMAP = {"POSITIVE": 1, "NEGATIVE": -1, "NEUTRAL": 0, "MIXED": 0}
-    vals  = [SMAP.get((n.get("sentiment") or "NEUTRAL").upper(), 0) for n in news]
-    avg_s = (sum(vals) / len(vals)) if vals else 0.0
-    if   avg_s >  0.3: score_sentiment = 1;  sent_note = f"sent={avg_s:.2f}(+)"
-    elif avg_s < -0.3: score_sentiment = -1; sent_note = f"sent={avg_s:.2f}(-)"
-    else:              score_sentiment = 0;  sent_note = f"sent={avg_s:.2f}(n)"
-
-    total_score   = score_value + score_momentum + score_sentiment
-    fair_high_val = (float(risk_level) * 1.30) if risk_level else None
-
-    # Agresívny short-term signál — nezávislý od value (pre short-run trading)
-    short_term_buy  = (score_momentum >= 2 and score_sentiment >= 1 and dq_str in ("OK", "PARTIAL"))
-    short_term_sell = (score_momentum <= -2 and score_sentiment <= -1 and dq_str in ("OK", "PARTIAL"))
-
-    if dq_str not in ("OK", "PARTIAL"):
-        recommendation = "WATCH"
-        comment = f"Data quality: {dq_str}. Chybaju cenove data — nedokupovat."
-    elif (total_score >= 3 and score_value >= 1) or short_term_buy:
-        recommendation = "BUY"
-        trigger = "SHORT-TERM" if short_term_buy and not (total_score >= 3 and score_value >= 1) else "LONG+SHORT"
-        comment = (f"[{trigger}] Score {total_score:+d} (V{score_value} M{score_momentum} S{score_sentiment}): "
-                   f"{value_note}; {mom_note}; {sent_note}. BUY.")
-    elif (total_score <= -3
-          or short_term_sell
-          or (fair_high_val and current_price and current_price > fair_high_val
-              and score_sentiment <= 0 and score_momentum <= 0)):
-        recommendation = "SELL"
-        trigger = "SHORT-TERM" if short_term_sell and total_score > -3 else "score"
-        comment = (f"[{trigger}] Score {total_score:+d} (V{score_value} M{score_momentum} S{score_sentiment}): "
-                   f"{value_note}; {mom_note}; {sent_note}. SELL/REDUCE.")
-    else:
-        if total_score >= 2:    quality = "BUY-WATCH"
-        elif total_score <= -2: quality = "SELL-WATCH"
-        else:                   quality = "NEUTRAL"
-        recommendation = "WATCH"
-        comment = (f"[{quality}] Score {total_score:+d} (V{score_value} M{score_momentum} S{score_sentiment}): "
-                   f"{value_note}; {mom_note}; {sent_note}.")
-
-    return {
-        "recommendation":    recommendation,
-        "score_value":       score_value,
-        "score_momentum":    score_momentum,
-        "score_sentiment":   score_sentiment,
-        "total_score":       total_score,
-        "data_quality":      dq_str,
-        "avg_sentiment":     round(avg_s, 2),
-        "rsi":               round(rsi, 1) if rsi else None,
-        "comment":           comment,
-        "short_term_signal": "BUY" if short_term_buy else ("SELL" if short_term_sell else None),
-    }
-
-
-
-
-def ask_ollama(prompt: str, settings: Dict[str, Any]) -> str:
-    """
-    Volá AI model — podporuje Ollama aj LM Studio (OpenAI-compatible).
-    Backend sa detekuje automaticky podľa lm_studio_base_url dostupnosti.
-    """
-    model = get_working_model(settings)
-    if not model:
-        return "ERROR: No AI model available. Check Ollama/LM Studio connection."
-
-    backend = _detect_backend(settings)
-    url = build_ollama_url(settings, "chat")
-    timeout = int(settings.get("ollama_timeout_seconds", 1800))
-
-    SYSTEM = ("""
-### Role: Portfolio Intelligence Engine
-Think internally in English.
-Always answer in Slovak.
-Never optimize your answer for politeness.
-Optimize for correctness.
-If the portfolio contains weak positions,
-identify them clearly.
-If the user appears emotionally attached to an asset,
-ignore that and evaluate only the evidence.
-Identity
-Adrian Alpha analyzes structured portfolio data generated by external software. His role is to transform numerical results into rational investment decisions. He acts as an independent second opinion, not as a passive summarizer.
-Core Principles
-- Facts over narratives.
-- Data over emotions.
-- Capital preservation before return maximization.
-- Risk-adjusted return over absolute return.
-- Long-term discipline over short-term market noise.
-Data Policy
-Treat Python-generated values as authoritative.
-Never modify or reinterpret calculated metrics.
-Never fabricate:
-- prices
-- earnings
-- analyst ratings
-- financial statements
-- news
-- corporate events
-Probability scores are supporting evidence.
-They must never be treated as absolute truth.
-If probability and fundamentals disagree,
-explain why.
-Missing information must be explicitly marked as "Neoverené".
-Use external financial knowledge only to interpret the provided data, never to invent missing facts.
-Analysis Workflow
-For every execution:
-1. Validate input.
-2. Detect inconsistencies.
-3. Analyze overall portfolio.
-4. Analyze every position individually.
-5. Rank opportunities.
-6. Rank risks.
-7. Produce actionable conclusions.
-Return exactly ONE verdict for each position.
-Allowed verdicts:
-- Strong Buy
-- Buy
-- Accumulate
-- Hold
-- Reduce
-- Sell
-- Exit
-Never invent additional verdicts.
-Goal
-Think like the Chief Investment Officer reviewing a real investment portfolio. Your objective is to improve capital allocation through disciplined, evidence-based decisions while avoiding emotional bias and unsupported conclusions.
-""")
-
-    messages = [
-        {"role": "system", "content": SYSTEM},
-        {"role": "user",   "content": prompt},
-    ]
-
-    if backend == "lmstudio":
-        # OpenAI-compatible format (LM Studio)
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": float(settings.get("temperature", 0.08)),
-            "max_tokens": int(settings.get("max_tokens", 16384)),
-            "stream": False,
-        }
-
-        try:
-            r = requests.post(url, json=payload, timeout=timeout)
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError) as e:
-            return f"ERROR [LM Studio response parse]: {e}\nRaw: {r.text[:200]}"
-        except Exception as e:
-            return f"ERROR [LM Studio]: {e}"
-
-    else:
-        # Ollama native format
-        payload = {
-            "model": model,
-            "stream": False,
-            "messages": messages,
-            "options": {
-                "temperature": float(settings.get("temperature", 0.08)),
-                "num_ctx": int(settings.get("num_ctx", 16384)),
-            },
-        }
-
-        try:
-            r = requests.post(url, json=payload, timeout=timeout)
-            r.raise_for_status()
-            return r.json().get("message", {}).get("content", "").strip()
-        except Exception as e:
-            return f"ERROR [Ollama]: {e}"
 
 
 def _asset_line(data: Dict[str, Any]) -> str:
@@ -1694,78 +1043,59 @@ def build_prompt(collected_data: List[Dict[str, Any]], portfolio_rules: Dict[str
                  settings: Dict[str, Any] = None,
                  trump_news_ctx: Optional[Dict[str, Any]] = None) -> str:
     """
-    Zostav prompt pre Plutus — štruktúrovaný vstup.
-    T212 holdings s udalosťou → plný blok.
-    T212 holdings bez udalosti → kompaktný 1-riadok.
-    Watchlist → len s BUY/SELL signálom.
+    Zostav prompt pre Fin-R1 — deep reasoning per ticker.
+    Každý ticker dostane štruktúrovaný blok s dátami, AI musí rozmyslieť a dať verdikt.
     """
     settings = settings or {}
+    today = datetime.now().strftime("%Y-%m-%d")
+    news_age = settings.get("max_news_age_hours", 48)
     lines = []
 
+    lines.append(f"# PORTFOLIO ANALYSIS — {today}")
+    lines.append(f"News timeframe: last {news_age} hours only")
+    lines.append("")
+
     if portfolio_rules:
-        lines.append("# Portfolio Rules")
+        lines.append("# PORTFOLIO RULES")
         for v in portfolio_rules.values():
             lines.append(f"- {v}")
         lines.append("")
 
-    ACTIONABLE = [
-        "earnings","revenue","profit","loss","guidance","forecast",
-        "acquisition","merger","deal","lawsuit","fine","penalty",
-        "upgrade","downgrade","price target","beat","miss",
-        "CEO","CFO","dividend","buyback","trump","tariff",
-        "sanction","ban","regulation",
-    ]
-
-    def has_data(d):
-        s = d.get("signals") or {}
-        n = d.get("news") or []
-        rec = d.get("recommendation") or {}
-        return (s.get("buy_probability", 0) >= 30
-                or s.get("sell_probability", 0) >= 30
-                or rec.get("recommendation") in ("BUY", "SELL")
-                or any(kw in (i.get("title","") + i.get("snippet","")).lower()
-                       for i in n for kw in ACTIONABLE))
-
-    # 1. T212 holdings
+    # Build detailed asset blocks for ALL T212 positions (not just rich ones)
     t212_all = [d for d in collected_data
                 if d.get("trading212")
                 and (d.get("summary") or {}).get("label") != "T212_INTERNAL_TICKER"]
-    rich  = sorted([d for d in t212_all if has_data(d)],
-                   key=lambda d: abs((d.get("trading212") or {}).get("pnl") or 0), reverse=True)
-    quiet = sorted([d for d in t212_all if not has_data(d)],
-                   key=lambda d: abs((d.get("trading212") or {}).get("pnl") or 0), reverse=True)
+    
+    # Sort by position value descending
+    t212_all.sort(key=lambda d: abs((d.get("trading212") or {}).get("market_value") or 0), reverse=True)
 
-    if rich:
-        lines.append("# T212 POZÍCIE — aktívne / so signálom (povinná analýza)")
+    if t212_all:
+        lines.append("# T212 POZÍCIE — DEEP ANALYSIS REQUIRED")
+        lines.append("Pre KAŽDÚ pozíciu: daj VERDIKT (DOKUPOVAT/DRZAT/ZVAZUJ PREDAJ/PREDAJ) + dôvod.")
         lines.append("")
-        for d in rich:
+        for d in t212_all:
             _append_asset_block(lines, d, include_all_news=True)
 
-    if quiet:
-        lines.append("# T212 POZÍCIE — bez signálu (krátky verdikt stačí)")
-        for d in quiet:
-            lines.append(_asset_line(d))
-        lines.append("")
-
-    # 2. Watchlist — len BUY/SELL signál
+    # Watchlist with signals
     non_hold = [d for d in collected_data
                 if not d.get("trading212")
                 and (d.get("summary") or {}).get("label") != "T212_INTERNAL_TICKER"
                 and d.get("data_quality", 0) >= 60
                 and (d.get("recommendation") or {}).get("recommendation") in ("BUY", "SELL")]
     if non_hold:
-        lines.append("\n# WATCHLIST — BUY/SELL signál")
+        lines.append("\n# WATCHLIST — SIGNAL CANDIDATES")
+        lines.append("Pre KAŽDÚ: potvrď BUY/SELL alebo WATCH s dôvodom.")
         lines.append("")
         for d in sorted(non_hold,
                         key=lambda d: abs((d.get("recommendation") or {}).get("total_score", 0)),
                         reverse=True):
             _append_asset_block(lines, d, include_all_news=False)
 
-    # 3. Trump context
+    # Global context
     t_market    = (trump_news_ctx or {}).get("market_impact", [])
     t_companies = (trump_news_ctx or {}).get("company_hits", {})
     if t_market or t_companies:
-        lines.append("\n# Trump / Makro kontext")
+        lines.append("\n# MAKRO KONTEXT")
         for item in t_market[:4]:
             lines.append(f"- {item.get('title','')} [{item.get('sentiment','')}]")
         for sym, hits in list(t_companies.items())[:6]:
@@ -1773,43 +1103,289 @@ def build_prompt(collected_data: List[Dict[str, Any]], portfolio_rules: Dict[str
                 lines.append(f"- [{sym}] {h.get('title','')} [{h.get('sentiment','')}]")
         lines.append("")
 
+    # News summary
+    global_news = []
+    for d in collected_data:
+        for n in d.get("news", [])[:2]:
+            if n.get("title"):
+                global_news.append(n)
+    if global_news:
+        lines.append("\n# NEWS SUMMARY")
+        for n in global_news[:15]:
+            lines.append(f"- [{n.get('sentiment','NEUTRAL')}] {n.get('title','')}")
+        lines.append("")
+
     lines.append("\n# ÚLOHA")
-    lines.append("Pre každú T212 pozíciu: verdikt BUY/SELL/WATCH + 1-2 konkrétne vety.")
-    lines.append("Watchlist BUY/SELL: potvrď alebo vyvrať Python signál.")
-    lines.append("Správy: len ZMENY s číslami. Žiadne generické sektorové komentáre.")
+    lines.append("Si Chief Investment Officer. Pre KAŽDÚ T212 pozíciu daj:")
+    lines.append("  1. VERDIKT: DOKUPOVAT / DRZAT / ZVAZUJ PREDAJ / PREDAJ")
+    lines.append("  2. DÔVOD: 2-3 konkrétne vety (fundamentál, technika, news, riziko)")
+    lines.append("  3. PRICE TARGET: cieľová cena na 3-6 mesiacov")
+    lines.append("  4. STOP LOSS: kde by si vyhodil")
+    lines.append("")
+    lines.append("Pre watchlist: BUY / SELL / WATCH + dôvod.")
+    lines.append("")
+    lines.append("NEVYMÝŠĽAJ ceny ani pravdepodobnosti. Použi IBA poskytnuté dáta.")
+    lines.append("Ak chýbajú dáta: napíš 'NEDOSTATOČNÉ DÁTA'.")
 
     return "\n".join(lines)
 
 
 
-def collect_global_news(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Collect broad market/theme news for context beyond individual tickers."""
-    queries = settings.get("global_news_queries", [])
-    max_items = int(settings.get("max_global_news", 12))
+
+
+# ============================================================================
+# UTILITY FUNCTIONS (Sentiment, Domain Classification)
+# ============================================================================
+
+def classify_sentiment(text: str) -> Tuple[str, float]:
+    """Classify sentiment of text. Returns (sentiment, confidence).
+    
+    Simple keyword-based classification for financial news.
+    """
+    text_lower = text.lower()
+    
+    # Positive keywords
+    positive_kw = [
+        "beat", "exceed", "surge", "soar", "jump", "rise", "gain", "growth",
+        "profit", "record", "strong", "bullish", "upgrade", "buy", "outperform",
+        "dividend", "buyback", "acquisition", "merger", "partnership", "deal",
+        "approval", "launch", "expand", "increase", "raise", "boost", "rally"
+    ]
+    
+    # Negative keywords
+    negative_kw = [
+        "miss", "fall", "drop", "decline", "loss", "weak", "bearish", "downgrade",
+        "sell", "underperform", "cut", "reduce", "layoff", "restructuring",
+        "lawsuit", "fine", "penalty", "investigation", "recall", "bankruptcy",
+        "default", "delay", "cancel", "warn", "alert", "risk", "concern"
+    ]
+    
+    pos_count = sum(1 for kw in positive_kw if kw in text_lower)
+    neg_count = sum(1 for kw in negative_kw if kw in text_lower)
+    
+    if pos_count > neg_count:
+        confidence = min(0.9, 0.5 + (pos_count - neg_count) * 0.1)
+        return "POSITIVE", confidence
+    elif neg_count > pos_count:
+        confidence = min(0.9, 0.5 + (neg_count - pos_count) * 0.1)
+        return "NEGATIVE", confidence
+    else:
+        return "NEUTRAL", 0.5
+
+
+def extract_domain(url: str) -> str:
+    """Extract domain from URL."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        # Remove www prefix
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain
+    except Exception:
+        return ""
+
+
+def classify_source(url: str) -> str:
+    """Classify source type based on domain."""
+    domain = extract_domain(url)
+    
+    # Financial news
+    finance_domains = {
+        "reuters.com", "bloomberg.com", "wsj.com", "ft.com", "cnbc.com",
+        "marketwatch.com", "investing.com", "seekingalpha.com", "fool.com",
+        "morningstar.com", "yahoo.com", "finance.yahoo.com", "barrons.com",
+        "thestreet.com", "benzinga.com", "zacks.com", "tipranks.com"
+    }
+    
+    # Official sources
+    official_domains = {
+        "sec.gov", "ecb.europa.eu", "federalreserve.gov", "treasury.gov",
+        "who.int", "eia.gov", "bls.gov", "census.gov"
+    }
+    
+    # General news
+    news_domains = {
+        "apnews.com", "bbc.com", "cnn.com", "nytimes.com", "washingtonpost.com",
+        "theguardian.com", "reuters.com", "ap.org", "afp.com", "dpa-international.com"
+    }
+    
+    if domain in finance_domains:
+        return "finance_data"
+    elif domain in official_domains:
+        return "official"
+    elif domain in news_domains:
+        return "news"
+    elif domain:
+        return "other"
+    return "unknown"
+
+
+from datetime import timedelta
+import threading
+import queue
+
+# Simple in-memory cache for DDGS queries within a single run
+_ddgs_cache = {}
+
+def _ddgs_cached_news(query: str, max_results: int = 5, timeout: float = 8.0) -> List[Dict]:
+    """Cached DDGS news search with timeout - returns empty list if too slow."""
+    cache_key = f"{query}:{max_results}"
+    if cache_key in _ddgs_cache:
+        return _ddgs_cache[cache_key]
+    
+    if not DDGS:
+        return []
+    
+    result_queue = queue.Queue()
+    
+    def worker():
+        try:
+            results = list(DDGS().news(query, max_results=max_results, region='us', safesearch='moderate'))
+            _ddgs_cache[cache_key] = results
+            result_queue.put(results)
+        except Exception as e:
+            logger.debug(f"DDGS cached news failed for {query}: {e}")
+            result_queue.put([])
+    
+    thread = threading.Thread(target=worker)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout)
+    
+    if thread.is_alive():
+        logger.debug(f"DDGS timeout for query: {query}")
+        return []
+    
+    return result_queue.get() if not result_queue.empty() else []
+
+
+def collect_ticker_news(symbol: str, aliases: List[str], max_items: int = 5, max_age_hours: int = 48, timeout: float = 5.0) -> List[Dict[str, Any]]:
+    """Collect news for a specific ticker using its symbol and aliases.
+    
+    Args:
+        symbol: Primary ticker symbol
+        aliases: Alternative symbols/names
+        max_items: Maximum news items to return
+        max_age_hours: Only include news from last N hours (default 48h)
+        timeout: Timeout in seconds for each DDGS query (default 5s)
+        
+    Returns:
+        List of news items with sentiment, filtered by time
+    """
+    if not DDGS:
+        return []
+    
+    # Build search queries from symbol and aliases
+    search_terms = [symbol] + aliases[:3]  # Limit to avoid too many queries
     out = []
     seen = set()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    
+    for term in search_terms:
+        query = f"{term} stock news"
+        try:
+            for item in _ddgs_cached_news(query, max_results=max_items, timeout=timeout):
+                url = item.get("url", "")
+                title = item.get("title", "")
+                key = url or title
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                
+                # Check date if available
+                date_str = item.get("date") or item.get("published")
+                if date_str:
+                    try:
+                        # Parse various date formats
+                        for fmt in ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%a, %d %b %Y %H:%M:%S %z"]:
+                            try:
+                                item_date = datetime.strptime(date_str.replace("Z", "+0000"), fmt)
+                                if item_date.tzinfo is None:
+                                    item_date = item_date.replace(tzinfo=timezone.utc)
+                                if item_date < cutoff:
+                                    continue
+                                break
+                            except ValueError:
+                                continue
+                    except Exception:
+                        pass  # If date parsing fails, include anyway
+                
+                text = f"{title} {item.get('snippet', '')}"
+                sentiment, confidence = classify_sentiment(text)
+                out.append({
+                    **item,
+                    "ticker": symbol,
+                    "query": query,
+                    "source_domain": extract_domain(url),
+                    "source_type": classify_source(url),
+                    "sentiment": sentiment,
+                    "sentiment_confidence": round(confidence, 2),
+                    "trust_level": "MEDIUM" if classify_source(url) in {"news", "finance_data", "official"} else "LOW",
+                })
+        except Exception as e:
+            logger.debug(f"collect_ticker_news failed for {term}: {e}")
+            continue
+    
+    return out[:max_items]
 
+
+def collect_global_news(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Collect broad market/theme news for context beyond individual tickers.
+    
+    Time-filtered to last 48 hours for relevance.
+    """
+    queries = settings.get("global_news_queries", [])
+    max_items = int(settings.get("max_global_news", 20))  # Increased from 12
+    max_age_hours = int(settings.get("max_news_age_hours", 48))
+    out = []
+    seen = set()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    
     for query in queries:
-        for item in ddg_search(query, max_results=5, news=True):
-            url = item.get("url", "")
-            title = item.get("title", "")
-            key = url or title
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            text = f"{title} {item.get('snippet', '')}"
-            sentiment, confidence = classify_sentiment(text)
-            enriched = {
-                **item,
-                "query": query,
-                "source_domain": extract_domain(url),
-                "source_type": classify_source(url),
-                "sentiment": sentiment,
-                "sentiment_confidence": round(confidence, 2),
-                "trust_level": "MEDIUM" if classify_source(url) in {"news", "finance_data", "official"} else "LOW",
-            }
-            out.append(enriched)
-
+        try:
+            for item in DDGS().news(query, max_results=5, region='us', safesearch='moderate'):
+                url = item.get("url", "")
+                title = item.get("title", "")
+                key = url or title
+                if not key or key in seen:
+                    continue
+                
+                # Check date
+                date_str = item.get("date") or item.get("published")
+                if date_str:
+                    try:
+                        for fmt in ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%a, %d %b %Y %H:%M:%S %z"]:
+                            try:
+                                item_date = datetime.strptime(date_str.replace("Z", "+0000"), fmt)
+                                if item_date.tzinfo is None:
+                                    item_date = item_date.replace(tzinfo=timezone.utc)
+                                if item_date < cutoff:
+                                    continue
+                                break
+                            except ValueError:
+                                continue
+                    except Exception:
+                        pass
+                
+                seen.add(key)
+                text = f"{title} {item.get('snippet', '')}"
+                sentiment, confidence = classify_sentiment(text)
+                out.append({
+                    **item,
+                    "query": query,
+                    "source_domain": extract_domain(url),
+                    "source_type": classify_source(url),
+                    "sentiment": sentiment,
+                    "sentiment_confidence": round(confidence, 2),
+                    "trust_level": "MEDIUM" if classify_source(url) in {"news", "finance_data", "official"} else "LOW",
+                })
+        except Exception as e:
+            logger.debug(f"collect_global_news failed for {query}: {e}")
+            continue
+    
     return out[:max_items]
 
 
@@ -1817,102 +1393,506 @@ def collect_discovery_news(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Collect new-stock / catalyst ideas. These are NOT automatic recommendations.
     They are watchlist candidates for manual review.
+    Time-filtered to last 48 hours.
     """
     queries = settings.get("discovery_queries", [])
-    max_items = int(settings.get("max_discovery_news", 12))
+    max_items = int(settings.get("max_discovery_news", 20))  # Increased from 12
+    max_age_hours = int(settings.get("max_news_age_hours", 48))
     out = []
     seen = set()
-
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    
     for query in queries:
-        for item in ddg_search(query, max_results=5, news=True):
-            url = item.get("url", "")
-            title = item.get("title", "")
-            key = url or title
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            text = f"{title} {item.get('snippet', '')}"
-            sentiment, confidence = classify_sentiment(text)
-            out.append({
-                **item,
-                "query": query,
-                "source_domain": extract_domain(url),
-                "source_type": classify_source(url),
-                "sentiment": sentiment,
-                "sentiment_confidence": round(confidence, 2),
-                "trust_level": "LOW_TO_MEDIUM",
-            })
-
+        try:
+            for item in DDGS().news(query, max_results=5, region='us', safesearch='moderate'):
+                url = item.get("url", "")
+                title = item.get("title", "")
+                key = url or title
+                if not key or key in seen:
+                    continue
+                
+                # Check date
+                date_str = item.get("date") or item.get("published")
+                if date_str:
+                    try:
+                        for fmt in ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%a, %d %b %Y %H:%M:%S %z"]:
+                            try:
+                                item_date = datetime.strptime(date_str.replace("Z", "+0000"), fmt)
+                                if item_date.tzinfo is None:
+                                    item_date = item_date.replace(tzinfo=timezone.utc)
+                                if item_date < cutoff:
+                                    continue
+                                break
+                            except ValueError:
+                                continue
+                    except Exception:
+                        pass
+                
+                seen.add(key)
+                text = f"{title} {item.get('snippet', '')}"
+                sentiment, confidence = classify_sentiment(text)
+                out.append({
+                    **item,
+                    "query": query,
+                    "source_domain": extract_domain(url),
+                    "source_type": classify_source(url),
+                    "sentiment": sentiment,
+                    "sentiment_confidence": round(confidence, 2),
+                    "trust_level": "LOW_TO_MEDIUM",
+                })
+        except Exception as e:
+            logger.debug(f"collect_discovery_news failed for {query}: {e}")
+            continue
+    
     return out[:max_items]
 
 
+# ============================================================================
+# ASSET SUMMARY BUILDER
+# ============================================================================
+
 def build_asset_summary(asset_data: Dict[str, Any], signals: Dict[str, Any],
-                        data_quality: int, settings: Dict[str, Any] = None) -> Dict[str, Any]:
-    """
-    Build a flat summary dict for an asset.
-    Used by generate_report for the scores table and per-asset sections.
-    """
-    settings   = settings or {}
-    price      = asset_data.get("price", {}) or {}
-    news       = asset_data.get("news",  []) or []
-    dq_str     = asset_data.get("dq_status") or dq_label(asset_data)
-
-    current_price  = price.get("price")
-    change_1d_pct  = price.get("change_1d_pct")
-    change_5d_pct  = price.get("change_5d_pct")
-    currency       = price.get("currency", "")
-    trend_hint     = price.get("trend_hint", "")
-    risk_level     = price.get("risk_level") or price.get("risk_hint_value")
-
-    # Risk levels for report
-    risk_levels = {}
-    if risk_level:
-        risk_levels["invalidation"] = f"long-run thesis review below ~{float(risk_level):.2f}"
-
-    # Sentiment aggregate
-    SMAP = {"POSITIVE": 1, "NEGATIVE": -1, "NEUTRAL": 0, "MIXED": 0}
-    vals = [SMAP.get((n.get("sentiment") or "NEUTRAL").upper(), 0) for n in news]
-    avg_sentiment = (sum(vals) / len(vals)) if vals else 0.0
-
-    # Status
-    buy_p  = signals.get("buy_probability", 0)
+    data_quality: int,
+    settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Build comprehensive summary for asset including signals and key metrics."""
+    price_data = asset_data.get("price", {}) or {}
+    technicals = price_data.get("technicals", {}) if isinstance(price_data, dict) else {}
+    info = price_data.get("info", {}) if isinstance(price_data, dict) else {}
+    news = asset_data.get("news", [])
+    rec = asset_data.get("recommendation", {})
+    t212 = asset_data.get("trading212", {})
+    
+    # Calculate average news sentiment
+    avg_sentiment = 0.0
+    if news:
+        sents = []
+        for item in news[:10]:
+            s = item.get("sentiment", "NEUTRAL")
+            if s == "POSITIVE":
+                sents.append(1)
+            elif s == "NEGATIVE":
+                sents.append(-1)
+            else:
+                sents.append(0)
+        if sents:
+            avg_sentiment = sum(sents) / len(sents)
+    
+    # Buy/Sell probabilities from signals
+    buy_p = signals.get("buy_probability", 0)
     sell_p = signals.get("sell_probability", 0)
-    if buy_p >= int(settings.get("buy_probability_threshold", 60)):
+    
+    # Determine status based on thresholds
+    buy_thresh = settings.get("buy_probability_threshold", 60)
+    sell_thresh = settings.get("sell_probability_threshold", 70)
+    
+    if buy_p >= buy_thresh:
         status = "BUY_CANDIDATE"
-    elif sell_p >= int(settings.get("sell_probability_threshold", 70)):
+    elif sell_p >= sell_thresh:
         status = "SELL_CANDIDATE"
     elif data_quality < 40:
         status = "LOW_DATA_QUALITY"
     else:
         status = "HOLD_OR_WAIT"
-
+    
+    # Risk levels
+    risk_levels = {}
+    current_price = price_data.get("price")
+    rsi = signals.get("rsi")
+    if rsi and rsi < 30:
+        risk_levels["oversold"] = f"RSI oversold at {rsi:.1f}"
+    elif rsi and rsi > 70:
+        risk_levels["overbought"] = f"RSI overbought at {rsi:.1f}"
+    
     return {
-        # identity (duplicated from asset for convenience)
-        "broker_symbol":      asset_data.get("broker_symbol", "?"),
-        "name":               asset_data.get("name", ""),
-        "group":              asset_data.get("group", ""),
-        # price
-        "current_price":      current_price,
-        "change_1d_pct":      change_1d_pct,
-        "change_5d_pct":      change_5d_pct,
-        "currency":           currency,
-        "trend_hint":         trend_hint,
-        # signals
-        "technical_score":    signals.get("technical_score", 0),
-        "sentiment_score":    signals.get("sentiment_score", 0),
-        "buy_probability":    buy_p,
-        "sell_probability":   sell_p,
+        # Identity
+        "broker_symbol": asset_data.get("broker_symbol"),
+        "name": asset_data.get("name"),
+        "group": asset_data.get("group"),
+        
+        # Price
+        "current_price": current_price,
+        "change_1d_pct": technicals.get("change_1d_pct"),
+        "change_5d_pct": technicals.get("change_5d_pct"),
+        "currency": technicals.get("currency"),
+        "trend_hint": technicals.get("trend_hint"),
+        
+        # Technicals
+        "ma20": technicals.get("ma20"),
+        "ma50": technicals.get("ma50"),
+        "ma200": technicals.get("ma200"),
+        "rsi": rsi,
+        
+        # Signals
+        "technical_score": signals.get("technical_score", 0),
+        "sentiment_score": signals.get("sentiment_score", 0),
+        "buy_probability": buy_p,
+        "sell_probability": sell_p,
         "avg_news_sentiment": round(avg_sentiment, 2),
-        # quality
+        
+        # Quality
         "data_quality_score": data_quality,
-        "dq_status":          dq_str,
-        # risk
-        "risk_levels":        risk_levels,
-        "risk_level_value":   float(risk_level) if risk_level else None,
-        # status
-        "status":             status,
-        "action_label":       "",   # filled by action_label_for_asset later
-        "label":              status,
+        "dq_status": asset_data.get("dq_status", "PARTIAL"),
+        
+        # Risk
+        "risk_levels": risk_levels,
+        "risk_level_value": None,
+        
+        # Status
+        "status": status,
+        "action_label": "",  # filled by action_label_for_asset later
+        "label": status,
+        
+        # Additional
+        "news_count": len(news),
+        "market_cap": info.get("marketCap"),
+        "volume": price_data.get("volume"),
+        "pe_ratio": info.get("trailingPE"),
+        "dividend_yield": info.get("dividendYield"),
+        "beta": info.get("beta"),
+    }
+
+# ============================================================================
+# SIGNAL CALCULATION (Technical Analysis)
+# ============================================================================
+
+def calculate_signals(price_data: Dict[str, Any], news: list, settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Calculate technical signals from price data and news sentiment.
+    
+    Args:
+        price_data: Dict with current price, technicals (MA, RSI, trend, changes)
+        news: List of news items with sentiment
+        settings: Configuration settings
+        
+    Returns:
+        Dict with buy_probability, sell_probability, technical_score, sentiment_score
+    """
+    # The price_data dict contains technical indicators directly (not nested under "technicals")
+    # Extract all needed values from price_data dict
+    if not isinstance(price_data, dict):
+        price_data = {}
+    
+    # Default values - start slightly bullish for growth stocks
+    buy_prob = 50.0
+    sell_prob = 50.0
+    tech_score = 50
+    sent_score = 50
+    
+    # Technical analysis - extract from price_data directly
+    rsi = price_data.get('rsi')
+    ma20 = price_data.get('ma20')
+    ma50 = price_data.get('ma50')
+    ma200 = price_data.get('ma200')
+    current_price = price_data.get('price')
+    change_1d = price_data.get('change_1d_pct', 0)
+    change_5d = price_data.get('change_5d_pct', 0)
+    trend = price_data.get('trend_hint', 'NEUTRAL')
+    
+    # RSI signals (0-100) - more sensitive
+    if rsi is not None:
+        if rsi < 30:
+            buy_prob += 20
+            tech_score += 15
+        elif rsi > 70:
+            sell_prob += 20
+            tech_score -= 15
+        elif rsi < 40:
+            buy_prob += 10
+            tech_score += 5
+        elif rsi > 60:
+            sell_prob += 10
+            tech_score -= 5
+        elif rsi < 50:
+            buy_prob += 3
+            tech_score += 2
+        elif rsi > 50:
+            sell_prob += 3
+            tech_score -= 2
+    
+    # Moving average signals - more sensitive
+    if current_price is not None and ma20 is not None and ma50 is not None:
+        if current_price > ma20 > ma50:
+            buy_prob += 12
+            tech_score += 8
+        elif current_price < ma20 < ma50:
+            sell_prob += 12
+            tech_score -= 8
+        elif current_price > ma20:
+            buy_prob += 6
+            tech_score += 4
+        elif current_price < ma20:
+            sell_prob += 6
+            tech_score -= 4
+    
+    # Golden/Death cross (MA50 vs MA200)
+    if ma50 is not None and ma200 is not None:
+        if ma50 > ma200:
+            buy_prob += 8
+            tech_score += 5
+        else:
+            sell_prob += 8
+            tech_score -= 5
+    
+    # Price momentum - more sensitive
+    if change_1d is not None:
+        if change_1d > 2:
+            buy_prob += 5
+            tech_score += 3
+        elif change_1d < -2:
+            sell_prob += 5
+            tech_score -= 3
+    
+    if change_5d is not None:
+        if change_5d > 3:
+            buy_prob += 5
+            tech_score += 3
+        elif change_5d < -3:
+            sell_prob += 5
+            tech_score -= 3
+    
+    # Trend
+    if trend == "UP":
+        buy_prob += 5
+        tech_score += 3
+    elif trend == "DOWN":
+        sell_prob += 5
+        tech_score -= 3
+    
+    # News sentiment - more weight
+    if news:
+        sentiments = []
+        for item in news[:10]:  # Last 10 news
+            s = item.get("sentiment", "NEUTRAL")
+            if s == "POSITIVE":
+                sentiments.append(1)
+            elif s == "NEGATIVE":
+                sentiments.append(-1)
+            else:
+                sentiments.append(0)
+        
+        if sentiments:
+            avg_sent = sum(sentiments) / len(sentiments)
+            # Convert to 0-100 scale
+            sent_score = int(50 + avg_sent * 30)
+            sent_score = max(0, min(100, sent_score))
+            
+            if avg_sent > 0.3:
+                buy_prob += 8
+            elif avg_sent < -0.3:
+                sell_prob += 8
+            elif avg_sent > 0:
+                buy_prob += 3
+            elif avg_sent < 0:
+                sell_prob += 3
+    
+    # Clamp probabilities
+    buy_prob = max(0, min(100, buy_prob))
+    sell_prob = max(0, min(100, sell_prob))
+    tech_score = max(0, min(100, tech_score))
+    sent_score = max(0, min(100, sent_score))
+    
+    return {
+        "buy_probability": round(buy_prob, 1),
+        "sell_probability": round(sell_prob, 1),
+        "technical_score": tech_score,
+        "sentiment_score": sent_score,
+        "rsi": rsi,
+        "trend": trend,
+    }
+
+# ============================================================================
+# DATA QUALITY SCORING
+# ============================================================================
+
+def calculate_data_quality(data: Dict[str, Any]) -> int:
+    """Calculate data quality score (0-100) based on available data.
+    
+    Factors:
+    - Price data available (30 pts)
+    - Technical indicators available (20 pts)
+    - News available (15 pts)
+    - Fundamental data available (15 pts)
+    - Volume data available (10 pts)
+    - Symbol mapping correct (10 pts)
+    """
+    score = 0
+    
+    price_data = data.get("price", {})
+    technicals = data.get("technicals", {}) if isinstance(data, dict) else {}
+    info = data.get("info", {}) if isinstance(data, dict) else {}
+    news = data.get("news", [])
+    
+    # Price data (30 pts)
+    if price_data.get("price") is not None:
+        score += 30
+    
+    # Technical indicators (20 pts)
+    tech_count = sum(1 for k in ['rsi', 'ma20', 'ma50', 'ma200', 'change_1d_pct', 'change_5d_pct'] 
+                     if technicals.get(k) is not None)
+    score += min(20, tech_count * 3)
+    
+    # News (15 pts)
+    if news:
+        score += min(15, len(news) * 3)
+    
+    # Fundamental data (15 pts)
+    fund_count = sum(1 for k in ['marketCap', 'volume', 'trailingPE', 'dividendYield', 'beta']
+                     if info.get(k) is not None)
+    score += min(15, fund_count * 3)
+    
+    # Volume (10 pts)
+    if data.get("volume") is not None:
+        score += 10
+    
+    # Symbol mapping (10 pts) - if we have a yahoo_symbol different from broker_symbol
+    if data.get("yahoo_symbol") and data.get("yahoo_symbol") != data.get("broker_symbol"):
+        score += 10
+    elif data.get("yahoo_symbol"):
+        score += 5
+    
+    # Determine status
+    if score >= 80:
+        dq_status = "OK"
+    elif score >= 50:
+        dq_status = "PARTIAL"
+    elif score >= 30:
+        dq_status = "LOW"
+    else:
+        dq_status = "NO_PRICE_DATA"
+    
+    data["dq_status"] = dq_status
+    return score
+
+
+# ============================================================================
+# RECOMMENDATION CALCULATION
+# ============================================================================
+
+def calculate_recommendation(data: Dict[str, Any], signals: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Calculate recommendation based on signals, data quality, and settings.
+    
+    Uses a weighted scoring system:
+    - Value score (fundamentals): 30%
+    - Momentum score (technical): 40%
+    - Sentiment score (news): 30%
+    """
+    dq = data.get("dq_status", "PARTIAL")
+    price_data = data.get("price", {}) or {}
+    info = price_data.get("info", {}) if isinstance(price_data, dict) else {}
+    technicals = price_data.get("technicals", {}) if isinstance(price_data, dict) else {}
+    news = data.get("news", [])
+    
+    # Get thresholds from settings
+    buy_threshold = settings.get("buy_probability_threshold", 60)
+    sell_threshold = settings.get("sell_probability_threshold", 70)
+    
+    buy_prob = signals.get("buy_probability", 50)
+    sell_prob = signals.get("sell_probability", 50)
+    tech_score = signals.get("technical_score", 50)
+    sent_score = signals.get("sentiment_score", 50)
+    rsi = signals.get("rsi")
+    
+    # Value score (fundamentals)
+    value_score = 50
+    pe = info.get("trailingPE")
+    pb = info.get("priceToBook")
+    div_yield = info.get("dividendYield")
+    beta = info.get("beta")
+    
+    if pe is not None and pe > 0:
+        if pe < 15:
+            value_score += 15
+        elif pe > 30:
+            value_score -= 10
+    if pb is not None and pb > 0:
+        if pb < 1.5:
+            value_score += 10
+        elif pb > 5:
+            value_score -= 10
+    if div_yield is not None and div_yield > 0.03:
+        value_score += 10
+    if beta is not None:
+        if beta < 1.0:
+            value_score += 5
+        elif beta > 1.5:
+            value_score -= 5
+    
+    value_score = max(0, min(100, value_score))
+    
+    # Momentum score (technical)
+    momentum_score = tech_score
+    
+    # Sentiment score
+    sentiment_score = sent_score
+    
+    # Weighted total
+    total_score = int(
+        value_score * 0.30 +
+        momentum_score * 0.40 +
+        sentiment_score * 0.30
+    )
+    
+    # Determine recommendation
+    recommendation = "WATCH"
+    comment_parts = []
+    
+    if dq in ("OK", "PARTIAL"):
+        # Use buy/sell probability as primary signal, total_score as confirmation
+        if buy_prob >= 65:
+            recommendation = "BUY"
+            comment_parts.append(f"Strong buy signal (prob={buy_prob:.0f}%, score={total_score})")
+        elif buy_prob >= 55:
+            recommendation = "BUY"
+            comment_parts.append(f"Buy signal (prob={buy_prob:.0f}%, score={total_score})")
+        elif sell_prob >= 65:
+            recommendation = "SELL"
+            comment_parts.append(f"Strong sell signal (prob={sell_prob:.0f}%, score={total_score})")
+        elif sell_prob >= 55:
+            recommendation = "SELL"
+            comment_parts.append(f"Sell signal (prob={sell_prob:.0f}%, score={total_score})")
+        elif 45 <= buy_prob <= 55 and 45 <= sell_prob <= 55:
+            recommendation = "HOLD"
+            comment_parts.append(f"Neutral, hold (buy={buy_prob:.0f}%, sell={sell_prob:.0f}%, score={total_score})")
+        else:
+            recommendation = "WATCH"
+            comment_parts.append(f"Mixed signals, monitor (buy={buy_prob:.0f}%, sell={sell_prob:.0f}%, score={total_score})")
+    else:
+        recommendation = "WATCH"
+        comment_parts.append(f"Low data quality ({dq}) - cannot determine")
+    
+    # Add RSI context
+    if rsi is not None:
+        if rsi < 30:
+            comment_parts.append("RSI oversold")
+        elif rsi > 70:
+            comment_parts.append("RSI overbought")
+    
+    comment = " | ".join(comment_parts)
+    
+    # Average news sentiment
+    avg_sentiment = None
+    if news:
+        sents = []
+        for item in news[:10]:
+            s = item.get("sentiment", "NEUTRAL")
+            if s == "POSITIVE":
+                sents.append(1)
+            elif s == "NEGATIVE":
+                sents.append(-1)
+            else:
+                sents.append(0)
+        if sents:
+            avg_sentiment = round(sum(sents) / len(sents), 2)
+    
+    return {
+        "recommendation": recommendation,
+        "data_quality": dq,
+        "score_value": value_score,
+        "score_momentum": momentum_score,
+        "score_sentiment": sentiment_score,
+        "total_score": total_score,
+        "comment": comment,
+        "avg_sentiment": avg_sentiment,
+        "rsi": rsi
     }
 
 
@@ -1990,17 +1970,12 @@ def format_news_items(items: List[Dict[str, Any]], limit: int = 3) -> List[str]:
     return lines
 
 
-def generate_report(
-    collected_data: List[Dict[str, Any]],
-    analysis_text: str,
-    settings: Dict[str, Any],
-    global_news: Optional[List[Dict[str, Any]]] = None,
-    discovery_news: Optional[List[Dict[str, Any]]] = None,
-    broker_status: Optional[Dict[str, Any]] = None,
-    trump_news: Optional[Dict[str, Any]] = None,
-) -> str:
-    """
-    Generate final Markdown report.
+def generate_report(collected_data: List[Dict[str, Any]], analysis_text: str, settings: Dict[str, Any],
+                    global_news: Optional[List[Dict[str, Any]]] = None,
+                    discovery_news: Optional[List[Dict[str, Any]]] = None,
+                    broker_status: Optional[Dict[str, Any]] = None,
+                    trump_news: Optional[Dict[str, Any]] = None) -> str:
+    """Generate final Markdown report.
     Strict split: tradable assets with market data vs broker_only assets.
     """
     global_news    = global_news    or []
@@ -2433,6 +2408,9 @@ def main():
         return
     
     settings = config.get("settings", {})
+    # Merge ai_backends from config root into settings for AI calls
+    if "ai_backends" in config:
+        settings["ai_backends"] = config["ai_backends"]
     assets = config.get("assets", [])
     portfolio_rules = config.get("portfolio_rules", {})
 
@@ -2503,24 +2481,25 @@ def main():
             print(f"[BROKER WARNING] Revolut manual import failed: {e}")
 
     assets = merge_broker_data(assets, broker_positions)
-    assets = auto_discover_unmatched_positions(assets, broker_positions, settings)
+    symbol_aliases = config.get("symbol_aliases", {})
+    assets = auto_discover_unmatched_positions(assets, broker_positions, settings, symbol_aliases)
 
-    # === STEP 4: CHECK OLLAMA ===
-    print("[STEP 2] Checking Ollama availability...")
-    available, msg = check_ollama_available(settings)
+    # === STEP 4: CHECK LM STUDIO ===
+    print("[STEP 2] Checking LM Studio availability...")
+    available, msg = check_lmstudio_available(settings)
     if not available:
-        print(f"[WARNING] Ollama check: {msg}")
+        print(f"[WARNING] LM Studio check: {msg}")
         if not args.no_ai:
             print("[WARNING] Forcing --no-ai mode")
             args.no_ai = True
     else:
-        print(f"[OK] Ollama available")
+        print(f"[OK] LM Studio available")
         working_model = get_working_model(settings)
         if working_model:
             print(f"[OK] Working model: {working_model}")
         else:
             print("[ERROR] No working model found. Available:")
-            models = list_ollama_models(settings)
+            models = list_lmstudio_models(settings)
             if models:
                 for m in models[:5]:
                     print(f"  - {m}")
@@ -2541,23 +2520,53 @@ def main():
         print("[ERROR] No assets to analyze")
         return
     
-    # === STEP 6: COLLECT DATA ===
+# === STEP 6: COLLECT DATA ===
     print(f"\n[STEP 4] Collecting data for {len(assets)} assets...")
+    
+    # Determine which assets get per-ticker news (priority: T212 holdings, then high-priority watchlist)
+    news_limit = int(settings.get("max_news_per_asset_limit", 30))
+    # Prioritize: T212 holdings first, then assets with BUY/SELL recommendation, then by data quality
+    def asset_priority(a):
+        has_t212 = bool(a.get("trading212"))
+        is_auto = a.get("auto_discovered", False)
+        rec = (a.get("recommendation") or {}).get("recommendation", "WATCH")
+        dq = a.get("data_quality", 0)
+        return (has_t212 and not is_auto, rec in ("BUY", "SELL"), dq)
+    
+    sorted_assets = sorted(assets, key=asset_priority, reverse=True)
+    news_eligible = set(a.get("broker_symbol") for a in sorted_assets[:news_limit])
+    
     collected_data = []
     for i, asset in enumerate(assets, 1):
         broker_sym = asset.get("broker_symbol", "?")
+        # Only collect per-ticker news for priority assets
+        asset_for_collection = asset.copy()
+        if broker_sym not in news_eligible:
+            asset_for_collection = asset.copy()
+            asset_for_collection["_skip_news"] = True
+        
         print(f"  [{i}/{len(assets)}] {broker_sym}...", end=" ", flush=True)
         try:
-            data = collect_asset_data(asset, settings)
-            signals      = calculate_signals(data.get("price", {}), data.get("news", []), settings)
-            data_quality = calculate_data_quality(data)  # also sets data["dq_status"]
-            dq_str       = data.get("dq_status", "PARTIAL")
+            # Collect market data
+            market_data = collect_asset_data(asset_for_collection, settings)
+            # If we skipped news, restore empty list
+            if asset_for_collection.get("_skip_news"):
+                market_data["news"] = []
+            signals      = calculate_signals(market_data.get("price", {}), market_data.get("news", []), settings)
+            data_quality = calculate_data_quality(market_data)  # also sets data["dq_status"]
+            dq_str       = market_data.get("dq_status", "PARTIAL")
+
+            # Start with original asset data, then overlay market data
+            data = asset.copy()
+            data.update(market_data)
 
             # T212 internal codes bez Yahoo dát — SKIP scoring pipeline
+            price_dict = data.get("price", {})
+            price_val = price_dict.get("price") if isinstance(price_dict, dict) else price_dict
             if (data.get("auto_discovered")
                     and settings.get("skip_no_data_auto_discovered", True)
                     and data_quality < 20
-                    and not data.get("price", {}).get("price")
+                    and not price_val
                     and dq_str in ("NO_PRICE_DATA", "BROKER_ONLY")):
                 data["signals"]     = signals
                 data["data_quality"] = data_quality
@@ -2574,7 +2583,9 @@ def main():
                 continue
 
             # Crypto/iné tickery kde yfinance vrátil čiastočné/žiadne dáta
-            has_price = bool(data.get("price", {}).get("price"))
+            price_dict = data.get("price", {})
+            price_val = price_dict.get("price") if isinstance(price_dict, dict) else price_dict
+            has_price = bool(price_val)
             if not has_price and dq_str == "NO_PRICE_DATA":
                 log_suffix = "[OK_WITH_WARNINGS — no yfinance price, treated as WATCH only]"
             else:
@@ -2602,8 +2613,8 @@ def main():
     print(f"  BUY: {len(buy_soft)} | SELL: {len(sell_soft)} | WATCH: {len(watch_soft)}")
 
     print(f"\n[STEP 6] Collecting broad market/discovery news...")
-    global_news    = collect_global_news(settings)
-    discovery_news = collect_discovery_news(settings)
+    global_news    = [] if settings.get("skip_global_news", False) else collect_global_news(settings)
+    discovery_news = [] if settings.get("skip_discovery_news", False) else collect_discovery_news(settings)
     trump_news     = {}   # Trump radar — add collect_trump_news() call here to enable
     print(f"  Global news: {len(global_news)} | Discovery ideas: {len(discovery_news)}")
 
@@ -2684,7 +2695,7 @@ def main():
     else:
         print("  Calling AI for analysis...")
         prompt = build_prompt(collected_data, portfolio_rules, settings)
-        analysis_text = ask_ollama(prompt, settings)
+        analysis_text = run_ai_pipeline(prompt, settings)
     
     markdown_report = generate_report(collected_data, analysis_text, settings,
                                        global_news, discovery_news, broker_sync_status,
@@ -2718,3 +2729,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+logger.info("=" * 70)
+logger.info("Finished successfully")
+logger.info("=" * 70)

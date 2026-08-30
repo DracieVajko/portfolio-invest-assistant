@@ -20,8 +20,8 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from pathlib import Path
 
-from trading212_auth import Trade212Client
-from trading212_portfolio import PortfolioMonitor
+from .auth import Trade212Client
+from .portfolio import PortfolioMonitor
 
 logging.basicConfig(
     level=logging.INFO,

@@ -10,7 +10,7 @@ echo.
 
 REM -- health check --
 echo [1/2] Health check...
-python trading212_integration.py --health --config api.env
+python trading212\integration.py --health --config api.env
 if errorlevel 1 (
     echo [ERROR] Trading212 connection failed.
     pause
@@ -19,7 +19,7 @@ if errorlevel 1 (
 
 echo.
 echo [2/2] Running AI analysis (odysseus/Ollama)...
-python trading212_integration.py --analyze --config api.env
+python trading212\integration.py --analyze --config api.env
 if errorlevel 1 (
     echo [ERROR] AI analysis failed.
     pause

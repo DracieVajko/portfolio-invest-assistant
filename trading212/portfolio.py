@@ -13,7 +13,7 @@ from datetime import datetime
 from collections import defaultdict
 import logging
 
-from trading212_auth import Trade212Client
+from .auth import Trade212Client
 
 logging.basicConfig(
     level=logging.INFO,
