@@ -1,0 +1,16 @@
+{
+  "pie_id": "TechPieShort",
+  "display_name": "Tech Pie - Short Term / High Growth",
+  "horizon": "short_term",
+  "purpose": "High-growth technology exposure with opportunistic standalone adds on validated signals",
+  "default_execution_mode": "mixed",
+  "allow_standalone_adds": true,
+  "allow_standalone_sells": true,
+  "max_standalone_add_pct_of_account": 3.0,
+  "max_total_ticker_pct_of_account": 7.0,
+  "rebalance_mode": "drift_allowed",
+  "analysis_mode": "aggregate_pie_and_standalone",
+  "default_action_scope": "mixed",
+  "target_weights": null,
+  "notes": "Pie holdings are managed as a whole. Single-constituent SELL is not operationally possible inside the pie. Standalone buys are advisory OPPORTUNISTIC_STANDALONE_ADD only and must not modify pie weights."
+}

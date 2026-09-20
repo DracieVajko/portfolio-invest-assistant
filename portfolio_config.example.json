@@ -1,0 +1,131 @@
+{
+  "settings": {
+    "days_price_history": "3mo",
+    "min_history_bars": 14,
+    "stale_days": 7,
+    "buy_probability_threshold": 45,
+    "sell_probability_threshold": 55,
+    "action_add_margin": 5,
+    "action_reduce_margin": 5,
+    "action_tech_floor": 45,
+    "action_hold_band": 10,
+    "rsi_overbought": 70,
+    "rsi_oversold": 30,
+    "mapping_price_warn_pct": 15,
+    "mapping_price_block_pct": 35,
+    "skip_global_news": false,
+    "skip_discovery_news": false,
+    "max_news_per_asset": 5,
+    "max_news_age_hours": 48,
+    "max_global_news": 20,
+    "max_discovery_news": 20,
+    "auto_discover_t212_positions": true,
+    "auto_discover_min_value": 0,
+    "skip_no_data_auto_discovered": true,
+    "output_folder": "reports",
+    "runtime_dir": "runtime",
+    "use_trading212_api": false,
+    "ai_warmup_wait": 30,
+    "ai_probe_timeout": 5,
+    "ollama_load_timeout": 300,
+    "lmstudio_load_timeout": 900,
+    "ai_chain_alpha": ["alpha", "fallback"],
+    "ai_chain_summary": ["summary", "fallback"],
+    "global_news_queries": [
+      "global stock market news macro economy",
+      "central bank interest rates inflation",
+      "AI semiconductor datacenter infrastructure",
+      "renewable energy battery storage grid",
+      "major earnings guidance analyst ratings"
+    ],
+    "discovery_queries": [
+      "high quality growth stocks improving fundamentals",
+      "strong earnings raising guidance",
+      "AI infrastructure datacenter expansion",
+      "semiconductor equipment demand growth",
+      "battery materials lithium uranium",
+      "renewable energy electrification companies",
+      "significant insider buying",
+      "expanding margins accelerating revenue"
+    ]
+  },
+  "assets": [
+    {
+      "broker_symbol": "AAPL",
+      "yahoo_symbol": "AAPL",
+      "name": "Apple Inc.",
+      "group": "EQUITY",
+      "search_query": "AAPL Apple earnings guidance",
+      "aliases": ["AAPL", "Apple"],
+      "enabled": true
+    },
+    {
+      "broker_symbol": "MSFT",
+      "yahoo_symbol": "MSFT",
+      "name": "Microsoft Corp.",
+      "group": "EQUITY",
+      "search_query": "MSFT Microsoft cloud earnings",
+      "aliases": ["MSFT", "Microsoft"],
+      "enabled": true
+    },
+    {
+      "broker_symbol": "NVDA",
+      "yahoo_symbol": "NVDA",
+      "name": "NVIDIA Corp.",
+      "group": "EQUITY",
+      "search_query": "NVDA NVIDIA AI datacenter earnings",
+      "aliases": ["NVDA", "NVIDIA"],
+      "enabled": true
+    },
+    {
+      "broker_symbol": "BTC-USD",
+      "yahoo_symbol": "BTC-USD",
+      "name": "Bitcoin",
+      "group": "CRYPTO",
+      "search_query": "Bitcoin BTC-USD price macro",
+      "aliases": ["BTC", "Bitcoin"],
+      "enabled": true
+    }
+  ],
+  "symbol_aliases": {
+    "VWSBD": "VWS.CO",
+    "LITMM": "LIT",
+    "LITM": "LIT"
+  },
+  "ai_backends": {
+    "alpha": {
+      "provider": "lmstudio",
+      "base_url": "http://localhost:1234/v1",
+      "model": "fin-r1",
+      "timeout": 300,
+      "num_ctx": 8192,
+      "temperature": 0.08,
+      "enabled": true,
+      "api_key": "${OPENROUTER_API_KEY}"
+    },
+    "summary": {
+      "provider": "lmstudio",
+      "base_url": "http://localhost:1234/v1",
+      "model": "gemma-4-12b",
+      "timeout": 120,
+      "num_ctx": 8192,
+      "temperature": 0.1,
+      "enabled": true,
+      "api_key": "${OPENROUTER_API_KEY}"
+    },
+    "fallback": {
+      "provider": "ollama",
+      "base_url": "http://127.0.0.1:11434",
+      "model": "gpt-oss-20b",
+      "timeout": 300,
+      "num_ctx": 8192,
+      "temperature": 0.1,
+      "enabled": true
+    }
+  },
+  "portfolio_rules": {
+    "diversification": "Max 10% per position, max 30% per sector",
+    "risk_management": "Stop-loss at 15% for trading positions, review at 20% for DCA",
+    "rebalancing": "Quarterly review of allocation targets"
+  }
+}

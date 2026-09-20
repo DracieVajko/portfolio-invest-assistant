@@ -1,0 +1,25 @@
+# Secrets & local config
+api.env
+portfolio_config.json
+
+# Runtime artifacts
+logs/
+reports/
+runtime/
+data/cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,6 @@
+requests>=2.31.0
+yfinance>=0.2.32
+pandas>=2.0.0
+numpy>=1.26.0
+ddgs>=0.2.0
+pytest>=8  # test suite only (tests/test_v4_hardening.py)
