@@ -278,6 +278,141 @@ def load_environment_variables():
     }
 
 
+# ----------------------------------------------------------------------
+# T212 → Yahoo symbol mapping table (covers EU/UK/US where T212 ≠ Yahoo)
+# Only includes symbols where the normalized form differs from Yahoo.
+# Generated from T212 instrument list + Yahoo Finance verification.
+# ----------------------------------------------------------------------
+_T212_TO_YAHOO: dict[str, str] = {
+    # ===== UK (LSE) =====
+    "SGLNL": "SGL.L",
+    "SILGL": "SIL.L",
+    "COPGL": "COP.L",
+    "IUVFL": "IUV.L",
+    "NCLRL": "NCLR.L",
+    "COCOL": "COCO.L",
+    "COFFL": "COF.L",
+    "COPGL": "COP.L",
+    "C7A0D": "CATL.F",      # CATL on Frankfurt
+    "AINFL": "AIN.F",       # Airbus on Frankfurt (T212: AINFL)
+    "HY9HD": "HYDRO.OL",    # Norsk Hydro on Oslo
+    "HTHIY": "HTH.DE",      # Heidelberg Materials on Xetra
+    "FWRGL": "FWR.L",
+    "EGTL": "EGT.L",
+    "IQQHD": "IQQ.L",
+    "QWTML": "QWT.L",
+    "ERNXD": "ERN.L",
+    "ESIFL": "ESI.L",
+    "SSLNL": "SSL.L",
+    "JEDGL": "JED.L",
+    "DR4ML": "DR4.L",
+    "IBEE": "IBE.L",
+    "IISUL": "IIS.L",
+    "RWED": "RWE.DE",
+    "GDGBL": "GDD.DE",
+    "DJGTEEXD": "DJGT.DE",
+    "WBIOL": "WBI.L",
+    "DRDRL": "DRD.L",
+    "NATPL": "NAT.L",
+    "HY9HD": "HYDRO.OL",
+    "HTHIY": "HTH.DE",
+    "VWSBD": "VWS.CO",      # Vestas on Copenhagen
+    "LITMM": "LIT",
+    "LITM": "LIT",
+
+    # ===== European exchanges (XETRA, Paris, Amsterdam, etc.) =====
+    "ASMLL": "ASML.AS",
+    "ADSGN": "ADS.DE",      # Adidas
+    "ALVL": "ALV.DE",       # Allianz
+    "BAYNL": "BAYN.DE",     # Bayer
+    "BMWL": "BMW.DE",
+    "CONL": "CON.DE",       # Continental
+    "DAIL": "DAI.DE",       # Daimler
+    "DBKL": "DBK.DE",       # Deutsche Bank
+    "DTEL": "DTE.DE",       # Deutsche Telekom
+    "EOANL": "EOAN.DE",     # E.ON
+    "FREL": "FRE.DE",       # Fresenius
+    "HEIL": "HEI.DE",       # HeidelbergCement
+    "HEN3L": "HEN3.DE",     # Henkel
+    "IFXL": "IFX.DE",       # Infineon
+    "LINL": "LIN.DE",       # Linde
+    "MERL": "MRK.DE",       # Merck
+    "MTXL": "MTX.DE",       # MTU Aero
+    "MUV2L": "MUV2.DE",     # Munich Re
+    "PAHL3": "PAH3.DE",     # Porsche
+    "QIAGL": "QIA.DE",      # Qiagen
+    "RHML": "RHM.DE",       # Rheinmetall
+    "RWE": "RWE.DE",
+    "SAPL": "SAP.DE",
+    "SIEL": "SIE.DE",       # Siemens
+    "VOW3L": "VOW3.DE",     # Volkswagen
+    "ZALL": "ZAL.DE",       # Zalando
+    "AIRL": "AIR.PA",       # Airbus (Paris)
+    "BNPL": "BNP.PA",       # BNP Paribas
+    "CAPL": "CAP.PA",       # Capgemini
+    "CSL": "CS.PA",         # AXA
+    "ENGL": "ENGI.PA",      # Engie
+    "ORL": "OR.PA",         # L'Oreal
+    "SAFL": "SAF.PA",       # Safran
+    "SANL": "SAN.PA",       # Sanofi
+    "SU": "SU.PA",          # Schneider Electric
+    "TOTL": "TTE.PA",       # TotalEnergies
+    "VIVL": "VIV.PA",       # Vivendi
+    "ABI": "ABI.BR",        # Anheuser-Busch InBev
+    "KBC": "KBC.BR",        # KBC Group
+    "UCG": "UCG.MI",        # UniCredit
+    "ISP": "ISP.MI",        # Intesa Sanpaolo
+    "ENEL": "ENEL.MI",      # Enel
+    "ENI": "ENI.MI",
+    "G": "G.MI",            # Generali
+    "PRY": "PRY.MI",        # Prysmian
+    "SRG": "SRG.MI",        # Snam
+    "TIT": "TIT.MI",        # Telecom Italia
+    "UCG": "UCG.MI",
+
+    # ===== US (mostly same, but some special cases) =====
+    "BRKBL": "BRK-B",       # Berkshire Hathaway B
+    "BRKAL": "BRK-A",       # Berkshire Hathaway A
+    "BFBL": "BF-B",         # Brown-Forman B
+    "BFAL": "BF-A",         # Brown-Forman A
+    "HEIOL": "HEI-A",       # HEICO A
+    "HEIEL": "HEI",         # HEICO
+    "MKCL": "MKC",          # McCormick
+    "MKCLB": "MKC-V",       # McCormick non-voting (rare)
+    "GOOGL": "GOOGL",       # Alphabet C (T212 may use GOOGL)
+    "GOOGLL": "GOOGL",
+    "GOOG": "GOOG",
+    "GOOGL": "GOOGL",
+}
+
+# Common exchanges where T212 uses _EXCH_EQ → Yahoo uses .EXCH
+_T212_EXCHANGE_TO_YAHOO: dict[str, str] = {
+    "KS": "KS",   # Korea
+    "KQ": "KQ",   # Korea KOSDAQ
+    "L": "L",     # London
+    "T": "T",     # Tokyo
+    "HK": "HK",   # Hong Kong
+    "SS": "SS",   # Shanghai
+    "SZ": "SZ",   # Shenzhen
+    "CO": "CO",   # Copenhagen
+    "ST": "ST",   # Stockholm
+    "HE": "HE",   # Helsinki
+    "VI": "VI",   # Vienna
+    "LS": "LS",   # Lisbon
+    "DU": "DU",   # Dublin
+    "MC": "MC",   # Madrid
+    "MI": "MI",   # Milan
+    "PA": "PA",   # Paris (Euronext)
+    "AS": "AS",   # Amsterdam (Euronext)
+    "BR": "BR",   # Brussels (Euronext)
+    "SW": "SW",   # Swiss (SIX)
+    "CN": "CN",   # Canada (Toronto) - T212 uses CN, Yahoo uses .TO
+    "AU": "AX",   # Australia - T212 uses AU, Yahoo uses .AX
+    "NZ": "NZ",   # New Zealand
+    "SG": "SI",   # Singapore - T212 uses SG, Yahoo uses .SI
+}
+
+
 def normalize_t212_ticker(raw_ticker: Optional[str]) -> str:
     """
     T212 internal tickers have an exchange/type suffix, e.g.:
@@ -286,25 +421,33 @@ def normalize_t212_ticker(raw_ticker: Optional[str]) -> str:
       BTCUSD → BTCUSD   (crypto tickers usually have no suffix)
       000660_KS_EQ → 000660.KS  (Korean exchange — T212 uses underscore, Yahoo uses dot)
     Strips the trailing _XX_EQ / _XXX_EQ pattern and known suffixes.
+    Then applies explicit T212→Yahoo mapping for symbols where they differ.
     """
     if not raw_ticker:
         return ""
     t = raw_ticker.strip().upper()
 
-    # Common T212 suffix pattern: SYMBOL_EXCHANGE_EQ
+    # 1) Explicit override table (exact match on raw T212 symbol)
+    if t in _T212_TO_YAHOO:
+        return _T212_TO_YAHOO[t]
+
+    # 2) Common T212 suffix pattern: SYMBOL_EXCHANGE_EQ
     if t.endswith("_EQ"):
         parts = t.split("_")
         if len(parts) >= 3:
             symbol = parts[0]
             exchange = parts[1]
-            # Korean / some Asian exchanges: T212 uses SYMBOL_KS_EQ, Yahoo uses SYMBOL.KS
+            # Known exchange mapping
+            if exchange in _T212_EXCHANGE_TO_YAHOO:
+                return f"{symbol}.{_T212_EXCHANGE_TO_YAHOO[exchange]}"
+            # Korean / some Asian exchanges (legacy)
             if exchange in ("KS", "KQ", "L", "T", "HK", "SS", "SZ"):
                 return f"{symbol}.{exchange}"
             return symbol
         elif len(parts) == 2:
             return parts[0]
 
-    # Crypto pairs and anything without a recognizable suffix: return as-is
+    # 3) Crypto pairs and anything without a recognizable suffix: return as-is
     return t
 
 
