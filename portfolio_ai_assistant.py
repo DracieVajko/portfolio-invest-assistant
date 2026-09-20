@@ -37,9 +37,11 @@ import math
 import os
 import queue
 import random
+import re
 import sys
 import threading
 import time
+import urllib.parse
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -95,6 +97,259 @@ except ImportError:
         from duckduckgo_search import DDGS
     except ImportError:
         DDGS = None
+
+
+# ============================================================================
+# TICKER RESOLUTION (web search fallback for unknown tickers)
+# ============================================================================
+
+_TICKER_RESOLUTION_CACHE: Dict[str, Optional[str]] = {}
+
+# Global list to track tickers that failed all resolution attempts
+_FAILED_TICKERS: List[Dict[str, Any]] = []
+
+
+def _search_yahoo_ticker_via_web(broker_symbol: str, asset_name: str = "") -> Optional[str]:
+    """
+    Search the web for the correct Yahoo Finance ticker for a given broker symbol.
+    
+    Uses DDGS to search for queries like "SYMBOL Yahoo Finance ticker" or 
+    "COMPANY NAME stock symbol Yahoo Finance".
+    
+    Returns the Yahoo ticker if found with high confidence, else None.
+    """
+    if not DDGS:
+        return None
+    
+    cache_key = broker_symbol.upper()
+    if cache_key in _TICKER_RESOLUTION_CACHE:
+        return _TICKER_RESOLUTION_CACHE[cache_key]
+    
+    # Build search queries - try multiple strategies
+    queries = []
+    base = broker_symbol
+    
+    # Strategy 1: Direct symbol search
+    queries.append(f"{base} Yahoo Finance ticker symbol")
+    queries.append(f"{base} stock ticker Yahoo Finance")
+    
+    # Strategy 2: If we have an asset name, use it
+    if asset_name and asset_name != base:
+        queries.append(f"{asset_name} stock symbol Yahoo Finance")
+        queries.append(f"{asset_name} ticker Yahoo Finance")
+    
+    # Strategy 3: Exchange-specific searches for common patterns
+    if base.endswith("_EQ") or "_" in base:
+        clean = normalize_t212_ticker(base)
+        if clean != base:
+            queries.append(f"{clean} Yahoo Finance ticker")
+    
+    for query in queries:
+        try:
+            results = list(DDGS().text(query, max_results=5, region='us', safesearch='moderate'))
+            for r in results:
+                # Extract potential ticker from result
+                title = r.get("title", "") or ""
+                snippet = r.get("body", "") or r.get("snippet", "") or ""
+                url = r.get("url", "") or ""
+                text = f"{title} {snippet} {url}".upper()
+                
+                # Look for Yahoo Finance URLs with ticker patterns
+                yahoo_match = re.search(r'FINANCE\.YAHOO\.COM/QUOTE/([A-Z0-9\.\-]+)', url.upper())
+                if yahoo_match:
+                    candidate = yahoo_match.group(1)
+                    if _validate_yahoo_ticker(candidate):
+                        _TICKER_RESOLUTION_CACHE[cache_key] = candidate
+                        logger.info(f"Resolved {broker_symbol} -> {candidate} via web search")
+                        return candidate
+                
+                # Look for ticker patterns in text: SYMBOL.EXCHANGE or SYMBOL
+                ticker_matches = re.findall(r'\b([A-Z]{1,5}(?:\.[A-Z]{1,3})?)\b', text)
+                for candidate in ticker_matches:
+                    # Filter out common false positives
+                    if candidate in {"THE", "AND", "FOR", "YOU", "ARE", "BUT", "NOT", "YOU", "ALL", "NEW", "TOP", "BEST", "USD", "EUR", "GBP", "ETF", "IPO", "CEO", "CFO", "YOY", "QOQ", "FY", "Q1", "Q2", "Q3", "Q4"}:
+                        continue
+                    if _validate_yahoo_ticker(candidate):
+                        _TICKER_RESOLUTION_CACHE[cache_key] = candidate
+                        logger.info(f"Resolved {broker_symbol} -> {candidate} via web search (text match)")
+                        return candidate
+                        
+        except Exception as e:
+            logger.debug(f"Web search for ticker {broker_symbol} failed: {e}")
+            continue
+    
+    _TICKER_RESOLUTION_CACHE[cache_key] = None
+    return None
+
+
+def _validate_yahoo_ticker(ticker: str) -> bool:
+    """Quick validation that a ticker looks like a valid Yahoo Finance symbol."""
+    if not ticker or len(ticker) > 20:
+        return False
+    # Basic pattern: alphanumeric, dots, hyphens
+    if not re.match(r'^[A-Z0-9\.\-]+$', ticker):
+        return False
+    # Must have at least one letter
+    if not re.search(r'[A-Z]', ticker):
+        return False
+    # Common invalid patterns
+    if ticker in {"WWW", "HTTP", "HTTPS", "COM", "ORG", "NET", "HTML", "API", "JSON", "XML"}:
+        return False
+    return True
+
+
+def resolve_ticker_with_fallback(asset: Dict[str, Any]) -> Optional[str]:
+    """
+    Attempt to resolve the correct Yahoo ticker for an asset.
+    
+    Tries in order:
+    1. Built-in mapping table (normalize_t212_ticker)
+    2. symbol_aliases from config
+    3. Web search via DDGS
+    4. Direct Yahoo Finance lookup with the broker symbol
+    
+    Returns the resolved Yahoo ticker, or None if all methods fail.
+    """
+    broker_symbol = (asset.get("broker_symbol") or "").upper()
+    asset_name = asset.get("name", "")
+    symbol_aliases = asset.get("_symbol_aliases", {})
+    
+    # 1. Try built-in mapping table
+    mapped = normalize_t212_ticker(broker_symbol)
+    if mapped and mapped != broker_symbol:
+        if _validate_yahoo_ticker(mapped):
+            logger.debug(f"Mapped {broker_symbol} -> {mapped} via built-in table")
+            return mapped
+    
+    # 2. Try config aliases
+    if broker_symbol in symbol_aliases:
+        alias = symbol_aliases[broker_symbol]
+        if _validate_yahoo_ticker(alias):
+            logger.debug(f"Mapped {broker_symbol} -> {alias} via config alias")
+            return alias
+    
+    # 3. Try web search
+    web_resolved = _search_yahoo_ticker_via_web(broker_symbol, asset_name)
+    if web_resolved:
+        return web_resolved
+    
+    # 4. Try direct Yahoo lookup with broker symbol (maybe it works directly)
+    if _validate_yahoo_ticker(broker_symbol):
+        return broker_symbol
+    
+    return None
+
+
+def record_failed_ticker(asset: Dict[str, Any], reason: str, attempted_tickers: List[str]):
+    """Record a ticker that failed all resolution attempts for the failure report."""
+    _FAILED_TICKERS.append({
+        "broker_symbol": asset.get("broker_symbol"),
+        "yahoo_symbol": asset.get("yahoo_symbol"),
+        "name": asset.get("name", ""),
+        "group": asset.get("group", ""),
+        "broker": asset.get("trading212", {}).get("broker", "Trading212") if asset.get("trading212") else "Unknown",
+        "quantity": asset.get("trading212", {}).get("quantity") if asset.get("trading212") else None,
+        "avg_price": asset.get("trading212", {}).get("average_price") if asset.get("trading212") else None,
+        "currency": asset.get("trading212", {}).get("currencyCode") or asset.get("trading212", {}).get("currency") if asset.get("trading212") else None,
+        "market_value": asset.get("trading212", {}).get("market_value") if asset.get("trading212") else None,
+        "reason": reason,
+        "attempted_tickers": attempted_tickers,
+        "suggested_config_entry": {
+            "broker_symbol": asset.get("broker_symbol"),
+            "yahoo_symbol": "<RESOLVE_MANUALLY>",
+            "name": asset.get("name", asset.get("broker_symbol")),
+            "group": asset.get("group", "PORTFOLIO"),
+            "search_query": asset.get("broker_symbol"),
+            "aliases": [asset.get("broker_symbol")],
+            "enabled": True
+        }
+    })
+
+
+def get_failed_tickers_report() -> List[Dict[str, Any]]:
+    """Get the list of failed tickers for report generation."""
+    return _FAILED_TICKERS.copy()
+
+
+def clear_failed_tickers():
+    """Clear the failed tickers list (call at start of each run)."""
+    _FAILED_TICKERS.clear()
+    _TICKER_RESOLUTION_CACHE.clear()
+
+
+def generate_failed_tickers_md(failed_tickers: List[Dict[str, Any]], run_id: str) -> str:
+    """Generate a Markdown report of failed tickers with exact JSON format for manual config."""
+    if not failed_tickers:
+        return ""
+    
+    lines = []
+    lines.append("# Failed Ticker Resolution Report")
+    lines.append(f"Run: `{run_id}` | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append(f"Total failed tickers: **{len(failed_tickers)}**")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("These tickers could not be automatically resolved to Yahoo Finance symbols.")
+    lines.append("Add them manually to `portfolio_config.json` under `assets` and `symbol_aliases`.")
+    lines.append("")
+    
+    # Group by reason
+    by_reason = {}
+    for ft in failed_tickers:
+        reason = ft.get("reason", "Unknown")
+        if reason not in by_reason:
+            by_reason[reason] = []
+        by_reason[reason].append(ft)
+    
+    for reason, items in by_reason.items():
+        lines.append(f"### {reason} ({len(items)} tickers)")
+        lines.append("")
+        for ft in items:
+            lines.append(f"- **{ft['broker_symbol']}** ({ft.get('name', '')})")
+            lines.append(f"  - Broker: {ft.get('broker', 'Unknown')}")
+            lines.append(f"  - Quantity: {ft.get('quantity', 'N/A')}")
+            lines.append(f"  - Avg Price: {ft.get('avg_price', 'N/A')}")
+            lines.append(f"  - Currency: {ft.get('currency', 'N/A')}")
+            lines.append(f"  - Market Value: {ft.get('market_value', 'N/A')}")
+            lines.append(f"  - Reason: {ft.get('reason', 'Unknown')}")
+            lines.append(f"  - Attempted: {', '.join(ft.get('attempted_tickers', ['N/A']))}")
+            lines.append("")
+    
+    lines.append("---")
+    lines.append("## Ready-to-copy JSON for `portfolio_config.json`")
+    lines.append("")
+    lines.append("### Add to `assets` array:")
+    lines.append("```json")
+    
+    assets_json = []
+    for ft in failed_tickers:
+        entry = ft["suggested_config_entry"]
+        # Try to infer a better yahoo_symbol if possible
+        if entry["yahoo_symbol"] == "<RESOLVE_MANUALLY>":
+            entry["yahoo_symbol"] = entry["broker_symbol"]
+        assets_json.append(entry)
+    
+    lines.append(json.dumps(assets_json, indent=2, ensure_ascii=False))
+    lines.append("```")
+    lines.append("")
+    lines.append("### Add to `symbol_aliases` (if broker symbol differs from Yahoo):")
+    lines.append("```json")
+    
+    aliases = {}
+    for ft in failed_tickers:
+        broker = ft["broker_symbol"]
+        # We don't know the correct Yahoo symbol, but we can suggest the format
+        aliases[broker] = "<RESOLVE_MANUALLY>"
+    
+    lines.append(json.dumps(aliases, indent=2, ensure_ascii=False))
+    lines.append("```")
+    lines.append("")
+    lines.append("---")
+    lines.append("*Generated by Portfolio AI Assistant v4.1.0-hardening*")
+    lines.append("")
+    
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -2611,6 +2866,7 @@ def _build_result(*, run_id, started_utc, finished_utc, config, settings, args,
                    "yf_ok": yf_ok, "yf_fail": yf_fail, "news_total": news_total},
         "news": {"global": global_news, "discovery": discovery_news},
         "broker_cash_ok": bool(broker_sync_status.get("account_total")),
+        "failed_tickers": get_failed_tickers_report(),
     }
 
 
@@ -2881,6 +3137,31 @@ def build_dq_report(result) -> str:
         lines.append(f"- {d.get('broker_symbol', '?')}: action={d.get('action')} "
                      f"blockers={'; '.join(d.get('blockers', [])) or 'n/a'}")
     lines.append("")
+    lines.append("### Failed ticker resolution")
+    failed_tickers = result.get("failed_tickers", [])
+    if failed_tickers:
+        lines.append(f"Total failed: **{len(failed_tickers)}**")
+        lines.append("")
+        by_reason = {}
+        for ft in failed_tickers:
+            reason = ft.get("reason", "Unknown")
+            if reason not in by_reason:
+                by_reason[reason] = []
+            by_reason[reason].append(ft)
+        
+        for reason, items in by_reason.items():
+            lines.append(f"#### {reason} ({len(items)} tickers)")
+            lines.append("")
+            for ft in items:
+                lines.append(f"- **{ft['broker_symbol']}** ({ft.get('name', '')})")
+                lines.append(f"  - Reason: {ft.get('reason', 'Unknown')}")
+                lines.append(f"  - Attempted: {', '.join(ft.get('attempted_tickers', ['N/A']))}")
+                lines.append(f"  - Suggested config: `{json.dumps(ft['suggested_config_entry'], ensure_ascii=False)}`")
+                lines.append("")
+    else:
+        lines.append("- none")
+    lines.append("")
+    
     if js.get("warnings"):
         lines.append("### Run warnings")
         for warning in js["warnings"]:
@@ -2917,7 +3198,8 @@ def _build_manifest(result, published: Dict[str, str]) -> Dict[str, Any]:
 
 
 def publish_run(result, main_md: str, dq_md: str, manifest: Dict[str, Any],
-                output_folder: str = "reports", json_only: bool = False) -> Dict[str, str]:
+                output_folder: str = "reports", json_only: bool = False,
+                failed_tickers_md: str = "") -> Dict[str, str]:
     """Atomically publish latest/ + archive/ + legacy compat copies. Returns {label: path}."""
     out = Path(output_folder)
     latest = out / "latest"
@@ -2930,6 +3212,8 @@ def publish_run(result, main_md: str, dq_md: str, manifest: Dict[str, Any],
     if not json_only:
         payloads[0:0] = [("portfolio_report.md", main_md, False),
                          ("data_quality.md", dq_md, False)]
+        if failed_tickers_md:
+            payloads.append(("failed_tickers.md", failed_tickers_md, False))
 
     for name, content, is_json in payloads:
         if is_json:
@@ -2960,6 +3244,7 @@ def publish_run(result, main_md: str, dq_md: str, manifest: Dict[str, Any],
 def _run_pipeline(args, config, settings, assets, portfolio_rules, env,
                   run_id: str, started_utc) -> int:
     """Full automatic pipeline. Returns a RunExit code. Lock held by caller."""
+    clear_failed_tickers()  # Reset failed tickers for this run
     broker_positions = {
         "trading212": [],
         "revolut": []
@@ -3112,12 +3397,48 @@ def _run_pipeline(args, config, settings, assets, portfolio_rules, env,
             # Start with original asset data, then overlay market data
             data = asset.copy()
             data.update(market_data)
+            data["_symbol_aliases"] = symbol_aliases  # for ticker resolution
 
             # --- V4: mapping audit + price gate inputs ---
             mapping = _mapping_of(asset)
             t212 = data.get("trading212") or {}
             if t212 and not mapping.broker_currency:
                 mapping.broker_currency = t212.get("currencyCode") or t212.get("currency")
+
+            # T212 internal codes bez Yahoo dát — attempt ticker resolution before skipping
+            price_dict = data.get("price", {})
+            price_val = price_dict.get("price") if isinstance(price_dict, dict) else price_dict
+            
+            # Attempt ticker resolution if no price data
+            attempted_tickers = [asset.get("yahoo_symbol") or asset.get("broker_symbol")]
+            if (not price_val and dq_str in ("NO_PRICE_DATA", "BROKER_ONLY")):
+                resolved_ticker = resolve_ticker_with_fallback(data)
+                if resolved_ticker and resolved_ticker != (asset.get("yahoo_symbol") or asset.get("broker_symbol")):
+                    logger.info(f"Retrying {asset.get('broker_symbol')} with resolved ticker: {resolved_ticker}")
+                    # Retry collection with resolved ticker
+                    retry_asset = asset.copy()
+                    retry_asset["yahoo_symbol"] = resolved_ticker
+                    retry_market_data = collect_asset_data(retry_asset, settings)
+                    if retry_market_data.get("price", {}).get("price"):
+                        # Success! Use the resolved data
+                        data = asset.copy()
+                        data.update(retry_market_data)
+                        data["_symbol_aliases"] = symbol_aliases
+                        mapping = _mapping_of(asset)
+                        t212 = data.get("trading212") or {}
+                        if t212 and not mapping.broker_currency:
+                            mapping.broker_currency = t212.get("currencyCode") or t212.get("currency")
+                        price_dict = data.get("price", {})
+                        price_val = price_dict.get("price") if isinstance(price_dict, dict) else price_dict
+                        signals = calculate_signals(data.get("price", {}), data.get("news", []), settings)
+                        data_quality = calculate_data_quality(data)
+                        dq_str = data.get("dq_status", "PARTIAL")
+                        logger.info(f"Successfully resolved {asset.get('broker_symbol')} -> {resolved_ticker}")
+                    else:
+                        attempted_tickers.append(resolved_ticker)
+                        logger.warning(f"Resolved ticker {resolved_ticker} still returned no data for {asset.get('broker_symbol')}")
+                else:
+                    logger.warning(f"Could not resolve ticker for {asset.get('broker_symbol')}")
 
             # T212 internal codes bez Yahoo dát — SKIP scoring pipeline
             price_dict = data.get("price", {})
@@ -3149,6 +3470,8 @@ def _run_pipeline(args, config, settings, assets, portfolio_rules, env,
                 data["action_reasons"] = ["No market data for broker-only ticker."]
                 data["levels"] = None
                 data["levels_reason"] = "blocked-data-quality"
+                # Record failed ticker for report
+                record_failed_ticker(data, "T212 internal ticker — no Yahoo Finance data after all resolution attempts", attempted_tickers)
                 collected_data.append(data)
                 print("[SKIP — T212 internal ticker, no Yahoo data]")
                 continue
@@ -3358,10 +3681,13 @@ def _run_pipeline(args, config, settings, assets, portfolio_rules, env,
         logger.info("run_id=%s phase=publish status=SKIP reason=dry-run", run_id)
     else:
         print(f"\n[STEP 8] Publishing reports (atomic)...")
+        # Generate failed tickers report
+        failed_tickers_md = generate_failed_tickers_md(result.get("failed_tickers", []), run_id)
         with V4.phase(logger, run_id, "publish") as stat:
             published = publish_run(result, main_md, dq_md, manifest,
                                     output_folder=settings.get("output_folder", "reports"),
-                                    json_only=args.json_only)
+                                    json_only=args.json_only,
+                                    failed_tickers_md=failed_tickers_md)
             manifest = _build_manifest(result, published)
             # Re-publish manifest with final file list (manifest itself is new information)
             out_folder = settings.get("output_folder", "reports")
