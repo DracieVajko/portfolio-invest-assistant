@@ -1,0 +1,86 @@
+{
+  "_comment": "Copy to portfolio_config.json and adapt to YOUR portfolio. NEVER commit portfolio_config.json. Unknown keys are ignored; missing keys fall back to EngineSettings defaults.",
+  "settings": {
+    "provider": "auto",
+    "language": "English",
+    "lm_studio_base_url": "http://127.0.0.1:1234/v1",
+    "lm_studio_model": "your-reasoning-model",
+    "decision_model": "your-reasoning-model",
+    "writer_model": "your-summary-model",
+    "request_timeout_seconds": 1800,
+    "output_folder": "reports",
+    "archive_folder": "reports/archive",
+    "log_folder": "logs",
+    "buy_probability_threshold": 45,
+    "sell_probability_threshold": 55,
+    "days_price_history": "3mo",
+    "max_news_per_asset": 5,
+    "max_news_age_days": 2,
+    "use_trading212_api": true,
+    "auto_discovery_limit": 8,
+    "skip_no_data_auto_discovered": true,
+    "watchlist": ["AAPL", "MSFT", "NVDA"],
+    "global_news_queries": [
+      "global stock market news macro economy",
+      "central bank interest rates inflation"
+    ],
+    "discovery_queries": [
+      "high quality growth stocks improving fundamentals"
+    ],
+    "market_regime": {
+      "symbol": "EXI2.DE",
+      "news": {
+        "max_age_hours": 48,
+        "min_relevance_score": 30,
+        "max_articles_per_symbol": 5
+      }
+    }
+  },
+  "assets": [
+    {
+      "broker_symbol": "AAPL",
+      "yahoo_symbol": "AAPL",
+      "tradingview_symbol": "NASDAQ:AAPL",
+      "name": "Apple Inc. (example)",
+      "group": "EQUITY",
+      "quantity": null,
+      "average_price": null,
+      "target_weight_pct": null,
+      "search_query": "AAPL Apple earnings guidance",
+      "aliases": ["AAPL", "Apple"],
+      "enabled": true
+    },
+    {
+      "broker_symbol": "MSFT",
+      "yahoo_symbol": "MSFT",
+      "tradingview_symbol": "NASDAQ:MSFT",
+      "name": "Microsoft Corp. (example)",
+      "group": "EQUITY",
+      "quantity": null,
+      "average_price": null,
+      "target_weight_pct": null,
+      "search_query": "MSFT Microsoft cloud earnings",
+      "aliases": ["MSFT", "Microsoft"],
+      "enabled": true
+    },
+    {
+      "broker_symbol": "BTC-USD",
+      "yahoo_symbol": "BTC-USD",
+      "tradingview_symbol": "BINANCE:BTCUSD",
+      "name": "Bitcoin (example)",
+      "group": "CRYPTO",
+      "quantity": null,
+      "average_price": null,
+      "target_weight_pct": null,
+      "search_query": "Bitcoin BTC-USD price macro",
+      "aliases": ["BTC", "Bitcoin"],
+      "enabled": true
+    }
+  ],
+  "symbol_aliases": {
+    "VWSBD": "VWS.CO"
+  },
+  "portfolio_rules": {
+    "diversification": "Max 10% per position, max 30% per sector"
+  }
+}

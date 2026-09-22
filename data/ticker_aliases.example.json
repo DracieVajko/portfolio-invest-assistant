@@ -1,0 +1,10 @@
+{
+  "_comment": "Predefined T212 -> Yahoo Finance symbol aliases (user-owned). Copy this file to data/ticker_aliases.json and fill in YOUR tickers. Entries here beat the built-in table; portfolio_config.json symbol_aliases still win over this file. See reports/latest/failed_tickers.md for tickers that need mapping.",
+  "VWSBD": "VWS.CO",
+  "EGTL": "EGT.L",
+  "C7A0D": "CATL.F",
+  "IBEE": "IBE.MC",
+  "RWED": "RWE.DE",
+  "SGLNL": "SGL.L",
+  "NCLRL": "NCLR.L"
+}

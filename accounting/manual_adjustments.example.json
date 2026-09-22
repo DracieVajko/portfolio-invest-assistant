@@ -1,0 +1,34 @@
+{
+  "starting_cash_eur": "10000.00",
+  "historical_fee_adjustments": [
+    {
+      "date": "2023-01-15",
+      "event_type": "fx_conversion_fee",
+      "amount_eur": "25.50",
+      "reason": "Broker statement shows higher FX fee than CSV export"
+    }
+  ],
+  "external_deposits": [
+    {
+      "date": "2023-01-01",
+      "amount_eur": "5000.00",
+      "source": "initial_funding",
+      "reference": "bank_transfer_001"
+    },
+    {
+      "date": "2023-06-15",
+      "amount_eur": "3000.00",
+      "source": "monthly_contribution",
+      "reference": "bank_transfer_002"
+    }
+  ],
+  "external_withdrawals": [
+    {
+      "date": "2023-12-20",
+      "amount_eur": "2000.00",
+      "source": "living_expenses",
+      "reference": "bank_transfer_003"
+    }
+  ],
+  "notes": "Copy this file to a local ignored path (e.g., ../local/manual_adjustments.json) and populate with actual data. Never commit to Git."
+}

@@ -1,0 +1,38 @@
+# Secrets & local configuration (never commit)
+api.env
+portfolio_config.json
+data/ticker_aliases.json
+accounting/manual_adjustments.json
+
+# Runtime output (regenerated every run)
+logs/
+reports/
+runtime/
+data/cache/
+*.db
+*.db-shm
+*.db-wal
+data/t212_*.json
+data/news_*.json
+data/*earnings*.json
+data/*finviz*.json
+
+# Personal holdings exports (keep only example_* templates)
+PIEs/*.csv
+!PIEs/example_*.csv
+
+# Local archives / version snapshots (never commit)
+Zalohy/
+portfolio-invest-assistant-clean/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

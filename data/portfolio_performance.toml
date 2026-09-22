@@ -1,0 +1,30 @@
+# Portfolio performance baseline — user-editable fallback ledger.
+#
+# HOW TO UPDATE AFTER A NEW DEPOSIT OR WITHDRAWAL:
+# 1. Set net_deposits_eur to (total cash deposited into Trading212 minus
+#    total cash withdrawn), expressed in EUR.
+# 2. Set verified_at to today's date (YYYY-MM-DD).
+# 3. Keep source = "manual_verified" and adjust the note if useful.
+# 4. Save the file and re-run the report generator.
+#
+# RULES (do not break these):
+# - This baseline is used ONLY when the Trading212 API transaction history
+#   is unavailable, partial, or fails validation. Verified API history
+#   always takes priority — never add API deposits/withdrawals on top of
+#   this number for the same period (that would double-count capital).
+# - Do NOT put FX fees, trading commissions, or any cost estimate here
+#   unless you explicitly want an independent manual adjustment. Broker
+#   total equity already reflects all costs, so subtracting fees here AND
+#   relying on broker equity would subtract them twice.
+# - BUY/SELL orders are not deposits/withdrawals and do not belong here.
+
+[performance_baseline]
+net_deposits_eur = 3201.51
+verified_at = "2026-09-10"
+source = "manual_verified"
+note = "Total cash deposited into Trading212 minus withdrawals. EUR."
+
+[manual_adjustments]
+# Keep empty by default.
+# Do not add FX fees here unless the user explicitly wants an independent
+# adjustment. Fees must not be subtracted twice from broker-equity P&L.

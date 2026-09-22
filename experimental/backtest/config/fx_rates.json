@@ -1,0 +1,15 @@
+{
+  "as_of": "2026-08-27",
+  "base_currency": "EUR",
+  "notes": "Dated local FX fixture. Used for advisory backtest only. GBX handled as GBP/100. Update dated file for new runs; do not edit hidden static conversions.",
+  "rates": {
+    "EUR": 1.0,
+    "USD": 0.922,
+    "GBP": 1.183,
+    "DKK": 0.134,
+    "CHF": 1.065,
+    "SEK": 0.087,
+    "NOK": 0.085
+  },
+  "gbx_divisor": 100
+}
