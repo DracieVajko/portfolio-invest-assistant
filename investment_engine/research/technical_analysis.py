@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -17,6 +16,113 @@ except ImportError:
     HAS_PANDAS_TA = False
     logger.warning("pandas-ta not installed, using manual indicators")
 
+# TA-Lib is optional and unavailable on most Windows hosts. Candlestick
+# patterns are attempted only when the native capability is present.
+try:
+    import talib  # noqa: F401
+    HAS_TALIB = True
+except ImportError:
+    HAS_TALIB = False
+    logger.info("TA-Lib not installed, candlestick patterns disabled")
+
+# Finviz kill-switch: on 404/API-incompatibility the integration disables
+# itself for the remainder of the run instead of retrying every stage.
+_FINVIZ_DISABLED = False
+_FINVIZ_API_MARKERS = ("404", "not found", "invalid", "unsupported", "incompatible", "no longer",
+                       "has no attribute", "unexpected keyword")
+
+
+def _finviz_api_broken(exc: Exception) -> bool:
+    low = str(exc or "").lower()
+    return any(m in low for m in _FINVIZ_API_MARKERS)
+
+
+def disable_finviz(reason: str = "") -> None:
+    """Disable Finviz for the remainder of the run (concise, no traceback)."""
+    global _FINVIZ_DISABLED
+    if not _FINVIZ_DISABLED:
+        _FINVIZ_DISABLED = True
+        logger.info("FinViz disabled for the remainder of the run%s", f": {reason}" if reason else "")
+
+
+def finviz_enabled() -> bool:
+    return HAS_FINVIZ and not _FINVIZ_DISABLED
+
+
+def group_sector_breadth_from_table(df, sectors: list[str] | None = None) -> dict[str, Any]:
+    """Parse a finviz GROUP sector table (1 row = 1 sector) into breadth data.
+
+    Expected columns (live HTML headers): Name, Market Cap, P/E, Change,
+    Volume, Stocks, ... ``Change`` arrives via finvizfinance's
+    ``number_convert`` as a fraction (``"-2.12%"`` -> ``-0.0212``) or None;
+    a defensive branch also accepts raw ``"x%"`` strings. ``count`` comes
+    from the ``Stocks`` column. Per-ticker advancing/declining distribution
+    is NOT in this table -> those keys stay None (declared, not hidden).
+    Never raises: unusable tables yield {}.
+    """
+    results: dict[str, Any] = {}
+    try:
+        if df is None or getattr(df, "empty", True):
+            return results
+        records = df.to_dict("records") if hasattr(df, "to_dict") else []
+        by_name: dict[str, dict] = {}
+        for rec in records:
+            if isinstance(rec, dict) and str(rec.get("Name", "")).strip():
+                by_name[str(rec.get("Name")).strip()] = rec
+        wanted = sectors or list(by_name.keys())
+        for sector in wanted:
+            rec = by_name.get(str(sector).strip())
+            if not isinstance(rec, dict):
+                continue
+            change_raw = rec.get("Change", None)
+            avg_change = None
+            try:
+                if isinstance(change_raw, str):
+                    s = change_raw.strip()
+                    if s and s != "-":
+                        avg_change = float(s.rstrip("%")) / 100.0 if s.endswith("%") else float(s)
+                        avg_change = round(avg_change * 100.0, 4)
+                elif isinstance(change_raw, bool):
+                    avg_change = None
+                elif change_raw is not None:
+                    avg_change = round(float(change_raw) * 100.0, 4)
+            except (TypeError, ValueError):
+                avg_change = None
+            count = None
+            try:
+                if rec.get("Stocks", None) is not None:
+                    count = int(float(rec.get("Stocks")))
+            except (TypeError, ValueError):
+                count = None
+            results[str(sector).strip()] = {
+                "count": count,
+                "avg_change": avg_change,
+                "advancing": None,
+                "declining": None,
+                "source": "finviz-group-table-v1",
+            }
+    except Exception:
+        return {}
+    return results
+
+
+def should_use_finviz(yahoo_symbol: str | None) -> bool:
+    """FinViz covers US listings only — gate BEFORE any HTTP call.
+
+    Yahoo tickers (``AAPL``, ``BRK.B``) pass; dotted EU venues (``EXI2.DE``),
+    crypto pairs (``BTC-USD``) and empty inputs are skipped so a dataless 404
+    can never fire. US-venue proof beyond the ticker itself is unnecessary
+    here: the kill-switch remains the backstop for API drift.
+    """
+    import re as _re_fv
+
+    s = str(yahoo_symbol or "").strip()
+    if not s:
+        return False
+    if s.upper().endswith(("-USD",)):
+        return False
+    return bool(_re_fv.match(r"^[A-Z]{1,5}(\.[AB])?$", s))
+
 # Try to import finvizfinance
 try:
     from finvizfinance.quote import finvizfinance
@@ -30,57 +136,14 @@ except ImportError:
     logger.warning("finvizfinance not installed, FinViz features disabled")
 
 
-@dataclass
-class IndicatorConfig:
-    """Configuration for technical indicators."""
-    # Trend
-    sma_periods: list[int] = None
-    ema_periods: list[int] = None
-    macd_fast: int = 12
-    macd_slow: int = 26
-    macd_signal: int = 9
-    adx_period: int = 14
-    supertrend_period: int = 10
-    supertrend_multiplier: float = 3.0
-
-    # Momentum
-    rsi_periods: list[int] = None
-    stoch_k: int = 14
-    stoch_d: int = 3
-    cci_period: int = 20
-    willr_period: int = 14
-
-    # Volatility
-    bb_period: int = 20
-    bb_std: float = 2.0
-    kc_period: int = 20
-    kc_scalar: float = 1.5
-    atr_period: int = 14
-    donchian_period: int = 20
-
-    # Volume
-    obv: bool = True
-    vwap: bool = True
-    mfi_period: int = 14
-    cmf_period: int = 20
-
-    # Candlestick patterns (requires TA-Lib)
-    candlestick_patterns: list[str] = None
-
-    def __post_init__(self):
-        if self.sma_periods is None:
-            self.sma_periods = [20, 50, 100, 200]
-        if self.ema_periods is None:
-            self.ema_periods = [9, 12, 21, 26, 50]
-        if self.rsi_periods is None:
-            self.rsi_periods = [7, 14]
-        if self.candlestick_patterns is None:
-            self.candlestick_patterns = [
-                "doji", "hammer", "hanging_man", "engulfing", "harami",
-                "morning_star", "evening_star", "three_white_soldiers",
-                "three_black_crows", "piercing", "dark_cloud_cover",
-                "shooting_star", "inverted_hammer", "marubozu",
-            ]
+# Canonical manual engine lives in research/indicators.py (Phase 3 policy A).
+# IndicatorConfig is re-exported here for backward compatibility.
+from investment_engine.research.indicators import (
+    ENGINE_VERSION as MANUAL_ENGINE_VERSION,
+    IndicatorConfig,
+    apply_manual_indicators,
+    resolve_engine,
+)
 
 
 class TechnicalAnalyzer:
@@ -89,8 +152,12 @@ class TechnicalAnalyzer:
     Supports multi-timeframe analysis with 150+ indicators.
     """
 
-    def __init__(self, config: IndicatorConfig | None = None):
+    def __init__(self, config: IndicatorConfig | None = None, engine: str = "auto"):
         self.config = config or IndicatorConfig()
+        # Policy A: "manual" forces the canonical engine; "reference" requires
+        # pandas-ta (raises when missing); "auto" preserves legacy behavior.
+        self.engine = engine
+        self.resolved_engine = resolve_engine(engine, HAS_PANDAS_TA)
         self._validate_dependencies()
 
     def _validate_dependencies(self):
@@ -127,131 +194,21 @@ class TechnicalAnalyzer:
             missing = required - set(df.columns)
             raise ValueError(f"Missing required columns: {missing}")
 
-        # Apply indicators - use pandas-ta if available, otherwise manual
-        if HAS_PANDAS_TA:
+        # Policy A: canonical manual engine unless reference explicitly resolved.
+        if self.resolved_engine == "manual":
+            df = apply_manual_indicators(df, self.config)
+        else:
             df = self._apply_trend_indicators(df)
             df = self._apply_momentum_indicators(df)
             df = self._apply_volatility_indicators(df)
             df = self._apply_volume_indicators(df)
             df = self._apply_candlestick_patterns(df)
-        else:
-            df = self._apply_manual_indicators(df)
 
         return df
 
     def _apply_manual_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Manual indicator calculations when pandas-ta is not available."""
-        close = df["close"]
-        high = df["high"]
-        low = df["low"]
-        volume = df["volume"]
-
-        # SMAs
-        for period in self.config.sma_periods:
-            df[f"SMA_{period}"] = close.rolling(period).mean()
-
-        # EMAs
-        for period in self.config.ema_periods:
-            df[f"EMA_{period}"] = close.ewm(span=period, adjust=False).mean()
-
-        # MACD (manual)
-        ema_fast = close.ewm(span=self.config.macd_fast, adjust=False).mean()
-        ema_slow = close.ewm(span=self.config.macd_slow, adjust=False).mean()
-        df["MACD"] = ema_fast - ema_slow
-        df["MACD_SIGNAL"] = df["MACD"].ewm(span=self.config.macd_signal, adjust=False).mean()
-        df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
-
-        # RSI (manual)
-        for period in self.config.rsi_periods:
-            delta = close.diff()
-            gain = delta.where(delta > 0, 0).rolling(period).mean()
-            loss = -delta.where(delta < 0, 0).rolling(period).mean()
-            rs = gain / loss.replace(0, np.nan)
-            df[f"RSI_{period}"] = 100 - (100 / (1 + rs))
-
-        # Bollinger Bands
-        sma_bb = close.rolling(self.config.bb_period).mean()
-        std_bb = close.rolling(self.config.bb_period).std()
-        df["BB_MIDDLE"] = sma_bb
-        df["BB_UPPER"] = sma_bb + self.config.bb_std * std_bb
-        df["BB_LOWER"] = sma_bb - self.config.bb_std * std_bb
-        df["BB_BANDWIDTH"] = (df["BB_UPPER"] - df["BB_LOWER"]) / df["BB_MIDDLE"]
-        df["BB_PERCENT"] = (close - df["BB_LOWER"]) / (df["BB_UPPER"] - df["BB_LOWER"])
-
-        # ATR (manual)
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        df[f"ATR_{self.config.atr_period}"] = tr.rolling(self.config.atr_period).mean()
-
-        # ADX (simplified manual)
-        plus_dm = high.diff()
-        minus_dm = low.diff()
-        plus_dm[plus_dm < 0] = 0
-        minus_dm[minus_dm > 0] = 0
-        minus_dm = minus_dm.abs()
-        tr_smooth = tr.rolling(self.config.adx_period).mean()
-        plus_di = 100 * (plus_dm.rolling(self.config.adx_period).mean() / tr_smooth)
-        minus_di = 100 * (minus_dm.rolling(self.config.adx_period).mean() / tr_smooth)
-        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-        df["ADX"] = dx.rolling(self.config.adx_period).mean()
-        df["DMP"] = plus_di
-        df["DMN"] = minus_di
-
-        # Stochastic
-        lowest_low = low.rolling(self.config.stoch_k).min()
-        highest_high = high.rolling(self.config.stoch_k).max()
-        df["STOCH_K"] = 100 * (close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
-        df["STOCH_D"] = df["STOCH_K"].rolling(self.config.stoch_d).mean()
-
-        # Volume indicators
-        df["OBV"] = (np.sign(close.diff()) * volume).fillna(0).cumsum()
-        df["VOL_SMA_20"] = volume.rolling(20).mean()
-        df["VOLUME_RATIO"] = volume / df["VOL_SMA_20"]
-
-        # VWAP (session-based approximation)
-        typical_price = (high + low + close) / 3
-        df["VWAP"] = (typical_price * volume).rolling(self.config.bb_period).sum() / volume.rolling(self.config.bb_period).sum()
-
-        # CCI
-        tp = (high + low + close) / 3
-        sma_tp = tp.rolling(self.config.cci_period).mean()
-        mean_dev = tp.rolling(self.config.cci_period).apply(lambda x: np.mean(np.abs(x - x.mean())))
-        df[f"CCI_{self.config.cci_period}"] = (tp - sma_tp) / (0.015 * mean_dev.replace(0, np.nan))
-
-        # Williams %R
-        highest_high_wr = high.rolling(self.config.willr_period).max()
-        lowest_low_wr = low.rolling(self.config.willr_period).min()
-        df[f"WILLR_{self.config.willr_period}"] = -100 * (highest_high_wr - close) / (highest_high_wr - lowest_low_wr).replace(0, np.nan)
-
-        # Donchian Channels
-        df["DC_UPPER"] = high.rolling(self.config.donchian_period).max()
-        df["DC_LOWER"] = low.rolling(self.config.donchian_period).min()
-        df["DC_MIDDLE"] = (df["DC_UPPER"] + df["DC_LOWER"]) / 2
-
-        # MFI (simplified)
-        typical_price = (high + low + close) / 3
-        money_flow = typical_price * volume
-        pos_flow = money_flow.where(typical_price > typical_price.shift(), 0).rolling(self.config.mfi_period).sum()
-        neg_flow = money_flow.where(typical_price < typical_price.shift(), 0).rolling(self.config.mfi_period).sum()
-        mfi_ratio = pos_flow / neg_flow.replace(0, np.nan)
-        df[f"MFI_{self.config.mfi_period}"] = 100 - (100 / (1 + mfi_ratio))
-
-        # CMF
-        mf_multiplier = ((close - low) - (high - close)) / (high - low).replace(0, np.nan)
-        mf_volume = mf_multiplier * volume
-        df[f"CMF_{self.config.cmf_period}"] = mf_volume.rolling(self.config.cmf_period).sum() / volume.rolling(self.config.cmf_period).sum()
-
-        # Supertrend (simplified)
-        hl2 = (high + low) / 2
-        atr = df[f"ATR_{self.config.atr_period}"]
-        df["SUPERT_LONG"] = hl2 - self.config.supertrend_multiplier * atr
-        df["SUPERT_SHORT"] = hl2 + self.config.supertrend_multiplier * atr
-        df["SUPERT"] = df["SUPERT_LONG"]
-        df["SUPERT_DIR"] = np.where(close > df["SUPERT_LONG"], 1, -1)
-
-        return df
+        """Manual indicator calculations (delegates to the canonical engine)."""
+        return apply_manual_indicators(df, self.config)
 
     def _apply_trend_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         # SMAs
@@ -403,7 +360,10 @@ class TechnicalAnalyzer:
         return df
 
     def _apply_candlestick_patterns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Apply candlestick patterns (requires TA-Lib)."""
+        """Apply candlestick patterns (requires TA-Lib native capability)."""
+        if not HAS_TALIB:
+            logger.debug("Skipping candlestick patterns: TA-Lib capability absent")
+            return df
         try:
             for pattern in self.config.candlestick_patterns:
                 result = ta.cdl_pattern(df["open"], df["high"], df["low"], df["close"], name=pattern)
@@ -543,6 +503,11 @@ class FinVizEnrichment:
 
     def get_quote_data(self, symbol: str) -> dict[str, Any]:
         """Get comprehensive quote data from FinViz."""
+        if not finviz_enabled():
+            return {}
+        if not should_use_finviz(symbol):
+            logger.debug("FinViz quote skipped for non-US symbol: %s", symbol)
+            return {}
         try:
             stock = finvizfinance(symbol)
             return {
@@ -555,11 +520,21 @@ class FinVizEnrichment:
                 "outer_ratings": stock.ticker_outer_ratings().to_dict("records") if hasattr(stock, 'ticker_outer_ratings') else [],
             }
         except Exception as e:
-            logger.warning("FinViz quote fetch failed for %s: %s", symbol, e)
+            if _finviz_api_broken(e):
+                disable_finviz(str(e)[:120])
+            else:
+                logger.warning("FinViz quote fetch failed for %s: %s", symbol, e)
             return {}
 
     def get_sector_breadth(self, sectors: list[str] | None = None) -> dict[str, Any]:
-        """Get sector performance breadth from FinViz Groups."""
+        """Get sector performance breadth from FinViz Groups.
+
+        Uses ONE ``group.overview`` call (``screener_view(group="Sector")``):
+        the group endpoint has no ``set_filter`` (calling it raised
+        ``AttributeError`` and silently killed sector data in run 524fffa0).
+        The table is sector-aggregate (1 row = 1 sector), so ``avg_change``
+        is the sector's own Change and ``advancing``/``declining`` stay None.
+        """
         if sectors is None:
             sectors = [
                 "Technology", "Healthcare", "Financial", "Consumer Cyclical",
@@ -567,30 +542,24 @@ class FinVizEnrichment:
                 "Basic Materials", "Consumer Defensive", "Communication Services",
             ]
 
-        results = {}
+        results: dict[str, Any] = {}
+        if not finviz_enabled():
+            return results
         try:
             go = FinvizGroupOverview()
-            for sector in sectors:
-                try:
-                    go.set_filter(filters_dict={"Sector": sector})
-                    df = go.screener_view()
-                    if not df.empty:
-                        results[sector] = {
-                            "count": len(df),
-                            "avg_change": float(df["Change"].astype(str).str.rstrip('%').astype(float).mean()) if "Change" in df.columns else None,
-                            "advancing": int((df["Change"].astype(str).str.rstrip('%').astype(float) > 0).sum()) if "Change" in df.columns else None,
-                            "declining": int((df["Change"].astype(str).str.rstrip('%').astype(float) < 0).sum()) if "Change" in df.columns else None,
-                        }
-                except Exception as e:
-                    logger.debug("FinViz sector %s failed: %s", sector, e)
-                    continue
+            df = go.screener_view(group="Sector", order="Name")
+            return group_sector_breadth_from_table(df, sectors)
         except Exception as e:
-            logger.warning("FinViz group overview failed: %s", e)
-
-        return results
+            if _finviz_api_broken(e):
+                disable_finviz(str(e)[:120])
+            else:
+                logger.warning("FinViz group overview failed: %s", e)
+            return results
 
     def get_market_news(self) -> dict[str, list]:
         """Get market news from FinViz."""
+        if not finviz_enabled():
+            return {"news": [], "blogs": []}
         try:
             fnews = FinvizNews()
             all_news = fnews.get_news()
@@ -599,26 +568,39 @@ class FinVizEnrichment:
                 "blogs": all_news.get("blogs", pd.DataFrame()).head(10).to_dict("records"),
             }
         except Exception as e:
-            logger.warning("FinViz news fetch failed: %s", e)
+            if _finviz_api_broken(e):
+                disable_finviz(str(e)[:120])
+            else:
+                logger.warning("FinViz news fetch failed: %s", e)
             return {"news": [], "blogs": []}
 
     def get_insider_activity(self, option: str = "latest") -> list[dict]:
         """Get insider trading activity."""
+        if not finviz_enabled():
+            return []
         try:
             finsider = FinvizInsider(option=option)
             return finsider.get_insider().head(20).to_dict("records")
         except Exception as e:
-            logger.warning("FinViz insider fetch failed: %s", e)
+            if _finviz_api_broken(e):
+                disable_finviz(str(e)[:120])
+            else:
+                logger.warning("FinViz insider fetch failed: %s", e)
             return []
 
     def screen_stocks(self, filters: dict[str, str]) -> pd.DataFrame:
         """Screen stocks using FinViz filters."""
+        if not finviz_enabled():
+            return pd.DataFrame()
         try:
             fo = FinvizOverview()
             fo.set_filter(filters_dict=filters)
             return fo.screener_view()
         except Exception as e:
-            logger.warning("FinViz screener failed: %s", e)
+            if _finviz_api_broken(e):
+                disable_finviz(str(e)[:120])
+            else:
+                logger.warning("FinViz screener failed: %s", e)
             return pd.DataFrame()
 
 

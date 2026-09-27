@@ -16,7 +16,7 @@ class OllamaProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:11434",
+        base_url: str = "http://100.101.20.64:1234",
         model: str = "gemma4:12b",
         max_context_tokens: int = 128000,
         max_output_tokens: int = 4096,

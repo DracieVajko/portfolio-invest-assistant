@@ -1,236 +1,59 @@
 {
   "settings": {
-    "ollama_base_url": "http://127.0.0.1:11434",
-    "ollama_chat_endpoint": "/api/chat",
-    "ollama_tags_endpoint": "/api/tags",
-    "model": "local-model",
-    "fallback_model": "local-fallback",
-    "language": "en",
-    "num_ctx": 32000,
-    "temperature": 0.08,
-    "ollama_timeout_seconds": 1800,
-    "days_price_history": "6mo",
+    "language": "English",
     "output_folder": "reports",
     "archive_folder": "reports/archive",
     "cache_folder": "data/cache",
     "log_folder": "logs",
-    "max_news_per_asset": 4,
-    "max_forum_per_asset": 5,
-    "max_web_per_asset": 5,
-    "min_data_quality_for_signal": 60,
-    "allow_ai_to_change_probabilities": false,
-    "use_trading212_api": true,
-    "use_tradingview_public_data": true,
-    "use_social_sentiment": true,
-    "use_reddit": true,
-    "use_x_sentiment": true,
-    "use_stocktwits": true,
-    "use_sector_news": true,
-    "use_revolut_manual_research": true,
-    "use_macro_news": true,
-    "news_relevance_threshold": 60,
-    "buy_probability_threshold": 60,
-    "sell_probability_threshold": 65,
-    "ai_max_assets": 10,
-    "prioritize_manual_assets": true,
-    "always_include_portfolio": true,
-    "always_include_watchlist": true,
-    "auto_discovery_limit": 8,
-    "max_news_age_days": 2,
-    "ignore_duplicate_news": true,
-    "ignore_otc": true,
-    "use_etf_analysis": true,
-    "use_crypto_analysis": true,
+    "provider": "lmstudio",
+    "decision_model": "qwen3.8-9b",
+    "writer_model": "google/gemma-4-12b",
+    "lm_studio_base_url": "http://localhost:1234/v1",
+    "ollama_base_url": "http://localhost:11434",
+    "use_trading212_api": false,
+    "t212_reconciliation_threshold_pct": 0.1,
+    "use_playwright_fallback": false,
     "market_regime": {
       "enabled": true,
       "symbol": "EXI2.DE",
-      "cache_ttl_seconds": 3600,
-      "timeframes": {
-        "intraday_15m": {
-          "interval": "15m",
-          "period": "1d",
-          "lookback_bars": 96,
-          "enabled": true,
-          "weight": 0.5
-        },
-        "intraday_1h": {
-          "interval": "1h",
-          "period": "5d",
-          "lookback_bars": 120,
-          "enabled": true,
-          "weight": 0.7
-        },
-        "daily": {
-          "interval": "1d",
-          "period": "3mo",
-          "lookback_bars": 63,
-          "enabled": true,
-          "weight": 1.5
-        },
-        "weekly": {
-          "interval": "1wk",
-          "period": "2y",
-          "lookback_bars": 104,
-          "enabled": true,
-          "weight": 2.0
-        },
-        "monthly": {
-          "interval": "1mo",
-          "period": "max",
-          "lookback_bars": 120,
-          "enabled": true,
-          "weight": 1.0
-        }
-      },
-      "peak_valley": {
-        "prominence_pct": 2.0,
-        "min_distance": 5,
-        "cluster_threshold_pct": 1.0,
-        "min_prominence_bars": 3
-      },
-      "thresholds": {
-        "peak_hold_rsi_daily_min": 60,
-        "peak_hold_rsi_weekly_min": 55,
-        "peak_hold_price_above_sma20_daily": true,
-        "peak_hold_price_above_sma50_weekly": true,
-        "peak_hold_macd_hist_declining": true,
-        "peak_hold_consolidation_days_min": 5,
-        "peak_hold_consolidation_range_pct": 2.5,
-        "declining_price_below_sma20_daily": true,
-        "declining_price_below_sma50_daily": true,
-        "declining_macd_bearish_cross": true,
-        "declining_rsi_daily_max": 50,
-        "declining_adx_min": 25,
-        "declining_lower_highs": true,
-        "declining_lower_lows": true,
-        "must_buy_near_200dma_tolerance_pct": 2.0,
-        "must_buy_near_52w_low_tolerance_pct": 5.0,
-        "must_buy_rsi_daily_max": 35,
-        "must_buy_rsi_weekly_max": 40,
-        "must_buy_volume_spike_threshold": 2.0,
-        "must_buy_supertrend_flip_bullish": true,
-        "must_buy_macd_weekly_bullish": true,
-        "min_timeframes_agree": 2,
-        "confidence_threshold": 0.75
-      },
       "news": {
         "max_age_hours": 48,
-        "min_relevance_score": 60,
+        "min_relevance_score": 30,
         "max_articles_per_symbol": 5
-      },
-      "finviz": {
-        "enabled": true,
-        "get_fundamentals": true,
-        "get_sector_breadth": true,
-        "sectors": [
-          "Technology",
-          "Healthcare",
-          "Financial",
-          "Consumer Cyclical",
-          "Industrial",
-          "Energy",
-          "Utilities",
-          "Real Estate",
-          "Basic Materials",
-          "Consumer Defensive",
-          "Communication Services"
-        ]
-      },
-      "reporting": {
-        "include_in_main_report": true,
-        "include_charts": false,
-        "include_json": true
       }
-    },
-    "global_news_queries": [
-      "major global stock market news affecting long-term investors",
-      "AI semiconductor GPU datacenter cloud infrastructure latest developments",
-      "renewable energy battery storage nuclear grid modernization latest news",
-      "Federal Reserve ECB inflation interest rates macroeconomic news",
-      "major earnings surprises guidance changes analyst upgrades downgrades",
-      "major mergers acquisitions strategic partnerships technology sector",
-      "global lithium uranium hydrogen rare earth supply chain news",
-      "Bitcoin Ethereum institutional adoption ETF regulation news"
-    ],
-    "discovery_queries": [
-      "high quality growth stocks with improving fundamentals",
-      "companies reporting strong earnings and raising guidance",
-      "AI infrastructure companies benefiting from datacenter expansion",
-      "semiconductor equipment suppliers with growing demand",
-      "battery materials lithium uranium hydrogen investment opportunities",
-      "renewable energy grid modernization electrification companies",
-      "companies with significant insider buying",
-      "companies with expanding margins and accelerating revenue growth",
-      "undervalued technology leaders after earnings selloff",
-      "emerging companies supplying Nvidia AMD TSMC Microsoft"
-    ],
-    "odysseus_url": "http://localhost:7000",
-    "odysseus_model": "",
-    "odysseus_probe_timeout": 10,
-    "auto_discover_min_value": 1.0,
-    "skip_no_data_auto_discovered": true,
-    "lm_studio_base_url": "http://localhost:1234/v1",
-    "lm_studio_model": "local-model",
-    "lm_studio_timeout": 7200,
-    "lm_studio_context_tokens": 32000,
-    "lm_studio_max_output_tokens": 8192,
-    "decision_model": "local-decision",
-    "writer_model": "local-writer",
-    "max_parallel_requests": 1,
-    "openrouter_base_url": "https://openrouter.ai/api/v1",
-    "openrouter_model": "openrouter/free",
-    "openrouter_context_tokens": 62000,
-    "openrouter_max_output_tokens": 8192,
-    "provider": "lmstudio"
+    }
   },
   "assets": [
     {
-      "broker_symbol": "AAPL",
+      "broker_symbol": "AAPL_US_EQ",
       "yahoo_symbol": "AAPL",
-      "tradingview_symbol": "NASDAQ:AAPL",
-      "name": "Apple Inc. (example)",
-      "group": "EQUITY",
-      "quantity": null,
-      "average_price": null,
-      "target_weight_pct": null,
-      "search_query": "AAPL Apple earnings guidance",
-      "aliases": [
-        "AAPL",
-        "Apple"
-      ],
+      "name": "Apple Inc (DEMO)",
+      "group": "tech",
+      "quantity": 1.0,
+      "average_price": 150.0,
       "enabled": true
     },
     {
-      "broker_symbol": "MSFT",
+      "broker_symbol": "MSFT_US_EQ",
       "yahoo_symbol": "MSFT",
-      "tradingview_symbol": "NASDAQ:MSFT",
-      "name": "Microsoft Corp. (example)",
-      "group": "EQUITY",
-      "quantity": null,
-      "average_price": null,
-      "target_weight_pct": null,
-      "search_query": "MSFT Microsoft cloud earnings",
-      "aliases": [
-        "MSFT",
-        "Microsoft"
-      ],
+      "name": "Microsoft Corp (DEMO)",
+      "group": "tech",
+      "quantity": 1.0,
+      "average_price": 300.0,
       "enabled": true
     },
     {
-      "broker_symbol": "BTC-USD",
+      "broker_symbol": "BTCUSD",
       "yahoo_symbol": "BTC-USD",
-      "tradingview_symbol": "BINANCE:BTCUSD",
-      "name": "Bitcoin (example)",
-      "group": "CRYPTO",
-      "quantity": null,
-      "average_price": null,
-      "target_weight_pct": null,
-      "search_query": "Bitcoin BTC-USD price macro",
-      "aliases": [
-        "BTC",
-        "Bitcoin"
-      ],
+      "name": "Bitcoin (DEMO)",
+      "group": "crypto",
+      "quantity": 0.01,
+      "average_price": 60000.0,
       "enabled": true
     }
-  ]
+  ],
+  "portfolio_rules": {},
+  "symbol_aliases": {
+    "AAPL": "AAPL"
+  }
 }

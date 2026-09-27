@@ -1,171 +1,168 @@
-﻿> [!WARNING]
-> **Current `main` is a beta / work-in-progress modular rewrite.**
-> The latest stable monolithic release is [`v0.6.0`](../../tree/v0.6.0).
->
-> This beta may contain bugs, incomplete features, incorrect calculations, data-provider edge cases, configuration incompatibilities, and breaking changes. Use it only for development and research. Do not rely on it for investment decisions.
-
 # Portfolio AI Assistant
 
-> **Read-only research and advisory tool — not financial advice and not an automated trading system. It does not create, modify or cancel broker orders.**
+Reliable Investment Monitoring System with local AI models (Ollama/LM Studio).
 
-Local portfolio monitoring and reporting assistant. It collects market data (yfinance), news (DDGS / DuckDuckGo), sector breadth (finvizfinance), and optional read-only Trading 212 positions, calculates deterministic BUY / SELL / WATCH signals with data-quality scoring, and renders Markdown + JSON reports. An optional local LLM layer (Ollama / LM Studio / OpenRouter) can tidy results, but all decisions are traceable without AI.
+## Features
 
-## Status
+- **T212 Integration** - Read-only portfolio sync via Trading 212 API
+- **Technical Analysis** - RSI, MA crossovers, momentum, trend detection
+- **Signal Generation** - BUY/SELL/HOLD with probabilities
+- **Per-Asset News** - 48h filtered news with sentiment analysis
+- **Local AI** - Works with Ollama or LM Studio (Fin-R1, Gemma, GPT-OSS)
+- **Deterministic Reports** - Markdown + JSON output
 
-- **Current `main` — `v1.0.0-beta.1` (Beta / WIP):** Modular rewrite with market-regime analysis and experimental backtesting. Not production-ready. May contain bugs, incomplete features, incorrect calculations, data-provider edge cases, configuration incompatibilities and breaking changes.
-- **Latest stable — `v0.6.0` (Current stable monolithic release):** Maintenance-oriented monolithic workflow used for regular local portfolio monitoring. No full automated test suite; all outputs must be independently validated. Recommended for routine use. See [`v0.6.0`](../../tree/v0.6.0).
+## Quick Start
 
-> If you need a stable local workflow today, checkout [`v0.6.0`](../../tree/v0.6.0). Use `main` only for development and research.
-
-## Version history
-
-| Version | Tag | Status | Summary |
-|---|---|---|---|
-| Initial baseline | [`v0.1.0`](../../tree/v0.1.0) | Historical | Initial monolithic portfolio tracker baseline |
-| Feature-rich monolith | [`v0.5.0`](../../tree/v0.5.0) | Historical | Multi-source research and broker-position auto-discovery |
-| Stable monolith | [`v0.6.0`](../../tree/v0.6.0) | Current stable | Regularly used local monitoring workflow; no comprehensive automated test suite |
-| Modular rewrite | [`v1.0.0-beta.1`](../../tree/v1.0.0-beta.1) | Beta / WIP | Experimental modular rewrite; not production-ready |
-
-Tags preserve selected architectural milestones, not every local backup.
-
-See [CHANGELOG.md](CHANGELOG.md) for a chronological summary and [docs/releases/](docs/releases/) for per-version notes.
-
-## What this beta does
-
-- All features from `v0.5.0` plus modular architecture:
-  - **Modular investment engine** (`investment_engine/`): settings, orchestration, providers (Ollama / LM Studio / OpenRouter fallback), research, portfolio, reporting, schemas, scoring, prompts, memory
-  - **Multi-timeframe market regime**: SMA/EMA/MACD/ADX/Supertrend/RSI/CCI/ATR/OBV/VWAP, Fibonacci levels, peak/valley detection, daily/weekly/monthly/15m/1h via `yfinance`
-  - **Pie-level exposure**: read-only aggregation of pie holdings; real PIE CSV exports are gitignored
-  - **Parallel news**: 48h window, relevance threshold, `feedparser` + `finvizfinance`
-  - **Provider fallback**: LM Studio → Ollama → OpenRouter with retry
-  - **Experimental backtest** (isolated, advisory only): deterministic indicators, `tech_pie_pullback_v1` strategy, next-open execution, dated FX configs, no network calls, no secrets — see [Limitations](#known-limitations-and-experimental-backtest)
-
-## Trading 212 — read-only
-
-- **Read-only import only.** The integration performs only `GET` requests (`/api/v0/equity/portfolio`, `/api/v0/equity/account/cash`, history). It never places, modifies or cancels broker orders.
-- No automated trading. The tool does not create, modify or cancel orders and must not be used as an automated trading system.
-- Credentials are local only (`api.env`, gitignored). See [Safe setup](#safe-local-setup).
-
-## Safe local setup
-
-Never commit secrets. Use the safe templates:
-
+### 1. Install Dependencies
 ```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-
-# 1. Create secrets file (not tracked)
-copy api.env.example api.env
-# Edit api.env — keep TRADING212_ENABLED=false for offline testing
-
-# 2. Create portfolio config (not tracked)
-copy portfolio_config.example.json portfolio_config.json
-# Adjust holdings / ai_backends if needed
-
-# 3. Optional: example PIE exports are already included
-dir PIEs
 ```
 
-- `api.env.example` — placeholder env vars (TRADING212_*, OLLAMA_*, LM_STUDIO_*, OPENROUTER_* with empty keys, localhost endpoints)
-- `portfolio_config.example.json` — safe example (demo assets, localhost endpoints)
-- You must create local `api.env` and `portfolio_config.json` before running. The `*.example` files are safe templates.
-
-## Privacy model and gitignored local data
-
-Private and runtime files are gitignored:
-
-- Secrets: `api.env`, `.env`, `portfolio_config.json` (only `*.example` tracked)
-- Personal financial data: `PIEs/*.csv` (only `PIEs/example_*.csv` tracked), `investment_engine/memory/memory.json`
-- Runtime output: `data/`, `logs/`, `reports/`, `experimental/reports/`
-- Caches and DBs: `__pycache__/`, `.pytest_cache/`, `*.db`, `*.sqlite`, `.venv/`
-- Temporary patches: `fix_*.py`, `*.bak`, `*.tmp`, `*Conflict*`
-
-Example configs contain only demo assets (e.g. `AAPL`, `MSFT`, `BTC-USD`) — no real holdings, quantities, or P/L. Never paste real `TRADING212_API_KEY`, `TRADING212_API_SECRET`, `TRADING212_ACCOUNT_ID`, holdings, or PIE exports into issues or commits.
-
-## Requirements
-
-- Python 3.12+ (scipy/numpy, optional `pandas-ta` needs `numba` on 3.12)
-- `pip install -r requirements.txt` — core: `requests`, `yfinance`, `pandas`, `ddgs`, `python-dotenv`, `scipy`, `numpy`, `feedparser`, `finvizfinance`
-
-For LM Studio: load your model and enable the OpenAI-compatible server on `http://localhost:1234/v1`.
-
-## How to run (typical)
-
+### 2. Configure
 ```bash
-# Deterministic report, no AI
-python portfolio_ai_assistant.py --no-ai
-
-# Full modular engine (requires local LLM if enabled, falls back to --no-ai)
-python portfolio_ai_assistant.py --config portfolio_config.json --investment-engine --generate-full-report
-
-# Helpers
-python trading212\integration.py --health --config api.env
-python trading212\integration.py --export reports\t212_portfolio.json --config api.env
+cp api.env.example api.env
+# Edit api.env with your T212 API credentials
 ```
 
-Windows batch helpers (`run_automated.bat`, `run_full_report.bat`, `run_t212_analysis.bat`, `run_t212_export.bat`) wrap the same commands.
+### 3. Configure Portfolio
+Edit `portfolio_config.json` with your assets and settings.
 
-Outputs (gitignored):
+### 4. Run (Python 3.12 required — use `py -3.12`)
 
-- `reports/portfolio_analysis.md` / `.json` + `reports/archive/*` + `reports/ai_context_*.md`
-- `logs/portfolio_*.log` + `logs/latest_run.log`
-- `data/cache/*.db`
-
-## High-level architecture
-
-```
-portfolio_ai_assistant.py            — thin wrapper (EngineSettings, run_engine, write_reports)
-investment_engine/
-  config/settings.py               — EngineSettings.from_mapping
-  main.py                          — run_engine() orchestration (T212 + news + regime + AI)
-  providers/                       — base, factory, fallback, LM Studio, Ollama, OpenRouter
-  research/                        — market data, market regime, news, peak/valley, technical analysis, pies, sector templates
-  portfolio/                       — exposure, pie metadata, sidecar
-  reporting/                       — regime report
-  schemas/                         — AI recommendations
-  scoring/, pipeline/              — priority, engine
-  prompts/                         — markdown prompt templates
-  memory/                          — local memory (memory.json gitignored)
-experimental/
-  backtest/                        — engine, indicators, benchmarks, compare, io, metrics, validate, costs
-  backtest/strategy/               — base, tech_pie_pullback_v1 + configs
-  tests/                           — backtest fixtures & 7 tests
-tests/                             — market regime, pie exposure, pie hardening
-PIEs/config/*.json                 — pie strategy metadata (tracked, no holdings)
-PIEs/example_*.csv                 — safe CSV examples (real PIEs/*.csv gitignored)
-portfolio_config.example.json      — safe example (tracked)
-api.env.example                    — placeholder env vars (tracked)
+**Full report (requires LM Studio unless all providers fall back to deterministic output):**
+```bash
+py -3.12 portfolio_ai_assistant.py
 ```
 
-## Known limitations and experimental backtest
+**Custom config:**
+```bash
+py -3.12 portfolio_ai_assistant.py --config portfolio_config.json
+```
 
-### This beta (v1.0.0-beta.1)
+Supported flags today: `--config <path>`, `--investment-engine`, `--generate-full-report`
+(compatibility only; reports are always written).
+Planned / not implemented: `--no-ai`, `--asset`, `--scheduled`, `--validate-only`, `--dry-run`.
 
-- Beta / WIP: may contain bugs, incomplete features, incorrect calculations, data-provider edge cases, configuration incompatibilities and breaking changes.
-- Architecture is still evolving; configuration keys and report schemas may change without migration.
-- Requires independent validation before any investment decision. Do not rely on it for live decisions.
+**Environment verification (offline, no secrets printed):**
+```bash
+py -3.12 scripts/verify_environment.py
+py -3.12 scripts/verify_environment.py --smoke
+```
 
-### Stable monolithic (v0.6.0)
+### Batch Files (Windows)
+```cmd
+run_automated.bat      # Daily automated run
+run_full_report.bat    # Full report with AI
+run_t212_analysis.bat  # T212 analysis only
+```
 
-- Current stable monolithic release used for regular local portfolio monitoring.
-- Has **no full automated test suite**; outputs must be independently validated (prices, signals, LLM tidy-ups).
-- Live data providers (yfinance, DDGS, Trading 212) may be unavailable or rate-limited.
+## Configuration
 
-### Experimental backtest (`experimental/backtest/`)
+### `portfolio_config.json`
+- `assets` - Your portfolio assets with symbols, groups, aliases
+- `settings` - Thresholds, AI backends, news settings
+- `symbol_aliases` - T212 internal ticker → Yahoo Finance mappings
+- `ai_backends` - LM Studio / Ollama model configuration
 
-- **Research only, not a guarantee of future performance.** Isolated from the production engine: consumes only local OHLCV CSV/parquet with dated FX (`experimental/backtest/config/*.json`), executes signals at next open, tracks `data_hash`/`fx_hash`/`config_hash` for reproducibility.
-- No Trading 212, LLM, or network calls. No secrets.
-- Must be checked for look-ahead bias (`experimental/tests/test_no_lookahead.py`). Passing a backtest does **not imply future profitability**.
-- Limitations apply: simplified costs, fixed slippage assumptions, survivorship bias if universe is not point-in-time.
+### `api.env`
+```env
+TRADING212_API_KEY=your_key
+TRADING212_API_SECRET=your_secret
+TRADING212_ENABLED=true
+```
 
-## Releases
+## Project Structure
 
-- [v0.1.0](docs/releases/v0.1.0.md) — Historical baseline
-- [v0.5.0](docs/releases/v0.5.0.md) — Historical feature-rich monolith
-- [v0.6.0](docs/releases/v0.6.0.md) — Current stable monolithic release
-- [v1.0.0-beta.1](docs/releases/v1.0.0-beta.1.md) — Beta / WIP modular rewrite (this branch)
-- [CHANGELOG.md](CHANGELOG.md) — Chronological summary
+```
+portfolio_ai_assistant/
+├── portfolio_ai_assistant.py   # Main entry point
+├── portfolio_config.json       # Configuration
+├── requirements.txt
+├── api.env                     # Secrets (gitignored)
+├── .gitignore
+├── trading212/                 # T212 modules
+│   ├── auth.py                 # Authentication
+│   ├── portfolio.py            # Portfolio analysis
+│   └── integration.py          # High-level integration
+├── reports/                    # Generated reports (gitignored)
+├── logs/                       # Runtime logs (gitignored)
+├── data/                       # Cache/data
+└── run_*.bat                   # Windows batch helpers
+```
+
+## AI Models (LM Studio)
+
+| Model | Purpose |
+|-------|---------|
+| `fin-r1` | Alpha analysis (reasoning) |
+| `gemma-4-12b` | Summary (fast) |
+| `gpt-oss-20b` | Fallback |
+
+Configure in `ai_backends` section of config.
+
+## Scheduled operation
+
+Windows Task Scheduler (or double-click `run_full_report.bat`, which pins Python 3.12):
+
+```cmd
+py -3.12 portfolio_ai_assistant.py --config portfolio_config.json --investment-engine --generate-full-report
+```
+
+> Note: `--scheduled` is planned / not implemented. The batch files above pass only
+> the actually supported flags. A `runtime/run.lock` single-run lock plus exit codes
+> `3` (already running) / `4` (partial) / `5` (broker sync failed) are likewise
+> planned / not implemented.
+
+Current outputs per run (see `portfolio_ai_assistant.write_reports`):
+
+```text
+reports/current/portfolio_intelligence_brief.md  # short human brief (≤60 lines, read this)
+reports/current/portfolio_decision_brief.md      # curated deterministic brief
+reports/current/t212_portfolio_snapshot.md       # full broker inventory
+reports/current/portfolio_analysis.json          # canonical machine-readable result
+reports/current/failed_tickers.md                # only when tickers are unresolvable
+reports/current/run_manifest.json                # run_id, sha256, counts, recon, providers, indicator engine
+reports/ai_context/ai_context_<run_id>.md        # full machine archive
+reports/debug/<run_id>/                          # raw dump, recon diagnostics, run log
+reports/archive/<run_id>/                        # full copy of current/ for this run
+```
+
+Provider policy: local-first chain, but **LM Studio is disabled by default for
+testing** — set `LMSTUDIO_ENABLED=1` (or `"lmstudio_enabled": true` in config) to
+enable it. Every run records the actual winning provider/model per stage in
+`run_manifest.json` (`providers_per_stage`); `provider` is the winners summary,
+`stance` the human portfolio stance.
+
+Exit codes today: `0` success · `1` report/LLM-stage failure · `2` config error
+(unknown flags also exit `2` via argparse).
+
+Pre-flight checks (offline, no secrets printed):
+
+```cmd
+py -3.12 scripts/verify_environment.py          :: interpreter, deps, gitignore, syntax
+py -3.12 scripts/verify_environment.py --smoke  :: plus one fast offline test module
+py -3.12 -m pytest tests/ -q                    :: full offline unit suite
+py -3.12 -m pytest experimental/tests/ -q       :: isolated backtest suite
+```
+
+## Technical indicators (optional dependencies)
+
+`pandas-ta` is optional and NOT required. When installed, `TechnicalAnalyzer` uses the
+`pandas-ta` engine; otherwise it falls back to deterministic manual indicators
+(SMA/EMA/MACD/RSI/Bollinger/ATR/simplified ADX and Supertrend, OBV, rolling VWAP, …).
+Both paths are covered by tests, but numerics differ — see `docs/audit/PROJECT_AUDIT.md`
+(Technical Indicator Audit) and run `scripts/verify_environment.py` to see which engine
+would activate on your PC. `tzdata` is a core requirement so `ZoneInfo` works on Windows.
+
+Secrets: `api.env` holds real keys — never commit it, never paste logs containing
+`Authorization`/`Bearer`/`key=` values (the tool redacts them automatically).
+
+## Output (legacy layout note)
+
+- `reports/portfolio_analysis.md` - Human-readable Markdown (compat copy of the main report)
+- `reports/portfolio_analysis.json` - Machine-readable JSON (compat copy)
+- `reports/archive/` - Timestamped history (new layout: `YYYY-MM-DD/<run_id>/`)
+- `reports/latest/` - Always the newest complete run (published atomically)
 
 ## License
 

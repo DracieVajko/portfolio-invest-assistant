@@ -46,50 +46,101 @@ class OpenRouterProvider(BaseLLMProvider):
         self.max_context_tokens = max_context_tokens
         self.max_output_tokens = max_output_tokens
 
+    # Curated free models on OpenRouter (Sep 2026, verified live).
+    # Will try in order if model == "free" or "openrouter/free".
+    # "openrouter/free" router itself is first; explicit IDs below are fallbacks.
+    FREE_MODELS = [
+        "openrouter/free",
+        "openai/gpt-oss-20b:free",
+        "google/gemma-4-31b-it:free",
+        "google/gemma-4-26b-a4b-it:free",
+        "nvidia/nemotron-3-nano-30b-a3b:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "cohere/north-mini-code:free",
+        "z-ai/glm-5.2:free",
+        "poolside/laguna-s-2.1:free",
+        "poolside/laguna-xs-2.1:free",
+        "liquid/lfm-2.5-2.6b:free",
+    ]
+
+    def _models_to_try(self) -> list[str]:
+        m = (self.model or "").strip()
+        if m.lower() in ("free", "openrouter/free", "openrouter/free:free", ""):
+            return self.FREE_MODELS
+        # If user set specific model, use ONLY that model - no fallback to free models
+        return [m]
+
     def generate(self, prompt: str, *, stage: str, context: dict | None = None) -> str:
         if not self.api_key:
             return f"[{stage}] OpenRouter provider is not configured."
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": f"You are the {stage} stage of the investment engine."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.15,
-            "max_tokens": min(self.max_output_tokens, 8192),
-        }
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        max_retries = 3
-        base_delay = 2
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(f"{self.base_url}/chat/completions", json=payload, headers=headers, timeout=120)
-                if response.status_code == 429:
-                    # Rate limited - wait and retry
-                    delay = base_delay * (2 ** attempt)
-                    time.sleep(delay)
-                    continue
-                response.raise_for_status()
-                data = response.json()
-                choices = data.get("choices") or []
-                if not choices:
-                    return f"[{stage}] OpenRouter returned no choices."
-                message = choices[0].get("message", {})
-                content = message.get("content") or message.get("reasoning") or ""
-                return _clean_llm_output(content) or f"[{stage}] OpenRouter returned an empty response."
-            except requests.exceptions.Timeout:
-                if attempt == max_retries - 1:
-                    return f"[{stage}] OpenRouter timeout after {max_retries} attempts"
-                time.sleep(base_delay * (2 ** attempt))
-            except Exception as exc:
-                if attempt == max_retries - 1:
-                    return f"[{stage}] OpenRouter error: {exc}"
-                time.sleep(base_delay * (2 ** attempt))
+        models = self._models_to_try()
+        # When using a specific model (not free tier), don't fall back to other models
+        use_single_model = len(models) == 1 and models[0] != "openrouter/free"
         
-        return f"[{stage}] OpenRouter failed after {max_retries} attempts"
+        for model in models:
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": f"You are the {stage} stage of the investment engine."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.15,
+                "max_tokens": min(self.max_output_tokens, 8192),
+            }
+
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+
+            max_retries = 3
+            base_delay = 2
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(f"{self.base_url}/chat/completions", json=payload, headers=headers, timeout=120)
+                    if response.status_code == 429:
+                        delay = base_delay * (2 ** attempt)
+                        time.sleep(delay)
+                        continue
+                    if response.status_code in (400, 402, 404) and not use_single_model:
+                        # Model not available / no credits – try next free model (only in free tier mode)
+                        last_error = f"[{stage}] OpenRouter model {model} error {response.status_code}: {response.text[:300]}"
+                        break
+                    response.raise_for_status()
+                    data = response.json()
+                    choices = data.get("choices") or []
+                    if not choices:
+                        last_error = f"[{stage}] OpenRouter model {model} returned no choices."
+                        break
+                    message = choices[0].get("message", {})
+                    content = message.get("content") or message.get("reasoning") or ""
+                    cleaned = _clean_llm_output(content)
+                    if cleaned:
+                        return cleaned
+                    last_error = f"[{stage}] OpenRouter model {model} returned an empty response."
+                    break
+                except requests.exceptions.Timeout as e:
+                    last_error = f"[{stage}] OpenRouter timeout model {model}: {e}"
+                    if attempt == max_retries - 1:
+                        break
+                    time.sleep(base_delay * (2 ** attempt))
+                except Exception as exc:
+                    last_error = f"[{stage}] OpenRouter error model {model}: {exc}"
+                    if attempt == max_retries - 1:
+                        break
+                    time.sleep(base_delay * (2 ** attempt))
+            # If using single model, don't try other models - return error
+            if use_single_model:
+                return last_error or f"[{stage}] OpenRouter failed after {max_retries} attempts"
+            # If we are here and last_error is about model not available, try next model
+            if last_error and ("error 400" in last_error or "error 404" in last_error or "402" in last_error or "returned no choices" in last_error):
+                continue
+            if last_error and "timeout" not in last_error.lower() and len(models) > 1:
+                # Try next model for any error when multiple models available
+                continue
+            if last_error is None:
+                continue
+
+        return last_error or f"[{stage}] OpenRouter failed after {max_retries} attempts"

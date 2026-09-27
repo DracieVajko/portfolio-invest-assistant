@@ -1,21 +1,33 @@
-# Core dependencies
+# Phase 0 policy: Python 3.12 runtime (see README). No version pins yet
+# (pandas/numpy/scipy pinning is deferred to Phase 1). pandas-ta stays
+# optional: when absent, manual indicators are the production fallback.
+#
+# --- Core (required; verify_environment.py fails without these) ---
 requests>=2.31.0
 yfinance>=1.6.0
 pandas>=2.0.0
 ddgs>=0.2.0
 python-dotenv>=1.0.0
-
-# Technical analysis (requires Python 3.12+ for numba)
-# pandas-ta>=0.4.71b0  # Requires Python 3.12+ for numba
+pydantic>=2.0.0
 scipy>=1.10.0
 numpy>=1.24.0
-
-# News & data enrichment
 feedparser>=6.0.10
 finvizfinance>=1.0.0
+tzdata>=2022.0  # Windows-safe zoneinfo database (Europe/Bratislava); no-op on most Linux/macOS
+
+# --- Optional technical (validation/reference only; never required) ---
+# Technical analysis (requires Python 3.12+ for numba)
+# pandas-ta>=0.4.71b0  # Requires Python 3.12+ for numba
 
 # Optional: TA-Lib for 60+ candlestick patterns (requires Visual C++ Build Tools on Windows)
 # ta-lib>=0.4.24  # pip install ta-lib (needs: brew install ta-lib / apt-get install libta-lib-dev)
+
+# Optional: Playwright for the automatic research sweep (TradingView symbol
+# pages, earnings calendars). The pip package alone is NOT enough — the browser
+# must be installed once per machine:  py -3.12 -m playwright install chromium
+# Without it the sweep degrades gracefully (all Playwright paths catch the
+# missing-browser error and continue with Yahoo/RSS data only).
+# playwright>=1.40.0
 
 # Optional: FinBERT for better sentiment (uncomment if needed)
 # transformers>=4.30.0

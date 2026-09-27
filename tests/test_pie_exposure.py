@@ -10,7 +10,7 @@ from investment_engine.portfolio.exposure import (
     generate_actionability_view,
     generate_exposure_view,
 )
-from trading212_portfolio import parse_position
+from trading212.portfolio import parse_position
 
 
 def _fake_api_position(ticker: str, quantity: float, pie_quantity: float, current_price: float, ppl: float = 0.0, fx_ppl: float = 0.0):
@@ -194,18 +194,19 @@ def test_unknown_target_weights_do_not_produce_fake_rebalance():
 
 
 def test_account_reconciliation_behavior_unchanged():
-    """Ensure reconciliation math still uses ALL positions value + cash, not CSV values."""
-    from trading212_portfolio import PortfolioMonitor
+    """Ensure reconciliation math still uses ALL positions value + reported cash (free + pie + blocked), not CSV values."""
+    from trading212.portfolio import PortfolioMonitor
     import inspect
     src = inspect.getsource(PortfolioMonitor.get_portfolio_summary)
-    # Must still compute derived_holdings_plus_available_cash = all_positions_value_eur + free_cash + pie_cash
-    assert "derived_holdings_plus_available_cash" in src
+    # Must still compute derived_holdings_plus_reported_cash = all_positions_value_eur + free_cash + pie_cash + blocked
+    assert "derived_holdings_plus_reported_cash" in src
     assert "all_positions_value_eur" in src
+    assert "blocked" in src
     # Must not reference PIEs/*.csv for reconciliation
     assert "PIEs" not in src
     assert "PieLoader" not in src
     # Validate that parse_position still preserves original logic
-    from trading212_portfolio import parse_position as pp
+    from trading212.portfolio import parse_position as pp
     src2 = inspect.getsource(pp)
     assert "value_eur" in src2
     assert "pie_quantity" in src2

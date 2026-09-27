@@ -4,7 +4,10 @@ import logging
 import threading
 import time
 
+import requests
+
 from .base import BaseLLMProvider
+from investment_engine.providers.presets import merge_sampling, preset_for
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +22,7 @@ class LMStudioProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        base_url: str = "http://localhost:1234/v1",
+        base_url: str = "http://100.101.20.64:1234/v1",
         model: str = "oda-fin-rl-8b",
         max_context_tokens: int = 32000,
         max_output_tokens: int = 8192,
@@ -51,7 +54,6 @@ class LMStudioProvider(BaseLLMProvider):
                 raise RuntimeError(f"Model '{model}' previously failed to load")
             logger.info("Warming up model %s on %s...", model, self.base_url)
             try:
-                import requests
                 payload = {
                     "model": model,
                     "messages": [{"role": "user", "content": "Hi"}],
@@ -74,41 +76,94 @@ class LMStudioProvider(BaseLLMProvider):
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
                 else:
+                    # Transient (cold load, 5xx, ...): do NOT cache — the model
+                    # may become ready by the next stage. Only the definitive
+                    # 400 "Failed to load model" above is cached permanently.
                     logger.warning("Model warmup returned %s: %s", r.status_code, r.text[:200])
-                    _model_failed.add(key)  # Cache other failures too
             except RuntimeError:
                 raise
             except Exception as e:
-                logger.warning("Model warmup failed: %s", e)
-                _model_failed.add(key)  # Cache timeout/connection failures
+                # Timeouts / connection errors while the model is (cold) loading
+                # must not poison the model for the whole run — next stage
+                # retries the warmup instead of falling back immediately.
+                logger.warning("Model warmup failed (transient, will retry): %s", e)
+
+    def _server_root(self) -> str:
+        """Server root without the /v1 suffix (for management endpoints)."""
+        root = self.base_url.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[: -len("/v1")]
+        return root.rstrip("/")
+
+    def unload_model(self, model: str) -> bool:
+        """Best-effort unload of one model to free VRAM. Never raises.
+
+        Tries known LM Studio management endpoint variants; servers without
+        unload support just log a warning (use the app's auto-evict setting
+        as the reliable path there). Also clears local warmup caches.
+        """
+        key = (self.base_url, model)
+        _model_warmed.discard(key)
+        _model_failed.discard(key)
+        return _unload_via_api(self.base_url, model)
 
     def generate(self, prompt: str, *, stage: str, context: dict | None = None) -> str:
         requested_output_tokens = (context or {}).get("max_output_tokens", self.max_output_tokens)
         requested_model = str((context or {}).get("model", self.model))
+        # Thinking models (30B) need room past the 5min default read budget.
+        try:
+            read_timeout = int((context or {}).get("read_timeout_s", 300) or 300)
+        except (TypeError, ValueError):
+            read_timeout = 300
         
         # Warm up the model on first use
         self._warmup_model(requested_model)
         
+        preset = preset_for(stage)
+        sampling = merge_sampling(preset, context)
+        max_tokens = min(int(requested_output_tokens), self.max_output_tokens)
+        floor = int(preset.get("min_tokens_floor", 0) or 0)
+        if floor > max_tokens:
+            # Reasoning trace needs budget or the answer comes back empty.
+            max_tokens = min(floor, self.max_output_tokens)
         payload = {
             "model": requested_model,
             "messages": [
                 {"role": "system", "content": f"You are the {stage} stage of the investment engine."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.1,
-            "max_tokens": min(int(requested_output_tokens), self.max_output_tokens),
+            "temperature": sampling["temperature"],
+            "top_p": sampling["top_p"],
+            "top_k": sampling["top_k"],
+            "repeat_penalty": sampling["repeat_penalty"],
+            "max_tokens": max_tokens,
             "stream": False,
         }
 
         try:
-            import requests
-
             logger.info("LM Studio request: stage=%s model=%s", stage, requested_model)
             response = requests.post(
                 f"{self.base_url}/chat/completions",
                 json=payload,
-                timeout=(30, 300),  # 30s connect, 5min read
+                timeout=(30, read_timeout),  # 30s connect, stage read budget
             )
+            if response.status_code == 400:
+                # Model is likely (cold) loading after a switch — the server
+                # answers 400 instead of queueing. Wait, re-warmup, retry once.
+                logger.warning(
+                    "LM Studio 400 at stage=%s (likely model loading), "
+                    "waiting 30s and retrying once: %s",
+                    stage, (response.text or "")[:200])
+                time.sleep(30)
+                try:
+                    self._warmup_model(requested_model)
+                except Exception:
+                    pass
+                response = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    timeout=(30, read_timeout),
+                )
             logger.info("LM Studio response: stage=%s status=%s", stage, response.status_code)
             response.raise_for_status()
             data = response.json()
@@ -137,3 +192,44 @@ class LMStudioProvider(BaseLLMProvider):
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.exception("LM Studio generation failed at stage=%s", stage)
             raise
+
+
+def _unload_via_api(base_url: str, model: str) -> bool:
+    """Try known unload endpoint variants. Never raises. Returns True on success."""
+    base = (base_url or "").rstrip("/")
+    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    root = root.rstrip("/")
+    candidates = [
+        ("POST", f"{root}/api/v0/models/unload", {"model": model}),
+        ("POST", f"{base}/models/unload", {"model": model}),
+        ("DELETE", f"{base}/models/{model}", None),
+    ]
+    for method, url, payload in candidates:
+        try:
+            if method == "DELETE":
+                r = requests.delete(url, timeout=(5, 15))
+            else:
+                r = requests.post(url, json=payload, timeout=(5, 15))
+            body = (r.text or "")[:200]
+            if r.status_code == 200 and "Unexpected endpoint" not in body:
+                logger.info("Unloaded model %s via %s %s", model, method, url)
+                return True
+            logger.debug("Unload variant %s %s unsupported: %s %s",
+                         method, url, r.status_code, body)
+        except Exception as e:
+            logger.debug("Unload variant %s %s failed: %s", method, url, e)
+    logger.warning(
+        "Model %s NOT unloaded: server has no unload API. "
+        "Enable auto-evict in LM Studio app settings to free VRAM.", model)
+    return False
+
+
+def unload_lmstudio_models(base_url: str, models: list[str]) -> dict[str, bool]:
+    """Best-effort unload of several models. Never raises. Returns {model: ok}."""
+    out: dict[str, bool] = {}
+    for model in dict.fromkeys(models):  # dedupe, keep order
+        try:
+            out[model] = _unload_via_api(base_url, model)
+        except Exception:
+            out[model] = False
+    return out

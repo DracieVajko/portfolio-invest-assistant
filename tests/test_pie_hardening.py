@@ -2,7 +2,7 @@
 from investment_engine.portfolio.pie_metadata import load_pie_universe, _normalize_base_symbol
 from investment_engine.portfolio.sidecar import load_sidecar_registry
 from investment_engine.portfolio.exposure import build_canonical_exposures, generate_actionability_view
-from trading212_portfolio import parse_position
+from trading212.portfolio import parse_position
 
 
 def _fake_api_position(ticker: str, quantity: float, pie_quantity: float, current_price: float, ppl: float = 0.0, fx_ppl: float = 0.0, extra: dict | None = None):
@@ -208,10 +208,11 @@ def test_total_exposure_and_concentration_correct_for_multi_pie():
 
 def test_existing_reconciliation_behavior_stays_unchanged():
     import inspect
-    from trading212_portfolio import PortfolioMonitor
+    from trading212.portfolio import PortfolioMonitor
     src = inspect.getsource(PortfolioMonitor.get_portfolio_summary)
-    assert "derived_holdings_plus_available_cash" in src
+    assert "derived_holdings_plus_reported_cash" in src
     assert "all_positions_value_eur" in src
+    assert "blocked" in src
     assert "PIEs" not in src
     assert "PieLoader" not in src
     # Also ensure pie exposure does not alter reconciliation

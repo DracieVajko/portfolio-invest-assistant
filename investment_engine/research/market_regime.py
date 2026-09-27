@@ -66,7 +66,7 @@ class RegimeThresholds:
 class RegimeResult:
     """Complete regime analysis result."""
     symbol: str
-    regime: str  # PEAK_HOLD, DECLINING, MUST_BUY, NEUTRAL
+    regime: str  # PEAK_HOLD, DECLINING, POTENTIAL_ACCUMULATION_ZONE, NEUTRAL
     confidence: float
     primary_signal: str
     timeframes: dict[str, dict]
@@ -92,6 +92,19 @@ class RegimeResult:
             "warnings": self.warnings,
             "generated_at": self.generated_at,
         }
+
+
+# Phase 8 vocabulary: research postures, never imperatives. The classifier
+# emits POTENTIAL_ACCUMULATION_ZONE; MUST_BUY remains a deprecated alias so
+# cached results, configs, and downstream string checks keep working.
+POTENTIAL_ACCUMULATION_ZONE = "POTENTIAL_ACCUMULATION_ZONE"
+MUST_BUY = "MUST_BUY"  # deprecated alias (Phase 8 rename)
+ACCUMULATION_REGIMES = frozenset({POTENTIAL_ACCUMULATION_ZONE, MUST_BUY})
+
+
+def is_accumulation_regime(value: object) -> bool:
+    """True for either spelling of the accumulation-zone regime."""
+    return str(value or "").strip().upper() in ACCUMULATION_REGIMES
 
 
 class EXI2RegimeAnalyzer:
@@ -125,13 +138,22 @@ class EXI2RegimeAnalyzer:
             "cash_target_pct": 25,
             "message": "Downtrend confirmed. Build watchlists. Raise cash for deployment.",
         },
-        "MUST_BUY": {
-            "portfolio_action": "AGGRESSIVE_ACCUMULATE",
-            "tech_allocation": "AGGRESSIVE_ACCUMULATE",
-            "crypto_allocation": "SELECTIVE_BUY",
+        "POTENTIAL_ACCUMULATION_ZONE": {
+            "portfolio_action": "CONSIDER_ACCUMULATION",
+            "tech_allocation": "SELECTIVE_RESEARCH",
+            "crypto_allocation": "SELECTIVE_RESEARCH",
             "dca_multiplier": 2.0,
             "cash_target_pct": 5,
-            "message": "Major support hit with oversold conditions. Deploy cash aggressively.",
+            "message": "Major support with oversold conditions. Research accumulation candidates; no automatic action.",
+        },
+        # Deprecated alias (Phase 8 rename): resolves to the same posture.
+        "MUST_BUY": {
+            "portfolio_action": "CONSIDER_ACCUMULATION",
+            "tech_allocation": "SELECTIVE_RESEARCH",
+            "crypto_allocation": "SELECTIVE_RESEARCH",
+            "dca_multiplier": 2.0,
+            "cash_target_pct": 5,
+            "message": "Major support with oversold conditions. Research accumulation candidates; no automatic action.",
         },
         "NEUTRAL": {
             "portfolio_action": "NORMAL_DCA",
@@ -195,11 +217,20 @@ class EXI2RegimeAnalyzer:
             if daily_df is not None and not daily_df.empty:
                 price_structure = self.peak_detector.detect(daily_df["close"])
 
-            # 4. FinViz enrichment
-            finviz_data = {}
+            # 4. FinViz enrichment (US listings only; the quote call is
+            # skipped before any HTTP for non-US regime symbols like EXI2.DE,
+            # so a dataless 404 can never fire. Sector breadth is US-market
+            # data and always attempted.
+            finviz_data: dict = {}
             if self.finviz:
                 try:
-                    finviz_data = self.finviz.get_quote_data("EXI2")
+                    from investment_engine.research.technical_analysis import (
+                        should_use_finviz as _should_fv,
+                    )
+                    if _should_fv(self.symbol):
+                        finviz_data = self.finviz.get_quote_data("EXI2")
+                    else:
+                        logger.debug("FinViz quote skipped for non-US symbol: %s", self.symbol)
                     finviz_data["sector_breadth"] = self.finviz.get_sector_breadth()
                 except Exception as e:
                     logger.warning("FinViz enrichment failed: %s", e)
@@ -295,7 +326,7 @@ class EXI2RegimeAnalyzer:
         scores = {
             "PEAK_HOLD": 0.0,
             "DECLINING": 0.0,
-            "MUST_BUY": 0.0,
+            POTENTIAL_ACCUMULATION_ZONE: 0.0,
             "NEUTRAL": 0.5,  # Base score
         }
         signals = []
@@ -449,7 +480,7 @@ class EXI2RegimeAnalyzer:
             buy_checks += 1
 
         if buy_checks > 0:
-            scores["MUST_BUY"] = buy_score / buy_checks
+            scores[POTENTIAL_ACCUMULATION_ZONE] = buy_score / buy_checks
 
         # --- Select regime with highest score ---
         # Require minimum confidence and timeframe agreement
@@ -480,7 +511,7 @@ class EXI2RegimeAnalyzer:
             elif regime == "DECLINING":
                 if "DOWN" in trend:
                     count += 1
-            elif regime == "MUST_BUY":
+            elif is_accumulation_regime(regime):
                 if "OVERSOLD" in momentum or "CONSOLIDATING_AT_BOTTOM" in trend:
                     count += 1
         return count
@@ -506,7 +537,7 @@ class EXI2RegimeAnalyzer:
             warnings.append("Daily/Weekly trend conflict - mixed signals")
 
         # News sentiment divergence
-        if regime == "MUST_BUY" and news_sentiment.get("sentiment") == "NEGATIVE":
+        if is_accumulation_regime(regime) and news_sentiment.get("sentiment") == "NEGATIVE":
             warnings.append("Negative news sentiment despite oversold technicals")
 
         if regime == "PEAK_HOLD" and news_sentiment.get("sentiment") == "POSITIVE":

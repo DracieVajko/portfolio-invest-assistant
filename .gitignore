@@ -1,57 +1,96 @@
-﻿# Secrets and local configuration
+# Phase 0 foundation .gitignore — secrets and generated artifacts stay out of git.
+# Source code, tests, docs, example configs, PIE inputs, strategy JSON, requirements and launchers are tracked.
+
+# --- Secrets: real credentials must never be committed ---
 api.env
 .env
-.env.*
+*.env
+!api.env.example
 !.env.example
-*.secret
-*.secrets
-secrets.*
-credentials.*
+
+# --- User-local investment policy (template is committed, real file is not) ---
+investment_policy.json
+!investment_policy.example.json
+
+# --- Real portfolio config (template is committed, real holdings are not) ---
 portfolio_config.json
 !portfolio_config.example.json
 
-# Personal financial data
+# --- Real PIE exports (only example_* planned; real CSVs never committed) ---
 PIEs/*.csv
 !PIEs/example_*.csv
-investment_engine/memory/memory.json
 
-# Runtime output
-data/
-logs/
+# --- Generated reports (human + machine + debug + archives) ---
 reports/
-experimental/reports/
+*.html
 
-# Python cache and tests
+# --- Runtime logs ---
+logs/
+*.log
+
+# --- Local data (broker caches, news caches, performance, cookies) ---
+data/
+
+# --- Raw endpoint dumps (broker-sensitive, also live under reports/) ---
+raw_endpoint_dump*.json
+t212_raw_snapshot*.json
+
+# --- Single-run lock (local only) ---
+runtime/
+
+# --- Local memory / model state ---
+memory.json
+**/memory.json
+
+# --- Generated backtest reports (experimental outputs) ---
+experimental/reports/
+experimental/backtest/reports/
+
+# --- Local model data / caches (present or future) ---
+models/
+model_cache/
+*.gguf
+*.bin
+
+# --- Temporary files ---
+*.tmp
+*.part
+.tmp.*
+*.bak
+*.swp
+*~
+
+# --- Python bytecode and caches ---
 __pycache__/
 *.py[cod]
 *$py.class
+
+# --- Test / coverage / typecheck caches ---
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
+coverage.xml
 
-# Virtual environments
+# --- Build / packaging outputs ---
+build/
+dist/
+*.egg-info/
+
+# --- Virtual environments ---
 .venv/
 venv/
 env/
 ENV/
 
-# SQLite and other caches
-*.db
-*.sqlite
-*.sqlite3
-*.db-shm
-*.db-wal
+# --- Node (not used today, guard for future tooling) ---
+node_modules/
 
-# Editor and operating-system files
+# --- IDE / OS metadata ---
 .vscode/
 .idea/
+*.code-workspace
 .DS_Store
 Thumbs.db
-
-# Temporary and backup files
-*.bak
-*.tmp
-*.swp
-*Conflict*
+desktop.ini
