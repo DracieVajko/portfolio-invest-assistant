@@ -145,13 +145,23 @@ def _base_symbol(sym: str) -> str:
 def compute_reconciliation(
     t212_data: dict | None,
     rows: list[dict] | None,
+    canonical: dict | None = None,
 ) -> dict:
-    """Authoritative reconciliation from unified rows (no speculation).
+    """Reconciliation view over unified rows (no speculation).
 
     positions_value = sum(unified position value_eur)
     reported_cash  = cash_free + cash_pie + cash_blocked (all cash belonging to account)
     derived_total   = positions_value + reported_cash
     diff            = derived_total - total_equity (signed)
+
+    Verdict policy (Phase 1 canonical core):
+    - When ``canonical`` (a ``broker_first.reconcile_snapshot`` result dict
+      with ``status`` PASS/FAIL) is supplied, its verdict wins: this function
+      is a thin display view over unified rows, never a second authority.
+    - Otherwise the verdict is recomputed from the rows only. Legacy summary
+      fields (``reconciliation_status``/``reconciliation_threshold``) are
+      NEVER inherited: they may carry the deprecated R1 formula
+      (``max(€1, 0.1%)``, abs, no dedupe) which can disagree with canonical.
     """
     summary = (t212_data or {}).get("account_summary", {}) or {}
     cash = (t212_data or {}).get("cash", {}) or {}
@@ -177,12 +187,23 @@ def compute_reconciliation(
         # Strict tolerance: min(0.1% of broker equity, €2.00).
         threshold = round(min(total_equity * 0.001, 2.00), 2)
     # Fail-closed on missing broker data: an empty snapshot must never PASS.
+    canon = canonical if isinstance(canonical, dict) else {}
+    canon_status = str(canon.get("status", "") or "").upper()
+    try:
+        canon_threshold = float(canon.get("threshold", canon.get("tolerance_eur", 0)) or 0)
+    except (TypeError, ValueError):
+        canon_threshold = 0.0
     if total_equity <= 0 and not rows:
         status = "UNKNOWN"
+        verdict_source = "canonical" if canon_status in ("PASS", "FAIL") else "recomputed"
+    elif canon_status in ("PASS", "FAIL"):
+        status = canon_status
+        if canon_threshold > 0:
+            threshold = canon_threshold
+        verdict_source = "canonical"
     else:
-        status = str(summary.get("reconciliation_status", "") or "").upper()
-        if status not in ("PASS", "FAIL"):
-            status = "PASS" if abs(diff) <= threshold else "FAIL"
+        status = "PASS" if abs(diff) <= threshold else "FAIL"
+        verdict_source = "recomputed"
     return {
         "total_equity": total_equity,
         "positions_value": positions_value,
@@ -196,6 +217,7 @@ def compute_reconciliation(
         "diff": diff,
         "threshold": threshold,
         "status": status,
+        "verdict_source": verdict_source,
     }
 
 
@@ -387,21 +409,26 @@ def _hold_observation(signal: str, tech: dict | None, support: Any, resistance: 
 
 
 def build_unified_portfolio_rows(
-    t212_data: dict | None,
+    t212_data: dict | None = None,
     ai_recs: dict | None = None,
     technicals: dict | None = None,
     names: dict | None = None,
     known_clean: set | None = None,
     canonical: dict | None = None,
     yahoo_map: dict | None = None,
+    isin_map: dict | None = None,
 ) -> list[dict]:
     """Build the single authoritative holdings list.
 
     ``all_positions`` is the complete broker snapshot when non-empty;
     ``positions`` is a fallback only. Entries are never merged or summed:
-    duplicate broker IDs keep the first occurrence (counted, not summed).
-    Each row carries ``internal_id`` (broker), ``display_symbol`` (rendered)
-    and ``company_name`` (never an internal ID).
+    duplicates keep the first occurrence (counted, not summed).
+    Dedupe identity is ISIN-first — the same identity as
+    ``broker_first.reconcile_snapshot``: a position ``isin`` field, else
+    ``isin_map`` (broker symbol or display → ISIN), else the broker ID.
+    Each row carries ``internal_id`` (broker), ``display_symbol`` (rendered),
+    ``company_name`` (never an internal ID) and ``identity_provenance``
+    (``ISIN`` or ``BROKER_ID``).
     Sorted by market value desc. Deterministic.
     """
     if not isinstance(t212_data, dict):
@@ -421,18 +448,51 @@ def build_unified_portfolio_rows(
         if not raw_positions and isinstance(summary.get("positions"), list):
             raw_positions = summary["positions"]
 
-    # Deduplicate by broker ID: first occurrence wins, never summed.
+    # Deduplicate ISIN-first (same identity as broker_first.reconcile_snapshot):
+    # (ISIN + lot) when known, else (broker ID). Same-ISIN rows merge only on
+    # identical lot identity (quantity + average price); distinct lots are
+    # distinct holdings and both count. First occurrence wins, never summed.
+    def _row_lot(pos: dict) -> str:
+        try:
+            q = float(pos.get("quantity", 0) or 0)
+            a = float(pos.get("average_price_eur", pos.get("avg_price", 0)) or 0)
+        except (TypeError, ValueError):
+            return ""
+        import math as _math
+        if not (_math.isfinite(q) and _math.isfinite(a)):
+            return ""
+        return f"{q:.8f}|{a:.8f}"
+
+    isin_lookup = {str(k).strip().upper(): str(v).strip().upper()
+                   for k, v in (isin_map or {}).items() if v}
     by_sym: dict[str, dict] = {}
     order: list[str] = []
     duplicate_ids: set[str] = set()
+    collapsed_into: dict[str, list[str]] = {}
+    provenance: dict[str, str] = {}
+    seen_ids: dict[tuple[str, ...], str] = {}
     for p in raw_positions:
         if not isinstance(p, dict) or not p.get("symbol"):
             continue
         key = str(p["symbol"]).strip().upper()
-        if key in by_sym:
+        isin = str(p.get("isin") or "").strip().upper() or isin_lookup.get(key, "")
+        if not isin:
+            try:
+                isin = isin_lookup.get(to_display_symbol(key, known_clean), "")
+            except Exception:
+                pass
+        if isin:
+            lot = _row_lot(p)
+            dedupe_id = ("ISIN", isin, lot) if lot else ("ISIN", isin)
+        else:
+            dedupe_id = ("SYM", key)
+        if dedupe_id in seen_ids:
             duplicate_ids.add(key)
+            collapsed_into.setdefault(seen_ids[dedupe_id], []).append(key)
             continue
+        seen_ids[dedupe_id] = key
         by_sym[key] = p
+        provenance[key] = "ISIN" if isin else "BROKER_ID"
         order.append(key)
 
     total_equity = float(summary.get("total_equity", 0) or 0)
@@ -457,6 +517,37 @@ def build_unified_portfolio_rows(
     for k, v in (names or {}).items():
         name_lookup[str(k).strip().upper()] = str(v)
 
+    # FX table for adaptive S/R conversion (native -> EUR). Broker-attached
+    # rates first, live/cached lookup second, static fallback last — all via
+    # broker_first so GBX/pence handling stays in one place. The lookup runs
+    # ONLY when some technicals actually carry non-EUR levels (keeps offline
+    # tests and EUR-only runs free of network calls).
+    fx_rates: dict = {}
+    try:
+        _need_fx = False
+        for _t in (technicals or {}).values():
+            if not isinstance(_t, dict):
+                continue
+            if _t.get("Support") is None and _t.get("Resistance") is None:
+                continue
+            _c = str(_t.get("quote_currency", "") or "").strip().upper()
+            if _c and _c != "EUR":
+                _need_fx = True
+                break
+    except Exception:
+        _need_fx = False
+    if _need_fx:
+        try:
+            fx_rates = (summary.get("fx_rates_used", {}) or {}).get("rates", {}) or {}
+        except Exception:
+            fx_rates = {}
+    if _need_fx and not fx_rates:
+        try:
+            from investment_engine.portfolio.broker_first import get_live_fx_rates as _live_fx
+            fx_rates = (_live_fx().get("rates", {}) or {})
+        except Exception:
+            fx_rates = {}
+
     rows: list[dict] = []
     for sym_key in sorted(order, key=lambda s: float(by_sym[s].get("value_eur", by_sym[s].get("value", 0)) or 0), reverse=True):
         p = by_sym[sym_key]
@@ -474,6 +565,11 @@ def build_unified_portfolio_rows(
         # Broker native quote currency (e.g., USD, EUR, GBX, DKK)
         quote_ccy = str(p.get("quote_currency", p.get("broker_quote_currency", ""))).upper()
         price_unit = str(p.get("price_unit", "")).upper()
+        if not cur_price_native and cur_price_eur and quote_ccy in ("EUR", ""):
+            # EUR-quoted positions carry no separate native quote (seen live:
+            # LITM native 0.0); native == EUR price. Non-EUR rows keep 0.0 so
+            # the VERIFIED gate suppresses comparisons instead of guessing.
+            cur_price_native = cur_price_eur
         mval = float(p.get("value_eur", p.get("value", 0)) or 0)
         unreal = float(p.get("pnl_eur", p.get("pnl", 0)) or 0)
         realized_raw = p.get("realized_pnl_eur", p.get("realized_pnl"))
@@ -491,13 +587,59 @@ def build_unified_portfolio_rows(
         tech = tech_lookup.get(display) or tech_lookup.get(internal_id.strip().upper())
         support = (tech or {}).get("Support")
         resistance = (tech or {}).get("Resistance")
+        # Adaptive S/R currency: Yahoo levels are native-denominated; convert
+        # to EUR for every rendered comparison (prices/P&L are EUR). The tech
+        # quote_currency (USD/EUR/GBX/DKK/...) selects the rate; GBX pence
+        # are handled inside convert_to_eur, and anchor_levels_to_eur
+        # magnitude-checks the result against the broker EUR price (Yahoo
+        # GBp labels on pound-scale history are auto-corrected, garbage
+        # becomes "suspect" -> n/a). Raw natives stay in the row
+        # for audit; *_eur + sr_fx_status are the display truth.
+        tech_ccy = str((tech or {}).get("quote_currency", "") or "").strip().upper()
+        if not tech_ccy:
+            # Pre-currency tech dicts (tests, Playwright fallback): the Yahoo
+            # listing normally matches the broker quote, so reuse it rather
+            # than assuming EUR (which would silently skip FX for US/UK/DK).
+            tech_ccy = quote_ccy
+        if not isinstance(tech, dict) or (support is None and resistance is None):
+            support_eur, resistance_eur, sr_fx_status = None, None, ""
+        else:
+            try:
+                from investment_engine.portfolio.broker_first import anchor_levels_to_eur as _anchor
+                support_eur, resistance_eur, sr_fx_status = _anchor(
+                    support, resistance, tech_ccy or "EUR", cur_price_eur, fx_rates)
+            except Exception:
+                support_eur, resistance_eur, sr_fx_status = None, None, "unresolved"
+        # Tech-price sanity gate: the Yahoo listing must quote the same
+        # instrument scale as the broker (run ccb9a975: ERNX Yahoo 100.7 vs
+        # broker 5.62; LAR0D via LOM.DE 445 vs broker 296.25 — different
+        # listings/scales). Convert the tech close to EUR and compare with
+        # the broker EUR price; beyond +-35% the raw natives are cleared so
+        # no renderer or breach-gate can use them (suspect -> n/a).
+        try:
+            _tech_price = (tech or {}).get("price") if isinstance(tech, dict) else None
+            if ((support is not None or resistance is not None)
+                    and _tech_price is not None and cur_price_eur > 0):
+                from investment_engine.portfolio.broker_first import convert_to_eur as _c2e
+                _tp_eur, _tp_st = _c2e(_tech_price, tech_ccy or "EUR", fx_rates)
+                if _tp_eur:
+                    _ratio = float(_tp_eur) / float(cur_price_eur)
+                    if not (0.65 <= _ratio <= 1.35):
+                        support = resistance = support_eur = resistance_eur = None
+                        sr_fx_status = (
+                            f"suspect (tech price {_tp_eur} vs broker {cur_price_eur:.2f})")
+        except Exception:
+            pass
 
-        # Market-data support state for this row (no yfinance calls here).
+        # Market-data support state for this row (no yfinance calls here;
+        # universe-verified listings are admitted like table-verified ones).
         yahoo_symbol = (yahoo_map or {}).get(display) if isinstance(yahoo_map, dict) else None
         try:
             from investment_engine.portfolio.symbols import (
                 MAPPING_UNAVAILABLE_NOTE,
-                support_state as _support_state,
+            )
+            from investment_engine.research.universe import (
+                universe_support_state as _support_state,
             )
             md_state = _support_state(yahoo_symbol, "market_data") if yahoo_symbol else "UNSUPPORTED"
         except ImportError:
@@ -538,13 +680,16 @@ def build_unified_portfolio_rows(
             notes.append(str(p.get("validation_reason", "validation FAIL")))
         if sym_key in duplicate_ids:
             notes.append("duplicate broker entry ignored (not summed)")
+        if sym_key in collapsed_into:
+            notes.append("duplicate broker entry ignored (not summed): "
+                         + ",".join(sorted(set(collapsed_into[sym_key]))))
         if p.get("is_pie_constituent"):
             notes.append("pie-held")
         if p.get("fx_is_fallback"):
             notes.append("FX fallback")
         if md_state == "UNRESOLVED" and not tech:
             notes.append(MAPPING_UNAVAILABLE_NOTE)
-        obs = _hold_observation(signal, tech if isinstance(tech, dict) else None, support, resistance)
+        obs = _hold_observation(signal, tech if isinstance(tech, dict) else None, support_eur, resistance_eur)
         if obs:
             notes.append(obs)
 
@@ -552,6 +697,9 @@ def build_unified_portfolio_rows(
             "ticker": display,
             "display_symbol": display,
             "internal_id": internal_id,
+            "identity_provenance": provenance.get(sym_key, "BROKER_ID"),
+            "isin": str(p.get("isin") or "").strip().upper() or isin_lookup.get(sym_key, "")
+            or isin_lookup.get(display, ""),
             "company": company,
             "company_name": company,
             "quantity": qty,
@@ -570,6 +718,10 @@ def build_unified_portfolio_rows(
             "confidence": confidence,
             "support": support,
             "resistance": resistance,
+            "support_eur": support_eur,
+            "resistance_eur": resistance_eur,
+            "sr_currency": tech_ccy,
+            "sr_fx_status": sr_fx_status,
             "notes": "; ".join(notes),
             "is_pie_constituent": bool(p.get("is_pie_constituent", False)),
             "pnl_validated": validated,
@@ -610,8 +762,11 @@ def _fmt_num(v: Any, digits: int = 2) -> str:
 class RegimeReportGenerator:
     """Generates clean, actionable Markdown reports from regime analysis."""
 
-    def __init__(self, include_charts: bool = False):
+    def __init__(self, include_charts: bool = False, canonical_recon: dict | None = None):
         self.include_charts = include_charts
+        # Canonical broker_first verdict (thin-view source). When None, report
+        # sections recompute from unified rows (never from legacy R1 fields).
+        self._canonical_recon = canonical_recon if isinstance(canonical_recon, dict) else None
 
     def generate_parts(
         self,
@@ -648,7 +803,8 @@ class RegimeReportGenerator:
             try:
                 _rows_for_ai = build_unified_portfolio_rows(
                     t212_data, ai_recs, technicals, names, known_clean, canonical, yahoo_map)
-                _recon_for_ai = compute_reconciliation(t212_data, _rows_for_ai)["status"]
+                _recon_for_ai = compute_reconciliation(
+                    t212_data, _rows_for_ai, canonical=self._canonical_recon)["status"]
             except Exception:
                 _rows_for_ai, _recon_for_ai = None, "UNKNOWN"
             # FAIL-state guards at the choke point: no owned-position BUY,
@@ -656,7 +812,8 @@ class RegimeReportGenerator:
             _safe_recs = apply_fail_guards(ai_recs, _recon_for_ai)
             if t212_data:
                 parts["portfolio"] = self._t212_portfolio(
-                    t212_data, _safe_recs, technicals, names, known_clean, canonical, _rows_for_ai, yahoo_map)
+                    t212_data, _safe_recs, technicals, names, known_clean, canonical, _rows_for_ai, yahoo_map,
+                    canonical_recon=self._canonical_recon)
             parts["ai"] = self._ai_recommendations(_safe_recs, known_clean, canonical, names, _recon_for_ai)
         if earnings:
             parts["earnings"] = self._earnings_calendar(result, earnings, names)
@@ -683,8 +840,9 @@ class RegimeReportGenerator:
     def _header(self, result: RegimeResult) -> str:
         regime_emoji = {
             "PEAK_HOLD": "🔴",
-            "DECLINING": "🟠", 
-            "MUST_BUY": "🟢",
+            "DECLINING": "🟠",
+            "POTENTIAL_ACCUMULATION_ZONE": "🟢",
+            "MUST_BUY": "🟢",  # deprecated alias (Phase 8 rename)
             "NEUTRAL": "⚪",
             "ERROR": "❌",
         }.get(result.regime, "❓")
@@ -776,6 +934,7 @@ class RegimeReportGenerator:
         rows: list[dict] | None = None,
         yahoo_map: dict | None = None,
         performance: dict | None = None,
+        canonical_recon: dict | None = None,
     ) -> str:
         """Format the single unified T212 holdings table.
 
@@ -799,7 +958,7 @@ class RegimeReportGenerator:
         # precomputed broker fields.
         if rows is None:
             rows = build_unified_portfolio_rows(data, ai_recs, technicals, names, known_clean, canonical, yahoo_map)
-        recon = compute_reconciliation(data, rows)
+        recon = compute_reconciliation(data, rows, canonical=canonical_recon)
         total_equity = recon["total_equity"]
         free_cash = recon["free_cash"]
         pie_cash = recon["pie_cash"]
@@ -1170,7 +1329,8 @@ class AIContextBuilder:
             sections.append(f"  Free Cash: €{t212_data.get('cash', {}).get('free', 0):,.2f}")
             sections.append(f"  Pie Cash: €{t212_data.get('cash', {}).get('pie_cash', 0):,.2f}")
             sections.append(f"  Validated positions market value: €{summary.get('invested', 0):,.2f}")
-            recon_status = summary.get("reconciliation_status", "UNKNOWN")
+            _v2leg = summary.get("reconciliation_v2", {}) or {}
+            recon_status = _v2leg.get("reconciliation_status") or summary.get("reconciliation_status", "UNKNOWN")
             sections.append(f"  Reconciliation: {recon_status}")
             if recon_status == "PASS":
                 sections.append(f"  Open Position Unrealized P&L (T212): €{summary.get('unrealized_pnl', 0):,.2f}")
@@ -1202,6 +1362,52 @@ class AIContextBuilder:
 # =============================================================================
 # NEW: AI Context Report Generator (machine-safe, broker-first)
 # =============================================================================
+
+def _normalize_ts_to_iso(value) -> str:
+    """Normalize an FX/catalog timestamp to ISO-8601, or "" when unusable.
+
+    Accepts epoch seconds (int/float/numeric str), epoch milliseconds, and
+    ISO strings. Rejects timestamps more than 5 minutes in the future or
+    older than 48 hours (run 524fffa0 carried fx_timestamp ~+365 days —
+    a future stamp silently presented as fact). Never raises.
+    """
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        dt = None
+        if isinstance(value, bool):
+            return ""
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 1e12:  # epoch millis
+                ts /= 1000.0
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        elif isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return ""
+            try:
+                dt = datetime.fromtimestamp(float(s), tz=timezone.utc)
+                if float(s) > 1e12:
+                    dt = datetime.fromtimestamp(float(s) / 1000.0, tz=timezone.utc)
+            except (TypeError, ValueError):
+                try:
+                    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    return ""
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            return ""
+        if dt is None:
+            return ""
+        age_s = (now - dt).total_seconds()
+        if age_s < -300 or age_s > 48 * 3600:
+            return ""
+        return dt.isoformat()
+    except Exception:
+        return ""
+
 
 class AIContextReportBuilder:
     """Generates a machine-safe AI context report using the broker-first model.
@@ -1241,6 +1447,7 @@ class AIContextReportBuilder:
         run_id: str = "",
         model_info: dict | None = None,  # New: model attribution info
         news_context_path: str | None = None,
+        stage_attribution: dict | None = None,  # Actual per-stage winners
     ) -> str:
         """Build the complete AI context report."""
         lines: list[str] = []
@@ -1274,8 +1481,8 @@ class AIContextReportBuilder:
             t212_data, fx_info, account_snapshot))
 
         # 8. Model Attribution & Sources (NEW)
-        if model_info:
-            lines.append(self._build_model_attribution(model_info))
+        if model_info or stage_attribution:
+            lines.append(self._build_model_attribution(model_info or {}, stage_attribution))
 
         # 9. News context file path
         if news_context_path:
@@ -1305,15 +1512,27 @@ class AIContextReportBuilder:
         positions_ts = ""
         if t212_data and isinstance(t212_data.get("account_summary"), dict):
             summary = t212_data["account_summary"]
-            account_ts = summary.get("retrieved_at", "")
-            positions_ts = summary.get("positions_retrieved_at", account_ts)
-        fx_ts = fx_info.get("retrieved_at") if fx_info else ""
+            # account_summary carries "timestamp" (not "retrieved_at") —
+            # without this fallback both fields rendered "unavailable".
+            account_ts = summary.get("retrieved_at") or summary.get("timestamp") or ""
+            positions_ts = summary.get("positions_retrieved_at") or account_ts
+        fx_ts = _normalize_ts_to_iso(fx_info.get("retrieved_at")) if fx_info else ""
         fx_source = fx_info.get("source", "") if fx_info else ""
+        if fx_info and fx_info.get("stale"):
+            fx_source = f"{fx_source} (stale fallback)".strip()
         catalog_ver = catalog_meta.get("fetched_at", "") if catalog_meta else ""
         catalog_age = catalog_meta.get("age_days", "") if catalog_meta else ""
         catalog_count = catalog_meta.get("count", "") if catalog_meta else ""
         recon_status = reconciliation.reconciliation_status if reconciliation else "UNKNOWN"
         recon_delta = reconciliation.reconciliation_delta_eur if reconciliation else 0.0
+
+        # catalog_age: None/"" means unknown; a real 0.0 means fresh-today
+        # (0.0 is falsy — `if catalog_age` used to hide it as unavailable).
+        catalog_age_rendered = (
+            catalog_age
+            if isinstance(catalog_age, (int, float)) and not isinstance(catalog_age, bool)
+            else "unavailable"
+        )
 
         lines = [
             "---",
@@ -1325,7 +1544,7 @@ class AIContextReportBuilder:
             f"  fx_timestamp: \"{fx_ts or 'unavailable'}\"",
             f"  fx_source: \"{fx_source or 'unavailable'}\"",
             f"  instrument_catalog_version: \"{catalog_ver or 'unavailable'}\"",
-            f"  instrument_catalog_age_days: {catalog_age if catalog_age else 'unavailable'}",
+            f"  instrument_catalog_age_days: {catalog_age_rendered}",
             f"  instrument_catalog_count: {catalog_count if catalog_count else 'unavailable'}",
             f"  reconciliation_status: \"{recon_status}\"",
             f"  reconciliation_delta_eur: {recon_delta:.2f}",
@@ -1387,6 +1606,9 @@ class AIContextReportBuilder:
 
         if account_snapshot and account_snapshot.positions:
             lines.append("## Positions (broker-first, deduplicated by ISIN)")
+            lines.append("Legend: raw_* = broker native units; normalized_* = prices in "
+                         "major units (pence÷100 for GBX); broker_market_value_eur = "
+                         "quantity × normalized current × live FX (see valuation_source).")
             lines.append(
                 "| broker_instrument_id | display_symbol | isin | instrument_currency | "
                 "raw_quantity | raw_average_price | raw_current_price | price_unit | minor_factor | "
@@ -1400,13 +1622,23 @@ class AIContextReportBuilder:
                     continue
                 ins = pos.instrument
                 fx = pos.fx_audit
+                # normalized_average_price was a copy of normalized current
+                # (both printed fx.normalized_price). Derive it from the raw
+                # average through the same minor-unit factor.
+                norm_avg = ""
+                try:
+                    if pos.average_price_raw is not None:
+                        _f = fx.minor_unit_factor or 1
+                        norm_avg = float(pos.average_price_raw) / float(_f) if _f else float(pos.average_price_raw)
+                except (TypeError, ValueError):
+                    norm_avg = ""
                 lines.append(
                     f"| {ins.broker_instrument_id} | {ins.display_symbol} | {ins.isin or ''} | "
                     f"{ins.currency} | {pos.quantity:.6f} | "
                     f"{pos.average_price_raw if pos.average_price_raw is not None else ''} | "
                     f"{pos.current_price_raw if pos.current_price_raw is not None else ''} | "
                     f"{fx.source_currency} | {fx.minor_unit_factor} | "
-                    f"{fx.normalized_price if fx.normalized_price is not None else ''} | "
+                    f"{norm_avg} | "
                     f"{fx.normalized_price if fx.normalized_price is not None else ''} | "
                     f"{pos.broker_market_value_eur if pos.broker_market_value_eur is not None else ''} | "
                     f"{pos.valuation_source} | {pos.mapping_status} | "
@@ -1529,7 +1761,12 @@ class AIContextReportBuilder:
         if val is None:
             return "n/a"
         try:
+            import math as _math
             f = float(val)
+            # float("nan")/float("inf") convert fine but must never render
+            # as "nan"/"inf" (run 524fffa0: LSE/XETRA rows showed nan).
+            if _math.isnan(f) or _math.isinf(f):
+                return "n/a"
             # Never prefix with € unless quote currency is EUR
             if quote_ccy == "EUR":
                 return f"€{f:,.2f}"
@@ -1676,15 +1913,18 @@ class AIContextReportBuilder:
 
         timestamps = []
         if t212_data and isinstance(t212_data.get("account_summary"), dict):
-            ts = t212_data["account_summary"].get("retrieved_at")
+            summary = t212_data["account_summary"]
+            # account_summary carries "timestamp" (not "retrieved_at") — without
+            # this fallback the section always degraded to "insufficient".
+            ts = summary.get("retrieved_at") or summary.get("timestamp")
             if ts:
                 timestamps.append(("account_summary", ts))
-            ts = t212_data["account_summary"].get("positions_retrieved_at")
+            ts = summary.get("positions_retrieved_at") or summary.get("timestamp")
             if ts:
                 timestamps.append(("positions", ts))
 
         if fx_info:
-            ts = fx_info.get("retrieved_at")
+            ts = _normalize_ts_to_iso(fx_info.get("retrieved_at")) or fx_info.get("retrieved_at")
             if ts:
                 timestamps.append(("fx", ts))
 
@@ -1695,14 +1935,27 @@ class AIContextReportBuilder:
 
         unstable = False
         if len(timestamps) >= 2:
-            from datetime import datetime
+            from datetime import datetime, timezone
             parsed = []
             for label, ts in timestamps:
+                dt = None
                 try:
-                    dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    # epoch seconds/millis (FX cache) or ISO string
+                    dt = datetime.fromtimestamp(float(ts) / (1000.0 if float(ts) > 1e12 else 1.0),
+                                                tz=timezone.utc)
+                except (TypeError, ValueError):
+                    try:
+                        dt = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+                    except (ValueError, AttributeError):
+                        dt = None
+                if dt is not None:
+                    if dt.tzinfo is None:
+                        # Broker/API timestamps are naive LOCAL machine time
+                        # (e.g. CEST); assuming UTC inflated the spread by the
+                        # UTC offset (run 066ac8be: 7208s "unstable" for a ~8s
+                        # real spread). Attach the local zone instead.
+                        dt = dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
                     parsed.append((label, dt))
-                except (ValueError, AttributeError):
-                    pass
             if len(parsed) >= 2:
                 first = min(parsed, key=lambda x: x[1])
                 last = max(parsed, key=lambda x: x[1])
@@ -1725,40 +1978,42 @@ class AIContextReportBuilder:
 # -------------------------------------------------------------------------
     # Model Attribution Section (NEW)
     # -------------------------------------------------------------------------
-    def _build_model_attribution(self, model_info: dict) -> str:
-        """Build the model attribution section showing which model did what."""
+    def _build_model_attribution(self, model_info: dict,
+                                   stage_attribution: dict | None = None) -> str:
+        """Actual per-stage attribution: which AI served what, and where.
+
+        Built from the run's providers_per_stage records (truth), NOT from
+        configured model names (intent). Static fallback-chain boilerplate was
+        removed per user request — only actually-used links are shown.
+        """
         lines = [
             "# MODEL ATTRIBUTION & SOURCES",
             "",
-            "This section documents which AI model was used for each stage,",
-            "what was computed by Python (deterministic), and the fallback chain.",
+            "Which AI served each stage in THIS run (provider / served model / "
+            "local-vs-API / fallback depth). Deterministic rows are Python.",
             "",
         ]
+        stages = stage_attribution or {}
+        if stages:
+            lines.append("## Per-Stage Winners (this run)")
+            try:
+                from investment_engine.providers.attribution import format_stage_line as _fmt
+            except Exception:
+                _fmt = None
+            for stage in sorted(stages):
+                rec = stages.get(stage) or {}
+                if _fmt is not None:
+                    lines.append(f"- **{_fmt(stage, rec)}**")
+                else:
+                    lines.append(f"- **{stage}**: {(rec.get('provider') or '?')} / "
+                                 f"{(rec.get('model_served') or '?')}")
+            lines.append("")
+        else:
+            lines.append("## Per-Stage Winners (this run)")
+            lines.append("- attribution unavailable (stages did not record winners)")
+            lines.append("")
 
-        # Model info
-        decision_model = model_info.get("decision_model", "deterministic_fallback")
-        summary_model = model_info.get("summary_model", "deterministic_fallback")
-        discovery_model = model_info.get("discovery_model", "deterministic_fallback")
-        decision_detail_model = model_info.get("decision_detail_model", "deterministic_fallback")
-        aggressiveness = model_info.get("ai_aggressiveness", "balanced")
-
-        # Decision & Reasoning
-        lines.append("## Decision & Reasoning")
-        lines.append(f"- **Decision/Recommendation**: {self._format_model_name(decision_model)}")
-        lines.append(f"- **Reasoning/Thinking**: {self._format_model_name(decision_detail_model)} (finr1 for math, gpt-oss/qwen for reasoning)")
-        lines.append(f"- **Summary Generation**: {self._format_model_name(summary_model)} (gemma with fallback)")
-        lines.append(f"- **Discovery/New Ideas**: {self._format_model_name(discovery_model)}")
-        lines.append(f"- **Aggressiveness Profile**: {aggressiveness}")
-
-        # Analyst Recommendations & External Sources
-        lines.append("")
-        lines.append("## Analyst Recommendations & External Sources")
-        lines.append("- **Analyst Consensus**: Available via yfinance (when available)")
-        lines.append("- **Finr1**: Math reasoning model for quantitative analysis")
-        lines.append("- **Technical Indicators**: Python (yfinance + Playwright fallback)")
-
-        # Python-sourced calculations
-        lines.append("")
+        # Python-sourced calculations (static facts about the pipeline)
         lines.append("## Python-Sourced Calculations (Deterministic)")
         lines.append("- **Reconciliation & Valuation**: Python (broker-first, no LLM)")
         lines.append("- **Technical Indicators (RSI, MACD, SMA, ATR, Support/Resistance)**: Python (yfinance + Playwright fallback)")
@@ -1766,16 +2021,7 @@ class AIContextReportBuilder:
         lines.append("- **Reconciliation Delta & Thresholds**: Python (strict tolerance)")
         lines.append("- **Position Weights & Concentration**: Python")
         lines.append("- **Earnings Dates**: Python (yfinance + calendar classification)")
-
-        # Model Fallback Chain
         lines.append("")
-        lines.append("## Model Fallback Chain")
-        lines.append("- **Primary**: LM Studio (local, gpt-oss-20b / qwen3.8-9b / gemma4-12b)")
-        lines.append("- **Fallback 1**: llama.cpp (Raspberry Pi, qwen3.8-9b)")
-        lines.append("- **Fallback 2**: Ollama (Raspberry Pi, qwen3.8-9b-pi / qwen3-4b-pi / noema-2b)")
-        lines.append("- **Fallback 3**: Gemini (free tier, gemini-2.5-flash)")
-        lines.append("- **Fallback 4**: Mistral (free tier, open-mistral-nemo)")
-        lines.append("- **Fallback 5**: Deterministic Python (always available)")
 
         return "\n".join(lines)
 

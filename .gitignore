@@ -33,6 +33,9 @@ Thumbs.db
 .env.*
 !env.example
 
+# Local investment policy (user values, never commit; see investment_policy.example.json)
+investment_policy.json
+
 # Dependencies
 venv/
 .venv/
@@ -76,7 +79,9 @@ reports/t212_test*
 reports/portfolio_analysis*
 reports/run_manifest*
 
-# Old project versions and backups (do not commit)
+# Old project versions and backups (do not commit).
+# NOTE: trading212/ and scripts/ are LIVE code (imported by the engine and
+# tests) and must stay committable - do not re-add them here.
 AsistantV5/
 portfolio-invest-assistant-clean/
 Zalohy/
@@ -85,10 +90,11 @@ PIEs/
 docs/
 runtime/
 accounting/
-trading212/
+
+# Auto-backup snapshots (*_V2415_*) - never commit; canonical files live beside them
+*_V2415_*
 
 # Temporary scripts and files
-scripts/
 install_requirements.bat
 cleanup.bat
 data/

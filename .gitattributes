@@ -1,0 +1,5 @@
+# Repository convention: LF everywhere (see cleanup 2026-09-29 — the whole
+# tree was normalized from stray CRLF back to the committed LF state).
+# text=auto lets Git heal any future CRLF on commit; eol=lf keeps checkouts
+# LF even on Windows (batch files in this repo are LF at HEAD).
+* text=auto eol=lf

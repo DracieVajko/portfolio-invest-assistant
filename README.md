@@ -9,13 +9,22 @@ Reliable Investment Monitoring System with local AI models (Ollama/LM Studio).
 - **Signal Generation** - BUY/SELL/HOLD with probabilities
 - **Per-Asset News** - 48h filtered news with sentiment analysis
 - **Local AI** - Works with Ollama or LM Studio (Fin-R1, Gemma, GPT-OSS)
+- **Ticker self-healing** - Unresolvable holdings get Yahoo search-API suggestions
+  (`failed_tickers.md` + console block with copy-paste `symbol_aliases` fix)
 - **Deterministic Reports** - Markdown + JSON output
 
 ## Quick Start
 
-### 1. Install Dependencies
+### 1. Install Dependencies (Python 3.12 required — use `py -3.12`)
+```cmd
+install.bat
+```
+This installs `requirements.txt` (pinned stack) **plus** the Playwright Chromium
+browser (needed for the TradingView sweep, earnings layer 2 and the technicals
+fallback). Equivalent manual steps:
 ```bash
-pip install -r requirements.txt
+py -3.12 -m pip install -r requirements.txt
+py -3.12 -m playwright install chromium
 ```
 
 ### 2. Configure
@@ -27,21 +36,26 @@ cp api.env.example api.env
 ### 3. Configure Portfolio
 Edit `portfolio_config.json` with your assets and settings.
 
-### 4. Run
+### 4. Run (Python 3.12 required — use `py -3.12`)
 
-**Fast deterministic report (no AI):**
+**Full report (requires LM Studio unless all providers fall back to deterministic output):**
 ```bash
-python portfolio_ai_assistant.py --no-ai
+py -3.12 portfolio_ai_assistant.py
 ```
 
-**Single asset:**
+**Custom config:**
 ```bash
-python portfolio_ai_assistant.py --no-ai --asset AAPL
+py -3.12 portfolio_ai_assistant.py --config portfolio_config.json
 ```
 
-**Full with AI (requires LM Studio):**
+Supported flags today: `--config <path>`, `--investment-engine`, `--generate-full-report`
+(compatibility only; reports are always written).
+Planned / not implemented: `--no-ai`, `--asset`, `--scheduled`, `--validate-only`, `--dry-run`.
+
+**Environment verification (offline, no secrets printed):**
 ```bash
-python portfolio_ai_assistant.py
+py -3.12 scripts/verify_environment.py
+py -3.12 scripts/verify_environment.py --smoke
 ```
 
 ### Batch Files (Windows)
@@ -85,54 +99,78 @@ portfolio_ai_assistant/
 └── run_*.bat                   # Windows batch helpers
 ```
 
-## AI Models (LM Studio)
+## AI Models (LM Studio, per-stage routing)
 
-| Model | Purpose |
-|-------|---------|
-| `fin-r1` | Alpha analysis (reasoning) |
-| `gemma-4-12b` | Summary (fast) |
-| `gpt-oss-20b` | Fallback |
+| Stage | Model (`portfolio_config.json` key) |
+|-------|--------------------------------------|
+| `summary` | `writer_model` (`google/gemma-4-12b`, fast) |
+| `discovery` | `thinking_model` (`openai/gpt-oss-20b`, 32k ctx) |
+| `decision`, `ai_recommendations` | `finance_model` (`qwen3.8-9b-distill`, reasoning) |
+| everything else | `decision_model` (chain default) |
+
+Chain: LM Studio → llama.cpp (Pi) → Ollama (Pi) → Gemini → OpenRouter `:free` →
+Mistral → deterministic fallback. The real winner per stage is recorded in
+`run_manifest.json` (`providers_per_stage`).
 
 Configure in `ai_backends` section of config.
 
-## Scheduled operation (V4)
+## Scheduled operation
 
-Exact scheduled command (Windows Task Scheduler):
+Windows Task Scheduler (or double-click `run_full_report.bat`, which pins Python 3.12):
 
 ```cmd
-py -3.12 portfolio_ai_assistant.py --scheduled
+py -3.12 portfolio_ai_assistant.py --config portfolio_config.json --investment-engine --generate-full-report
 ```
 
-(or double-click `run_full_report.bat`, which pins Python 3.12 and passes `--scheduled`).
+> Note: `--scheduled` is planned / not implemented. The batch files above pass only
+> the actually supported flags. A `runtime/run.lock` single-run lock plus exit codes
+> `3` (already running) / `4` (partial) / `5` (broker sync failed) are likewise
+> planned / not implemented.
 
-Expected output files per run:
+Current outputs per run (see `portfolio_ai_assistant.write_reports`):
 
 ```text
-reports/latest/portfolio_report.md    # concise daily dashboard (read this)
-reports/latest/portfolio_report.json  # canonical machine-readable result
-reports/latest/data_quality.md        # mapping/provider audit (technical)
-reports/latest/run_manifest.json      # run metadata: exit code, timings, files
-reports/archive/YYYY-MM-DD/<run_id>/  # same four files + log snapshot
-reports/portfolio_analysis.md/json    # legacy compatibility copies
+reports/current/portfolio_intelligence_brief.md  # short human brief (≤60 lines, read this)
+reports/current/portfolio_decision_brief.md      # curated deterministic brief
+reports/current/t212_portfolio_snapshot.md       # full broker inventory
+reports/current/portfolio_analysis.json          # canonical machine-readable result
+reports/current/failed_tickers.md                # only when tickers are unresolvable
+reports/current/run_manifest.json                # run_id, sha256, counts, recon, providers, indicator engine
+reports/ai_context/ai_context_<run_id>.md        # full machine archive
+reports/debug/<run_id>/                          # raw dump, recon diagnostics, run log
+reports/archive/<run_id>/                        # full copy of current/ for this run
 ```
 
-Exit codes: `0` success · `1` fatal (no usable report) · `2` config/env error ·
-`3` skipped, another run active · `4` partial (usable report + warnings) ·
-`5` broker sync failed (report states broker data unavailable/stale).
+Provider policy: local-first chain, **LM Studio is the default primary**
+(LM Studio → llama.cpp on Pi → Ollama on Pi → Gemini → OpenRouter `:free`
+→ Mistral → deterministic fallback). Disable locals with
+`--execution-mode public` / `API_ONLY=1`, or LM Studio alone with
+`LMSTUDIO_ENABLED=0`. Every run records the actual winning provider/model
+per stage in `run_manifest.json` (`providers_per_stage`); `provider` is the
+winners summary, `stance` the human portfolio stance.
 
-Task Scheduler hardening — set **both** barriers:
-
-1. The script takes an OS-level lock (`runtime/run.lock`); an overlapping run logs
-   a warning and exits with code `3` without touching reports.
-2. In Task Scheduler set: *“If the task is already running: Do not start a new instance.”*
+Exit codes today: `0` success · `1` report/LLM-stage failure · `2` config error
+(unknown flags also exit `2` via argparse).
 
 Pre-flight checks (offline, no secrets printed):
 
 ```cmd
-py -3.12 portfolio_ai_assistant.py --validate-only   :: config check, exit 2 on errors
-py -3.12 portfolio_ai_assistant.py --dry-run --no-ai :: full pipeline in memory, no files
-py -3.12 -m pytest tests/ -q                         :: 55 offline tests
+py -3.12 scripts/verify_environment.py          :: interpreter, deps, gitignore, syntax
+py -3.12 scripts/verify_environment.py --smoke  :: plus one fast offline test module
+py -3.12 -m pytest tests/ -q                    :: full offline unit suite
+py -3.12 -m pytest experimental/tests/ -q       :: isolated backtest suite
 ```
+
+## Technical indicators (optional dependencies)
+
+`pandas-ta` is optional and NOT required. When installed, `TechnicalAnalyzer` uses the
+`pandas-ta` engine; otherwise it falls back to deterministic manual indicators
+(SMA/EMA/MACD/RSI/Bollinger/ATR/simplified ADX and Supertrend, OBV, rolling VWAP, …).
+Both paths are covered by tests, but numerics differ — see `docs/audit/PROJECT_AUDIT.md`
+(Technical Indicator Audit) and run `scripts/verify_environment.py` to see which engine
+would activate on your PC. `tzdata` is a core requirement so `ZoneInfo` works on Windows.
+Pinned stack (reproducible installs): `pandas==2.2.3`, `numpy==1.26.4`,
+`scipy==1.13.1` — pandas 3.x is not supported (breaks frozen manual-v1 numerics).
 
 Secrets: `api.env` holds real keys — never commit it, never paste logs containing
 `Authorization`/`Bearer`/`key=` values (the tool redacts them automatically).

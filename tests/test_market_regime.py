@@ -317,7 +317,8 @@ class TestRegimeClassification:
         
         assert "PEAK_HOLD" in analyzer.REGIME_ACTIONS
         assert "DECLINING" in analyzer.REGIME_ACTIONS
-        assert "MUST_BUY" in analyzer.REGIME_ACTIONS
+        assert "POTENTIAL_ACCUMULATION_ZONE" in analyzer.REGIME_ACTIONS
+        assert "MUST_BUY" in analyzer.REGIME_ACTIONS  # deprecated alias
         assert "NEUTRAL" in analyzer.REGIME_ACTIONS
         
         peak_action = analyzer.REGIME_ACTIONS["PEAK_HOLD"]

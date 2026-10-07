@@ -257,7 +257,7 @@ def test_gbx_rate_lookup_uses_gbp():
 
 
 def test_parse_position_gbx_uses_gbp_rate():
-    from trading212_portfolio import parse_position
+    from trading212.portfolio import parse_position
     catalog = {"EGTl_EQ": {"isin": "GB00BPVG5407", "currencyCode": "GBX"}}
     parsed = parse_position(
         {"ticker": "EGTl_EQ", "quantity": 100.0, "averagePrice": 14.0,

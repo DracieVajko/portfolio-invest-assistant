@@ -86,14 +86,59 @@ YAHOO_OVERRIDES: Dict[str, str] = {
     "BYND": "BYND",
     "BYDDY": "BYDDY",
     "EGT": "EGT.L",
-    "LITM": "LIT",
+    "LITM": "LITM.L",
     "DDD": "DDD",
     "000660": "000660.KS",
 }
 NO_EARNINGS_YAHOO: frozenset = frozenset({
     "BTC-USD", "ETH-USD", "SOL-USD", "KAS-USD", "SUI-USD", "RENDER-USD", "TAO-USD",
     "XEON", "CSH2", "ERNX",
+    # Verified ETFs/ETCs (no earnings calendar; skips the lookup before any
+    # network call, silencing yfinance "No earnings dates" noise at the source).
+    "NCLR.L", "SIL", "AINF", "WBIO.L", "NATP.L", "IISU.L", "IUVF.L", "ESIF.L",
+    "ERNE.L", "JEDG.L", "SGLN", "LITM.L", "GDX", "COFF.L", "FWRG", "IQQH.DE",
+    "EXI2.DE", "IEFA", "QWTM.L", "SSLN.L", "DR4M.L", "DRDR.L",
 })
+# Explicit broker-ID -> Yahoo map (verified against live Yahoo, 2026-09-26).
+# Every T212 broker_instrument_id held in the account resolves here first, so
+# display-stripping and suffix heuristics can never misroute a holding (e.g.
+# ENRd_EQ must reach Siemens Energy ENR.DE, never US Energizer ENR; LAR0D_EQ
+# reaches Xetra LOM.DE, never a guessed form). Keys are UPPER broker IDs.
+# Crypto pairs are handled by YAHOO_OVERRIDES/crypto rules below instead.
+BROKER_YAHOO_OVERRIDES: Dict[str, str] = {
+    "TUYA_US_EQ": "TUYA", "CNQ_US_EQ": "CNQ", "EMR_US_EQ": "EMR",
+    "NCLRL_EQ": "NCLR.L", "LOW_US_EQ": "LOW", "O_US_EQ": "O",
+    "LAR0D_EQ": "LOM.DE", "NEE_US_EQ": "NEE", "SILGL_EQ": "SIL",
+    "AFL_US_EQ": "AFL", "COPGL_EQ": "COP", "RY_US_EQ": "RY",
+    "LIN_US_EQ": "LIN", "AINFL_EQ": "AINF", "BLK_US_EQ": "BLK",
+    "WBIOL_EQ": "WBIO.L", "CAH_US_EQ": "CAH", "CSCO_US_EQ": "CSCO",
+    "ITW_US_EQ": "ITW", "GD_US_EQ": "GD", "ADC_US_EQ": "ADC",
+    "MAIN_US_EQ": "MAIN", "NATPL_EQ": "NATP.L", "ECL_US_EQ": "ECL",
+    "IBM_US_EQ": "IBM", "BMO_US_EQ": "BMO", "ETN_US_EQ": "ETN",
+    "FB2AD_EQ": "META", "ENRD_EQ": "ENR.DE", "IBEE_EQ": "IBE.MC",
+    "TD_US_EQ": "TD", "IISUL_EQ": "IISU.L", "LTC_US_EQ": "LTC",
+    "HTHIY_US_EQ": "HTHIY", "TROW_US_EQ": "TROW", "EGTL_EQ": "EGT.L",
+    "SYY_US_EQ": "SYY", "GEV_US_EQ": "GEV", "ERNXD_EQ": "ERNE.L",
+    "ESIFL_EQ": "ESIF.L", "SUP_EQ": "SU.PA", "C7A0D_EQ": "300750.SZ",
+    "ADP_US_EQ": "ADP", "TTWO_US_EQ": "TTWO", "PEP_US_EQ": "PEP",
+    "JEDGL_EQ": "JEDG.L", "INLD_EQ": "INTC", "CB_US_EQ": "CB",
+    "APD_US_EQ": "APD", "MSFT_US_EQ": "MSFT", "ROP_US_EQ": "ROP",
+    "SGLNL_EQ": "SGLN", "VWSBD_EQ": "VWS.CO", "UEC_US_EQ": "UEC",
+    "IUVFL_EQ": "IUVF.L", "LITMM_EQ": "LITM.L", "RWED_EQ": "RWE.DE",
+    "C_US_EQ": "C", "KO_US_EQ": "KO", "COCOL_EQ": "COCO",
+    "DRDRL_EQ": "DRDR.L", "PG_US_EQ": "PG", "GDGBL_EQ": "GDX",
+    "JNJ_US_EQ": "JNJ", "WMT_US_EQ": "WMT", "PNR_US_EQ": "PNR",
+    "MCD_US_EQ": "MCD", "GOOD_US_EQ": "GOOD", "AGNC_US_EQ": "AGNC",
+    "CVX_US_EQ": "CVX", "BNS_US_EQ": "BNS", "COFFL_EQ": "COFF.L",
+    "FWRGL_EQ": "FWRG", "IQQHD_EQ": "IQQH.DE", "DUK_US_EQ": "DUK",
+    "NUE_US_EQ": "NUE", "1YDD_EQ": "IEFA", "QWTML_EQ": "QWTM.L",
+    "GWW_US_EQ": "GWW", "ABT_US_EQ": "ABT", "AAPL_US_EQ": "AAPL",
+    "APCD_EQ": "AAPL", "JPM_US_EQ": "JPM", "PPG_US_EQ": "PPG",
+    "BMY_US_EQ": "BMY", "DJGTEEXD_EQ": "EXI2.DE", "SHW_US_EQ": "SHW",
+    "SSLNL_EQ": "SSLN.L", "CF_US_EQ": "CF", "NVDD_EQ": "NVDA",
+    "RGLD_US_EQ": "RGLD", "MA_US_EQ": "MA", "DR4ML_EQ": "DR4M.L",
+    "AIP_EQ": "AI.PA", "KMB_US_EQ": "KMB", "SLB_US_EQ": "SLB",
+}
 SUPPORTED = "SUPPORTED"
 UNSUPPORTED = "UNSUPPORTED"
 UNRESOLVED = "UNRESOLVED"
@@ -109,6 +154,19 @@ SUPPORTED_YAHOO: frozenset = frozenset({
     "TSLA", "STLA", "SLDP", "BYND", "BYDDY", "EGT.L", "LIT", "DDD",
     "000660.KS",
     "C", "CVX", "JNJ", "JPM", "WMT",
+    # Verified 2026-09-26 (live Yahoo): US holdings.
+    "TUYA", "CNQ", "EMR", "LOW", "O", "LMT", "AFL", "COP", "RY", "LIN",
+    "BLK", "CAH", "ITW", "GD", "ADC", "MAIN", "ECL", "BMO", "ETN", "META",
+    "TD", "HTHIY", "TROW", "SYY", "GEV", "ADP", "PEP", "CB", "APD", "ROP",
+    "UEC", "KO", "PG", "PNR", "MCD", "GOOD", "AGNC", "BNS", "DUK", "NUE",
+    "GWW", "ABT", "PPG", "BMY", "SHW", "CF", "RGLD", "MA", "KMB", "SLB",
+    # Verified 2026-09-26 (live Yahoo): EU/ETF listings (dotted forms need
+    # explicit entries; venue hints alone never verify them).
+    "NCLR.L", "WBIO.L", "DRDR.L", "QWTM.L", "NATP.L", "IISU.L", "IUVF.L",
+    "ESIF.L", "JEDG.L", "SSLN.L", "IQQH.DE", "EXI2.DE", "COFF.L", "DR4M.L",
+    "ERNE.L", "ENR.DE", "LOM.DE", "SU.PA", "AI.PA", "SGLN", "LITM.L",
+    "FWRG", "COCO", "GDX", "SIL", "IEFA", "300750.SZ", "3750.HK", "CYATY",
+    "AINF", "NVDA", "INTC",
 })
 MAPPING_UNAVAILABLE_NOTE = "Market-data mapping unavailable; broker valuation retained."
 def _normalize_alias_key(key: Any) -> str:
@@ -135,6 +193,20 @@ def resolve_alias(key: Any, aliases: Optional[Dict[str, str]] = None) -> Optiona
     if v is not None:
         logger.debug("resolve_alias %r -> %r via static", k, v)
     return v
+def resolve_config_alias(key: Any, aliases: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Config-layer hit only (no static fallback). Used for precedence."""
+    k = _normalize_alias_key(key)
+    if not k or not aliases:
+        return None
+    for ak, av in aliases.items():
+        if _normalize_alias_key(ak) == k:
+            v = str(av or "").strip()
+            if v:
+                return v
+            break
+    return None
+
+
 def resolve_alias_with_source(key: Any, aliases: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], str]:
     """Same as ``resolve_alias`` but also returns the provenance label.
     Returns ``(value_or_None, source)`` where source is config/static/none.
@@ -326,6 +398,9 @@ def support_state(yahoo_symbol: Optional[str], purpose: str = "market_data", ven
 UNRESOLVED_YAHOO: frozenset = frozenset({
     "EGTL", "SYNL", "SYN", "SYN.L", "IQQH", "HY9H",
     "C7A0", "VWSB", "SU", "AI", "ENR",
+    # Broker-display stems that are not real Yahoo symbols (must never validate
+    # even if a display-stripping path surfaces them).
+    "NVD", "INLD", "APCD", "LAR0D", "COPG",
 })
 _US_STOCK_RE = None
 _INTERNAL_SUFFIXES = ("_US_EQ", "_DE_EQ", "_IM_EQ", "_L_EQ", "_D_EQ", "_EQ")
@@ -405,7 +480,20 @@ def to_yahoo_symbol(internal_id: str, display_symbol: str = "", aliases: Optiona
     internal_key = (internal_id or "").strip().upper()
     display_key = (display_symbol or "").strip().upper() or to_display_symbol(internal_id)
     internal_stem = _internal_stem(internal_key)
-    for key in (internal_key, internal_stem, display_key, display_key.split("_")[0]):
+    keys = (internal_key, internal_stem, display_key, display_key.split("_")[0])
+    # Precedence: explicit config aliases > verified broker-ID map > static
+    # table. The broker map beats heuristics but never a user override.
+    if aliases:
+        for key in keys:
+            if key:
+                v = resolve_config_alias(key, aliases)
+                if v:
+                    return v
+    # Verified broker-ID map: exact holdings never pass through heuristics.
+    hit = BROKER_YAHOO_OVERRIDES.get(internal_key)
+    if hit:
+        return hit
+    for key in keys:
         if key:
             hit = resolve_alias(key, aliases)
             if hit:

@@ -1,8 +1,13 @@
 """Model presets: tuned sampling params per pipeline role.
 
-Two roles exist (mirrors _model_for_stage in investment_engine.main):
+Roles (mirrors _model_for_stage in investment_engine.main):
 - REASONING: deep analysis stages (decision, discovery, pie eval,
-  ai_recommendations). Tuned for deepseek-r1-finance-reasoning-14b.
+  ai_recommendations). Tuned for qwen3.8-9b (was deepseek-r1-finance-14b,
+  retired for reasoning-trace leakage into strict-JSON stages).
+- FINANCE: finance-specialist stages (decision, ai_recommendations).
+  Served by qwen3.8-9b-distill; same reasoning-friendly sampling as REASONING.
+- THINKING: open research (discovery). Served by openai/gpt-oss-20b
+  (32k ctx); generous output floor, longer reads tolerated.
 - SUMMARY: faithful compression (summary stage). Tuned for gemma-4-12b.
 
 All fields verified accepted (HTTP 200) by the LM Studio server; unknown
@@ -16,6 +21,12 @@ from __future__ import annotations
 # Stages that compress instead of reason. Single source of truth —
 # investment_engine.main imports this (do not duplicate the set).
 WRITER_STAGES = frozenset({"summary"})
+
+# Open-research stages served by the thinking model (gpt-oss-20b, 32k ctx).
+THINKING_STAGES = frozenset({"discovery"})
+
+# Finance-specialist stages served by qwen3.8-9b-distill (reasoning-friendly).
+FINANCE_STAGES = frozenset({"decision", "ai_recommendations", "decision_detail"})
 
 # Reasoning models (R1 family) degrade with near-zero temperature:
 # DeepSeek's guidance is temperature ~0.6. A low cap also truncates the
@@ -37,6 +48,15 @@ SUMMARY_PRESET: dict = {
     "min_tokens_floor": 0,  # stage token budget is enough for compression
 }
 
+# Thinking/research (30B-A3B MoE): reasoning-friendly, room to think.
+THINKING_PRESET: dict = {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 40,
+    "repeat_penalty": 1.0,
+    "min_tokens_floor": 2048,
+}
+
 # Payload keys the LM Studio server accepts (probed: all HTTP 200).
 SAMPLING_KEYS = ("temperature", "top_p", "top_k", "repeat_penalty")
 
@@ -45,7 +65,9 @@ def preset_for(stage: str) -> dict:
     """Return a copy of the preset for a pipeline stage."""
     if stage in WRITER_STAGES:
         return dict(SUMMARY_PRESET)
-    return dict(REASONING_PRESET)
+    if stage in THINKING_STAGES:
+        return dict(THINKING_PRESET)
+    return dict(REASONING_PRESET)  # FINANCE stages share reasoning sampling
 
 
 def merge_sampling(preset: dict, context: dict | None) -> dict:

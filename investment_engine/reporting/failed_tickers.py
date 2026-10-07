@@ -31,9 +31,14 @@ def collect_failed_tickers(
     as unresolved holdings.
     """
     try:
-        from investment_engine.portfolio.symbols import support_state
+        from investment_engine.research.universe import (
+            universe_support_state as support_state,
+        )
     except Exception:
-        return []
+        try:
+            from investment_engine.portfolio.symbols import support_state
+        except Exception:
+            return []
     try:
         by_display: dict[str, dict] = {}
         for pos in standalone or []:
@@ -84,7 +89,8 @@ def collect_failed_tickers(
         return []
 
 
-def render_failed_tickers_md(failed: list[dict[str, Any]], run_id: str = "") -> str:
+def render_failed_tickers_md(failed: list[dict[str, Any]], run_id: str = "",
+                             suggestions: dict[str, list[dict[str, Any]]] | None = None) -> str:
     """Render failed_tickers.md with ready-to-copy symbol_aliases JSON."""
     if not failed:
         return ""
@@ -112,6 +118,26 @@ def render_failed_tickers_md(failed: list[dict[str, Any]], run_id: str = "") -> 
             f"{'yes' if e.get('fetch_failed') else 'no'} | {e.get('qty', 0)} | "
             f"{e.get('value_eur', 0):,.2f} | {e.get('category', '?')} |"
         )
+    lines += [
+        "",
+        "## Suggested Yahoo symbols (auto, verify before use)",
+        "",
+        "Source: Yahoo search API (keyless). Playwright/manual quote-page check",
+        "is the last resort when no candidate fits.",
+        "",
+        "| Display | Candidate | Name | Exchange | Type | Score |",
+        "|---|---|---|---|---|---|",
+    ]
+    for e in held_failed:
+        disp = str(e.get("display", "?"))
+        cands = (suggestions or {}).get(disp) or (suggestions or {}).get(disp.upper()) or []
+        if not cands:
+            lines.append(f"| {disp} | — | no suggestion (check finance.yahoo.com manually) | — | — | — |")
+        for c in cands[:3]:
+            lines.append(
+                f"| {disp} | {c.get('symbol', '—')} | {c.get('name', '') or '—'} | "
+                f"{c.get('exch', '') or '—'} | {c.get('type', '') or '—'} | {c.get('score', 0)} |"
+            )
     lines += [
         "",
         "## Fix: add to `symbol_aliases` in portfolio_config.json",

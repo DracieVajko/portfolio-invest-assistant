@@ -21,29 +21,54 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Slovak news sources
+# Slovak news sources (verified live 2026-09-26: all HTTP 200 + XML).
+# SME removed (rss.sme.sk dead: 403 + robots-blocked); Pravda moved to
+# /spravy/rss/xml (old /rss/ is 404); TERAZ (TASR) and Google News SK added.
 # ---------------------------------------------------------------------------
 
 SLOVAK_NEWS_SOURCES = {
-    "sme.sk": {
-        "rss_url": "https://www.sme.sk/rss/aktuality/",
-        "name": "SME",
-        "base_url": "https://www.sme.sk",
-        "category": "general",
-    },
-    "pravda.sk": {
-        "rss_url": "https://www.pravda.sk/rss/",
-        "name": "Pravda",
-        "base_url": "https://www.pravda.sk",
-        "category": "general",
-    },
     "aktuality.sk": {
         "rss_url": "https://www.aktuality.sk/rss/",
         "name": "Aktuality",
         "base_url": "https://www.aktuality.sk",
         "category": "general",
     },
+    "pravda.sk": {
+        "rss_url": "https://www.pravda.sk/spravy/rss/xml",
+        "name": "Pravda",
+        "base_url": "https://www.pravda.sk",
+        "category": "general",
+    },
+    "teraz.sk": {
+        "rss_url": "https://www.teraz.sk/rss/vsetky-spravy.rss",
+        "name": "TERAZ",
+        "base_url": "https://www.teraz.sk",
+        "category": "general",
+    },
+    "googlenews-sk": {
+        "rss_url": "https://news.google.com/rss?hl=sk&gl=SK&ceid=SK:sk",
+        "name": "Google News",
+        "base_url": "https://news.google.com",
+        "category": "general",
+    },
 }
+
+
+# ---------------------------------------------------------------------------
+# Verified RSS fallback feeds (checked live 2026-09-26: HTTP 200 + body).
+# COMPLIANCE: public RSS endpoints only, headlines + links, modest rate.
+# Reuters rssFeed is dead (401); FT/Bloomberg are paywalled homepage scrapes
+# and are deliberately NOT included (ToS + auth walls).
+# ---------------------------------------------------------------------------
+
+RSS_FALLBACK_SOURCES = (
+    {"name": "Yahoo Finance", "rss_url": "https://finance.yahoo.com/news/rssindex",
+     "tier": 2, "category": "market"},
+    {"name": "CNBC Markets", "rss_url": "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+     "tier": 2, "category": "macro"},
+    {"name": "MarketWatch", "rss_url": "https://www.marketwatch.com/rss/topstories",
+     "tier": 2, "category": "market"},
+)
 
 
 # ---------------------------------------------------------------------------
@@ -81,18 +106,108 @@ CRYPTO_QUERY_MAP = {
 
 
 # ---------------------------------------------------------------------------
-# Analyst and forecast tracking
+# Section tagging for deep dive sections
+# Maps news categories/keywords to deep dive section tags
 # ---------------------------------------------------------------------------
 
-ANALYST_QUERY_TEMPLATES = [
-    "{name} {symbol} analyst rating price target",
-    "{name} {symbol} upgrade downgrade 2024 2025",
-    "{name} {symbol} investment outlook forecast",
-    "{symbol} stock analyst recommendation consensus",
-]
+SECTION_TAG_KEYWORDS = {
+    "MACRO": [
+        "macro", "fed", "federal reserve", "interest rate", "inflation", "cpi", "ppi",
+        "gdp", "unemployment", "jobs", "economy", "recession", "monetary policy",
+        "central bank", "ecb", "boj", "trump", "tariff", "trade war", "geopolitics",
+        "geopolitical", "sanctions", "fiscal", "deficit", "debt ceiling", "treasury",
+        "yield curve", "bond", "dollar", "currency", "forex", "emerging markets"
+    ],
+    "ENERGY": [
+        "oil", "crude", "wti", "brent", "natural gas", "lng", "energy", "opec",
+        "refinery", "pipeline", "solar", "wind", "renewable", "battery", "lithium",
+        "uranium", "nuclear", "hydrogen", "copper", "copper price", "copper market",
+        "solar", "wind power", "renewable energy", "clean energy", "grid", "utility",
+        "oil price", "gas price", "energy transition", "decarbonization"
+    ],
+    "HEALTHCARE": [
+        "fda", "clinical trial", "phase 1", "phase 2", "phase 3", "pharma",
+        "biotech", "biotechnology", "drug", "pharmaceutical", "healthcare",
+        "hospital", "medical", "vaccine", "therapy", "treatment", "diagnostic",
+        "oncology", "cardiology", "neurology", "rare disease", "orphan drug",
+        "biologics", "gene therapy", "cell therapy", "medical device", "health tech",
+        "clinical trial", "phase i", "phase ii", "phase iii", "approval", "ndaa",
+        "pipeline", "candidate", "orphan", "fast track", "breakthrough therapy"
+    ],
+    "CRYPTO": [
+        "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto",
+        "cryptocurrency", "blockchain", "defi", "decentralized finance",
+        "web3", "nft", "stablecoin", "tether", "usdt", "usdc", "binance",
+        "coinbase", "kraken", "etf", "bitcoin etf", "ethereum etf", "solana etf",
+        "regulation", "sec", "crypto regulation", "custody", "staking", "mining",
+        "halving", "lightning network", "layer 2", "layer2", "rollup", "zk",
+        "stablecoin", "tether", "circle", "paxos", "ripple", "xrp", "cardano",
+        "avalanche", "polygon", "arbitrum", "optimism", "base", "mantle"
+    ],
+    "ANALYST": [
+        "analyst", "rating", "upgrade", "downgrade", "price target", "consensus",
+        "recommendation", "buy", "sell", "hold", "overweight", "underweight",
+        "outperform", "underperform", "initiation", "coverage", "price target",
+        "earnings estimate", "revenue estimate", "guidance", "outlook",
+        "analyst rating", "price target raised", "price target lowered",
+        "upgrade", "downgrade", "initiated", "resumed", "suspended"
+    ],
+}
+
+ENERGY_COMMODITY_TARGETS = {"oil", "copper", "lithium", "uranium", "silver", "gold", "natural gas", "hydrogen"}
 
 
-class NewsSourceResult:
+def assign_section_tag(record: dict) -> str:
+    """Assign a deep-dive section tag based on record category and content.
+    
+    Returns one of: MACRO, ENERGY, HEALTHCARE, CRYPTO, ANALYST, GENERAL
+    """
+    category = (record.get("category") or "").lower()
+    trump_cat = (record.get("trump_category") or "").lower()
+    commodity_target = (record.get("commodity_target") or "").lower()
+    analyst_target = (record.get("analyst_target") or "").lower()
+    source = (record.get("source") or "").lower()
+    title = (record.get("title") or "").lower()
+    preview = (record.get("preview") or "").lower()
+    text = f"{title} {preview}"
+    
+    # Explicit category mappings
+    if category in ("macro", "trump") or trump_cat:
+        return "MACRO"
+    if category in ("macro", "market") and any(k in text for k in SECTION_TAG_KEYWORDS["MACRO"]):
+        return "MACRO"
+    if category in ("market",) and any(k in text for k in SECTION_TAG_KEYWORDS["MACRO"]):
+        return "MACRO"
+    
+    if commodity_target in ENERGY_COMMODITY_TARGETS:
+        return "ENERGY"
+    if commodity_target:
+        return "ENERGY"  # All commodities -> ENERGY section
+    
+    if category in ("crypto",) or commodity_target in ("btc", "eth", "sol", "crypto"):
+        return "CRYPTO"
+    if any(k in text for k in SECTION_TAG_KEYWORDS["CRYPTO"]):
+        return "CRYPTO"
+    
+    if analyst_target or category in ("analyst",):
+        return "ANALYST"
+    if any(k in text for k in SECTION_TAG_KEYWORDS["ANALYST"]):
+        return "ANALYST"
+    
+    if any(k in text for k in SECTION_TAG_KEYWORDS["HEALTHCARE"]):
+        return "HEALTHCARE"
+    
+    if any(k in text for k in SECTION_TAG_KEYWORDS["ENERGY"]):
+        return "ENERGY"
+    
+    if trump_cat or "trump" in text:
+        return "MACRO"
+    
+    # Default
+    return "GENERAL"
+
+
+def _as_record(item):
     """Result from a single news source fetch."""
     def __init__(self, source_name: str, items: list[dict], error: str | None = None):
         self.source_name = source_name
@@ -103,6 +218,63 @@ class NewsSourceResult:
     @property
     def success(self) -> bool:
         return self.error is None and len(self.items) > 0
+
+
+def _as_record(item):
+    """Coerce a news record to a plain dict (NewsItem dataclass, Pydantic
+    model, or mapping). Never raises: unusable shapes become {}.
+
+    Also synthesizes the display-date key ``published`` when the record only
+    carries ``published_str``/``published_dt`` (RSS-fallback shape). Renderers
+    below read ``published``; without this the holdings/trump/commodity
+    sections printed empty ``Date:`` (run 524fffa0). Records with no date at
+    all get ``undated: True`` instead of a silent blank.
+    """
+    if item is None:
+        return {}
+    if isinstance(item, dict):
+        out = dict(item)  # copy: synthesis below must not mutate fetcher output
+    else:
+        out = None
+        try:
+            import dataclasses as _dc
+            if _dc.is_dataclass(item) and not isinstance(item, type):
+                out = _dc.asdict(item)
+                if not isinstance(out, dict):
+                    out = None
+        except Exception:
+            pass
+        if out is None:
+            for attr in ("model_dump", "dict", "to_dict"):
+                try:
+                    conv = getattr(item, attr, None)
+                    if callable(conv):
+                        cand = conv()
+                        if isinstance(cand, dict):
+                            out = cand
+                            break
+                except Exception:
+                    continue
+        if out is None:
+            try:
+                out = {k: getattr(item, k) for k in dir(item)
+                       if not k.startswith("_") and not callable(getattr(item, k, None))}
+            except Exception:
+                return {}
+        if not isinstance(out, dict):
+            return {}
+    if not out.get("published"):
+        synth = out.get("published_str") or ""
+        if not synth and out.get("published_dt") is not None:
+            try:
+                synth = out["published_dt"].strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                synth = str(out.get("published_dt") or "")
+        if synth:
+            out["published"] = synth
+        else:
+            out["undated"] = True
+    return out
 
 
 class EnhancedNewsFetcher:
@@ -129,6 +301,8 @@ class EnhancedNewsFetcher:
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "PortfolioAI/2.0"})
         self._lock = threading.Lock()
+        # Slovak sites with a hard failure (HTTP 403/404) stay disabled rest of run.
+        self._slovak_disabled: set[str] = set()
 
     # -----------------------------------------------------------------
     # Slovak news sites
@@ -139,7 +313,7 @@ class EnhancedNewsFetcher:
         symbols: list[str] | None = None,
         companies: list[str] | None = None,
     ) -> list[dict]:
-        """Fetch news from Slovak news sites (sme.sk, pravda.sk, aktuality.sk).
+        """Fetch news from Slovak news sites (Aktuality, Pravda, TERAZ, Google News SK).
 
         Filters by symbols/company names if provided. Returns items
         with title, url, source, published_dt, and content preview.
@@ -154,11 +328,24 @@ class EnhancedNewsFetcher:
             site_info = SLOVAK_NEWS_SOURCES.get(site_key)
             if not site_info:
                 continue
+            if site_key in self._slovak_disabled:
+                continue
             try:
                 items = self._fetch_slovak_feed(site_info, cutoff, symbols, companies)
                 all_items.extend(items)
             except Exception as exc:
-                logger.debug("Slovak news fetch failed for %s: %s", site_key, exc)
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                try:
+                    status = int(status) if status else None
+                except (TypeError, ValueError):
+                    status = None
+                if status in (403, 404):
+                    self._slovak_disabled.add(site_key)
+                    logger.warning("Slovak source unavailable: %s (HTTP %s); "
+                                   "disabled for the rest of the run",
+                                   site_info.get("name", site_key), status)
+                else:
+                    logger.debug("Slovak news fetch failed for %s: %s", site_key, exc)
         return all_items
 
     def _fetch_slovak_feed(
@@ -211,6 +398,12 @@ class EnhancedNewsFetcher:
                     "published_str": pub_dt.strftime("%Y-%m-%d %H:%M"),
                     "preview": preview,
                     "category": "slovak",
+                    "section": assign_section_tag({
+                        "category": "slovak",
+                        "title": title,
+                        "preview": preview,
+                        "source": site_info["name"],
+                    }),
                     "ticker_match": self._find_ticker_matches(text, symbols or []),
                 })
             except Exception:
@@ -232,17 +425,24 @@ class EnhancedNewsFetcher:
         title_pattern = re.compile(r"<h[1-3][^>]*>\s*<a[^>]*href=\"([^\"]+)\"[^>]*>([^<]+)</a>", re.IGNORECASE)
         for match in title_pattern.finditer(text):
             url, title = match.groups()
-            pub_dt = datetime.now(timezone.utc)  # Approximate
-            if pub_dt < cutoff:
-                continue
+            # Phase 5: HTML fallback carries no trustworthy timestamp. Never
+            # stamp now() (that would defeat the 48h freshness gate); mark
+            # undated so the corpus excludes it from decision-relevant sets.
             items.append({
                 "title": title.strip(),
                 "url": url.strip(),
                 "source": site_info["name"],
-                "published_dt": pub_dt,
-                "published_str": pub_dt.strftime("%Y-%m-%d %H:%M"),
+                "published_dt": None,
+                "published_str": "undated",
+                "undated": True,
                 "preview": "",
                 "category": "slovak",
+                "section": assign_section_tag({
+                    "category": "slovak",
+                    "title": title.strip(),
+                    "preview": "",
+                    "source": site_info["name"],
+                }),
                 "ticker_match": [],
             })
         return items[:5]
@@ -263,6 +463,91 @@ class EnhancedNewsFetcher:
                 except Exception:
                     continue
         return None
+
+    # -----------------------------------------------------------------
+    # Verified RSS fallbacks (Yahoo/CNBC/MarketWatch — see RSS_FALLBACK_SOURCES)
+    # -----------------------------------------------------------------
+
+    def fetch_rss_fallbacks(
+        self,
+        query_terms: list[str] | None = None,
+        limit_total: int = 12,
+    ) -> list[dict]:
+        """Keyword-filtered items from verified RSS fallback feeds.
+
+        Returns Enhanced-shape dicts (category/tier/timestamps real from RSS).
+        Never raises: per-feed failures degrade to an empty contribution.
+        """
+        import email.utils as _eu
+
+        terms = [str(t or "").strip().lower() for t in (query_terms or []) if str(t or "").strip()]
+        if not terms:
+            terms = ["stock", "market", "earnings"]
+        cutoff = datetime.now(timezone.utc) - self.max_age
+        out: list[dict] = []
+        for src in RSS_FALLBACK_SOURCES:
+            if len(out) >= limit_total:
+                break
+            try:
+                resp = self._session.get(src["rss_url"], timeout=self.timeout)
+                resp.raise_for_status()
+                feed = feedparser.parse(resp.content)
+            except Exception as exc:
+                logger.debug("RSS fallback fetch failed for %s: %s", src["name"], exc)
+                continue
+            for entry in feed.entries:
+                if len(out) >= limit_total:
+                    break
+                try:
+                    title = str(entry.get("title", "") or "").strip()
+                    link = str(entry.get("link", "") or "").strip()
+                    if not title or not link:
+                        continue
+                    hay = f"{title} {entry.get('summary', '')}".lower()
+                    if not any(t in hay for t in terms):
+                        continue
+                    pub_dt = None
+                    for field in ("published_parsed", "updated_parsed"):
+                        val = getattr(entry, field, None) if not isinstance(entry, dict) else entry.get(field)
+                        if val:
+                            try:
+                                pub_dt = datetime(*val[:6], tzinfo=timezone.utc)
+                                break
+                            except Exception:
+                                continue
+                    if pub_dt is None:
+                        try:
+                            pub_dt = _eu.parsedate_to_datetime(
+                                str(entry.get("published", "") or "")).astimezone(timezone.utc)
+                        except Exception:
+                            continue
+                    if pub_dt < cutoff:
+                        continue
+                    out.append({
+                        "title": title,
+                        "url": link,
+                        "source": src["name"],
+                        "published_dt": pub_dt,
+                        "published_str": pub_dt.strftime("%Y-%m-%d %H:%M"),
+                        "preview": re.sub(r"\s+", " ", str(entry.get("summary", "") or ""))[:300],
+                        "category": src["category"],
+                        "tier": src["tier"],
+                        # Keyword-matched market item: moderately relevant by
+                        # construction, but generic — 65 clears the default
+                        # 60 gate while staying below strongly-scored items.
+                        # The held-link stage still drops unlinked items.
+                        "relevance_score": 65,
+                        "section": assign_section_tag({
+                            "category": src["category"],
+                            "title": title,
+                            "preview": re.sub(r"\s+", " ", str(entry.get("summary", "") or ""))[:300],
+                            "source": src["name"],
+                        }),
+                        "ticker_match": [],
+                    })
+                except Exception:
+                    continue
+        return out
 
     # -----------------------------------------------------------------
     # Reddit search
@@ -330,6 +615,12 @@ class EnhancedNewsFetcher:
                     "score": score,
                     "author": author,
                     "category": "reddit",
+                    "section": assign_section_tag({
+                        "category": "reddit",
+                        "title": title,
+                        "preview": "",
+                        "source": f"r/{subreddit}",
+                    }),
                     "ticker_match": [],
                 })
             except Exception:
@@ -361,6 +652,7 @@ class EnhancedNewsFetcher:
             for item in merged:
                 item["trump_category"] = category
                 item["trump_keywords"] = keywords
+                item["section"] = "MACRO"  # All Trump tracking is MACRO
             results[category] = merged[:5]
         return results
 
@@ -387,6 +679,12 @@ class EnhancedNewsFetcher:
                         merged.append(item.__dict__ if hasattr(item, "__dict__") else item)
                 for item in merged:
                     item["commodity_target"] = target
+                    item["section"] = assign_section_tag({
+                        "category": "commodity",
+                        "commodity_target": target,
+                        "title": item.get("title", ""),
+                        "preview": item.get("preview", ""),
+                    })
                 results[target] = merged[:5]
         return results
 
@@ -417,6 +715,7 @@ class EnhancedNewsFetcher:
                     merged.append(item.__dict__ if hasattr(item, "__dict__") else item)
             for item in merged:
                 item["analyst_target"] = symbol
+                item["section"] = "ANALYST"  # All analyst news goes to ANALYST section
             if merged:
                 results[symbol] = merged[:5]
         return results
@@ -472,6 +771,21 @@ class NewsContextBuilder:
         date, URL, and optional preview text. This gives the AI
         maximum context for decision-making.
         """
+        # Boundary normalization (A-sanitize): Strict fetchers yield NewsItem
+        # dataclasses, Enhanced fetchers yield dicts. Every consumer below may
+        # use .get(); normalize once here so a shape mismatch can never raise
+        # "'NewsItem' object has no attribute 'get'" mid-run again.
+        news_by_symbol = {k: [_as_record(i) for i in (v or [])]
+                          for k, v in (news_by_symbol or {}).items()}
+        trump_tracking = {k: [_as_record(i) for i in (v or [])]
+                          for k, v in (trump_tracking or {}).items()}
+        commodity_news = {k: [_as_record(i) for i in (v or [])]
+                          for k, v in (commodity_news or {}).items()}
+        analyst_news = {k: [_as_record(i) for i in (v or [])]
+                        for k, v in (analyst_news or {}).items()}
+        slovak_news = [_as_record(i) for i in (slovak_news or [])]
+        reddit_news = [_as_record(i) for i in (reddit_news or [])]
+
         lines: list[str] = []
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -508,7 +822,7 @@ class NewsContextBuilder:
         # 2. Slovak news
         if slovak_news:
             lines.append("---")
-            lines.append("## Slovak News (sme.sk, pravda.sk, aktuality.sk)")
+            lines.append("## Slovak News (Aktuality, Pravda, TERAZ, Google News SK)")
             lines.append("")
             for item in slovak_news[:10]:
                 title = item.get("title", "")

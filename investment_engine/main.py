@@ -36,6 +36,10 @@ from investment_engine.schemas.ai_recommendations import parse_ai_recommendation
 # one-line provider note in the report (no stack traces, no secrets).
 _FALLBACK_EVENTS: list[str] = []
 
+# Phase 4 attribution: actual winner per LLM stage for the current run.
+# Keys: stage -> {provider, model_requested, model_served, fallback_depth, error_class}.
+_STAGE_ATTRIBUTION: dict[str, dict] = {}
+
 
 def _record_fallback(stage: str, detail: str) -> None:
     label = f"{stage}: {detail}".strip()
@@ -53,10 +57,24 @@ def _note_unreachable_local_providers(settings) -> None:
         import requests as _rq
     except ImportError:
         return
+    # Public/API-only mode: disabled local providers are never probed (no HTTP
+    # calls, no timeout waits); the exclusion itself is recorded once.
+    try:
+        from investment_engine.config.settings import resolve_execution_mode as _em0
+        _public = _em0(settings) == "public"
+    except Exception:
+        _public = bool(getattr(settings, "api_only", False))
+    if _public:
+        _record_fallback("provider-chain", "API-only mode: LM Studio, llama.cpp, Ollama disabled, never probed")
+        return
+    lm_enabled = bool(getattr(settings, "lmstudio_enabled", True))
     for label, url in (
         ("LM Studio", f"{str(getattr(settings, 'lm_studio_base_url', '')).rstrip('/')}/models"),
         ("Ollama", f"{str(getattr(settings, 'ollama_base_url', '')).rstrip('/')}/api/tags"),
     ):
+        if label == "LM Studio" and not lm_enabled:
+            _record_fallback("provider-chain", "LM Studio disabled by policy")
+            continue
         if not url or "://" not in url:
             continue
         try:
@@ -77,6 +95,26 @@ def _provider_fallback_note() -> str:
     )
 
 
+def _execution_mode_lines(settings) -> list[str]:
+    """Execution-mode report lines. Rendered in the decision brief when active."""
+    try:
+        from investment_engine.config.settings import resolve_execution_mode as _mode
+        mode = _mode(settings)
+    except Exception:
+        mode = "auto"
+    if mode == "public":
+        return [
+            "AI execution mode: API_ONLY",
+            "Disabled providers: LM Studio, llama.cpp, Ollama",
+        ]
+    if mode == "locals":
+        return [
+            "AI execution mode: LOCALS_ONLY",
+            "Cloud providers disabled: Gemini, Mistral, OpenRouter, OpenCode Zen",
+        ]
+    return []
+
+
 def _symbol(asset: dict[str, Any]) -> str:
     return str(asset.get("broker_symbol") or asset.get("yahoo_symbol") or asset.get("name") or "UNKNOWN")
 
@@ -93,7 +131,7 @@ def _fetch_t212_data(settings_dict: dict) -> dict[str, Any] | None:
     if not settings_dict.get("use_trading212_api", True):
         return None
     try:
-        from trading212_integration import create_integration
+        from trading212.integration import create_integration
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
         
         logger.info("Fetching T212 account summary...")
@@ -104,13 +142,32 @@ def _fetch_t212_data(settings_dict: dict) -> dict[str, Any] | None:
         
         logger.debug("T212 integration created, calling get_account_summary...")
         # Single call to get_account_summary gets everything (cash + positions)
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(t212.get_account_summary)
+        # Increased timeout to 120s + retry for transient network issues
+        max_attempts = 3
+        base_delay = 5.0
+        summary = None
+        for attempt in range(1, max_attempts + 1):
             try:
-                summary = future.result(timeout=20)
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(t212.get_account_summary)
+                    summary = future.result(timeout=120)
+                break
             except FuturesTimeoutError:
-                logger.error("T212 summary timeout after 20s")
-                return {"status": "failed", "error": "T212 summary timeout"}
+                if attempt < max_attempts:
+                    logger.warning("T212 summary timeout (attempt %d/%d), retrying in %.0fs...",
+                                   attempt, max_attempts, 5.0)
+                    time.sleep(5.0)
+                else:
+                    logger.error("T212 summary timeout after %d attempts", max_attempts)
+                    return {"status": "failed", "error": "T212 summary timeout"}
+            except Exception as exc:
+                if attempt < max_attempts:
+                    logger.warning("T212 summary error (attempt %d/%d): %s. Retrying in %.0fs...",
+                                   attempt, max_attempts, exc, 5.0)
+                    time.sleep(5.0)
+                else:
+                    logger.error("T212 summary failed after %d attempts: %s", max_attempts, exc)
+                    return {"status": "failed", "error": f"T212 summary failed: {exc}"}
         
         logger.info(f"T212 summary received: status={summary.get('status')}, keys={list(summary.keys()) if isinstance(summary, dict) else 'N/A'}")
         
@@ -140,7 +197,7 @@ def _fetch_t212_data(settings_dict: dict) -> dict[str, Any] | None:
         return {"status": "failed", "error": str(e)}
 
 
-def _fetch_all_news_parallel(settings_dict: dict, assets: List[Dict[str, Any]], max_workers: int = 8) -> tuple[dict, list[NewsItem], dict, dict, dict, dict, dict, str | None]:
+def _fetch_all_news_parallel(settings_dict: dict, assets: List[Dict[str, Any]], max_workers: int = 8, run_id: str = "") -> tuple[dict, list[NewsItem], dict, dict, dict, dict, dict, str | None]:
     """Fetch news for assets in parallel - all enabled assets, not just top 10.
 
     Returns (news_by_symbol, all_news_items, trump_tracking, commodity_news,
@@ -184,7 +241,8 @@ def _fetch_all_news_parallel(settings_dict: dict, assets: List[Dict[str, Any]], 
                     all_news_items.extend(items_obj)
             except Exception as e:
                 asset = futures[future]
-                print(f"News fetch failed for {asset.get('name', 'unknown')}: {e}")
+                logger.warning("News fetch failed for %s: %s",
+                               asset.get('name', 'unknown'), e)
 
     # Fetch macro news (SPY, BTC) + Trump policy watch in parallel
     macro_queries = {
@@ -226,16 +284,31 @@ def _fetch_all_news_parallel(settings_dict: dict, assets: List[Dict[str, Any]], 
     # Fetch analyst recommendations
     analyst_news = enhanced_fetcher.fetch_analyst_recommendations(fetcher, priority_assets)
 
-    # Generate news context .md file for AI
+    # Verified RSS fallbacks (Yahoo/CNBC/MarketWatch): additive market bucket so
+    # a thin Google-RSS day still leaves a usable corpus. Keyword-filtered,
+    # capped, tier-labelled; failures degrade silently per adapter contract.
+    try:
+        _fallback_terms = [str(a.get("name") or a.get("symbol") or "").split()[0]
+                           for a in priority_assets[:15]]
+        _fallback_terms += ["stock market", "earnings", "S&P 500"]
+        _rss_items = enhanced_fetcher.fetch_rss_fallbacks(_fallback_terms, limit_total=12)
+        if _rss_items:
+            news_by_symbol.setdefault("RSS_FALLBACK", []).extend(_rss_items)
+    except Exception as exc:
+        logger.debug("RSS fallback fetch skipped: %s", type(exc).__name__)
+
+    # Generate news context .md file for AI (ai_context layer, single home).
+    # run_id comes from the caller (wrapper run_id via portfolio_context) —
+    # settings_dict never carries it, which used to leave "Run ID:" blank.
     news_context_path = None
     try:
-        output_dir = settings_dict.get("output_folder", "reports")
-        run_id = settings_dict.get("run_id", "")
+        output_dir = str(Path(settings_dict.get("output_folder", "reports")) / "ai_context")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
         ctx_builder = NewsContextBuilder()
         news_context_path = ctx_builder.build_news_context_file(
             news_by_symbol=news_by_symbol,
             output_dir=output_dir,
-            run_id=run_id,
+            run_id=run_id or settings_dict.get("run_id", ""),
             trump_tracking=trump_tracking,
             commodity_news=commodity_news,
             analyst_news=analyst_news,
@@ -272,6 +345,14 @@ def _fetch_earnings_fast(assets: List[Dict[str, Any]], timeout_per_symbol: float
         is_earnings_supported = lambda y: bool(y)
 
     def fetch_one(asset):
+        # ETFs/ETCs publish no earnings: skip before any network call so the
+        # run never spams "No earnings dates found" for 20+ fund tickers.
+        try:
+            from investment_engine.research.market_data import is_etf_like as _is_etf
+            if _is_etf(asset):
+                return _disp_of(asset), "no_data"
+        except Exception:
+            pass
         explicit_yahoo = (asset or {}).get("yahoo_symbol")
         ref = explicit_yahoo or (asset or {}).get("ticker") or _symbol(asset)
         try:
@@ -312,6 +393,79 @@ def _fetch_earnings_fast(assets: List[Dict[str, Any]], timeout_per_symbol: float
                 earnings[_disp_of(asset)] = f"error: {str(e)[:50]}"
 
     return earnings
+
+
+def _merge_calendar_earnings(earnings: dict, events, need: list,
+                             to_display) -> int:
+    """Merge Playwright calendar events into failed Yahoo earnings slots.
+
+    Pure helper (testable): only fills displays in `need` with a dated event.
+    Returns the number of filled slots.
+    """
+    filled = 0
+    try:
+        need_set = set(need or [])
+        for _ev in (events or [])[:80]:
+            try:
+                _d = to_display(str(getattr(_ev, "symbol", "")))
+            except Exception:
+                continue
+            if _d in need_set and getattr(_ev, "date", ""):
+                earnings[_d] = str(_ev.date)[:10]
+                filled += 1
+    except Exception:
+        pass
+    return filled
+
+
+def _fill_earnings_layer2(earnings: dict, need: list, *, fetch_calendar,
+                          fetch_yahoo_date, to_display, to_yahoo,
+                          sleep=None) -> int:
+    """Layer-2 earnings fill: Playwright calendar with retry, yfinance fallback.
+
+    Tries the calendar up to 3x (2s/4s backoff), merges dated events into
+    `need` slots; on total failure falls back to per-symbol Yahoo earnings
+    dates. Returns filled slots. Never raises.
+    """
+    from types import SimpleNamespace as _NS
+    _sleep = sleep if callable(sleep) else (lambda s: __import__("time").sleep(s))
+    try:
+        _events = None
+        for _attempt in range(3):
+            try:
+                _events = fetch_calendar()
+                break
+            except Exception as exc:
+                if _attempt < 2:
+                    logger.warning("Earnings layer 2 attempt %d/3 failed: %s. Retrying...",
+                                   _attempt + 1, exc)
+                    try:
+                        _sleep(2.0 * (2 ** _attempt))
+                    except Exception:
+                        pass
+                else:
+                    logger.warning("Earnings layer 2 calendar failed after 3 attempts: %s", exc)
+        if _events:
+            return _merge_calendar_earnings(earnings, _events, need, to_display)
+    except Exception as exc:
+        logger.debug("Earnings layer 2 calendar skipped: %s", exc)
+    try:
+        _fb = []
+        for _disp in need or []:
+            try:
+                _y = to_yahoo(_disp) if callable(to_yahoo) else None
+                if not _y:
+                    continue
+                _d = fetch_yahoo_date(_y)
+                if _d:
+                    _fb.append(_NS(symbol=_disp, date=str(_d)[:10]))
+            except Exception:
+                continue
+        if _fb:
+            return _merge_calendar_earnings(earnings, _fb, need, to_display)
+    except Exception as exc:
+        logger.debug("Earnings layer 2 yfinance fallback skipped: %s", exc)
+    return 0
 
 
 def _build_regime_context(regime_result) -> str:
@@ -358,19 +512,18 @@ def _fetch_finviz_safe(symbol: str) -> dict:
     breadth = {}
     try:
         from finvizfinance.group.overview import Overview as FinvizGroupOverview
+        try:
+            from investment_engine.research.technical_analysis import (
+                group_sector_breadth_from_table as _parse_group_table,
+            )
+        except Exception:
+            _parse_group_table = None
         go = FinvizGroupOverview()
-        sectors = ["Technology", "Healthcare", "Financial", "Consumer Cyclical",
-                   "Industrial", "Energy", "Utilities", "Real Estate",
-                   "Basic Materials", "Consumer Defensive", "Communication Services"]
-        for sector in sectors:
-            try:
-                go.set_filter(filters_dict={"Sector": sector})
-                df = go.screener_view()
-                if df is not None and not df.empty and "Change" in df.columns:
-                    changes = df["Change"].astype(str).str.rstrip("%").astype(float)
-                    breadth[sector] = {"count": len(df), "avg_change": float(changes.mean())}
-            except Exception as exc:
-                logger.debug("FinViz sector %s unavailable: %s", sector, exc)
+        # Group endpoint has no set_filter (AttributeError in run 524fffa0):
+        # one call returns the whole sector-aggregate table.
+        df = go.screener_view(group="Sector", order="Name")
+        if _parse_group_table is not None:
+            breadth = _parse_group_table(df) or {}
     except Exception as exc:
         logger.debug("FinViz group overview unavailable: %s", exc)
 
@@ -401,6 +554,7 @@ def run_engine(assets: List[Dict[str, Any]], portfolio_context: Dict[str, Any] |
         except Exception:
             pass
     _FALLBACK_EVENTS.clear()
+    _STAGE_ATTRIBUTION.clear()
     try:
         from investment_engine.providers.fallback import reset_circuit_breaker
         reset_circuit_breaker()
@@ -458,8 +612,8 @@ def run_engine(assets: List[Dict[str, Any]], portfolio_context: Dict[str, Any] |
     # Diagnostic raw endpoint dump (no state change, no trading)
     if t212_data and t212_data.get("status") == "ok":
         try:
-            from trading212_integration import create_integration
-            from trading212_auth import dump_raw_t212_diagnostics
+            from trading212.integration import create_integration
+            from trading212.auth import dump_raw_t212_diagnostics
             # Use the run_id from the portfolio_ai_assistant.py to ensure consistency
             _run_id = portfolio_context.get("run_id") if isinstance(portfolio_context, dict) else str(uuid.uuid4())[:8]
             _diag_client = create_integration(config_file="api.env")
@@ -488,19 +642,48 @@ def run_engine(assets: List[Dict[str, Any]], portfolio_context: Dict[str, Any] |
                 all_active_assets.append(entry)
         active_positions = all_active_assets  # Update active_positions
 
-    # Reconciliation guard: validate T212 data before proceeding
+    # Canonical broker-first snapshot FIRST (A3 sanitation): every
+    # reconciliation consumer uses this single result. Legacy R1 summary
+    # fields are never read here and never gate decisions.
+    _snap = None
+    _recon_result = None
+    _recon = {"total_equity": 0, "positions_value": 0, "implied_cash": 0,
+              "reported_cash": 0, "cash_delta": 0, "threshold": 0, "status": "UNKNOWN"}
+    try:
+        from investment_engine.portfolio.broker_first import (
+            build_account_snapshot as _build_snap,
+            get_cached_catalog as _get_cat,
+            reconcile_snapshot as _reconcile_snap,
+        )
+        from trading212.portfolio import get_live_fx_rates as _live_fx
+        _dsum = (t212_data.get("account_summary", {}) or {}) if isinstance(t212_data, dict) else {}
+        _dpos = _dsum.get("raw_positions") or _dsum.get("all_positions") or (t212_data.get("all_positions", []) if isinstance(t212_data, dict) else [])
+        _snap = _build_snap(
+            {"free": _dsum.get("cash_free", 0), "pieCash": _dsum.get("cash_pie", 0),
+             "blocked": _dsum.get("cash_blocked", 0), "invested": _dsum.get("invested", 0),
+             "total": _dsum.get("total_equity", 0), "ppl": _dsum.get("unrealized_pnl_eur", 0)},
+            _dpos, None, known_clean=known_clean, live_rates=(_live_fx().get("rates") or {}),
+            catalog=_get_cat() or None,
+        )
+        _recon_result = _reconcile_snap(_snap)
+        _recon = _recon_result.to_reconciliation_dict()
+    except Exception as exc:
+        logger.debug("Snapshot build skipped: %s", exc)
+
+    # Reconciliation guard on the canonical result only.
     reconciliation_ok = True
     if t212_data and t212_data.get("status") == "ok":
-        summary = t212_data.get("account_summary", {})
-        recon_status = summary.get("reconciliation_status", "UNKNOWN")
-        recon_diff = summary.get("reconciliation_difference", 0)
-        recon_threshold = summary.get("reconciliation_threshold", 0)
-        total_equity = summary.get("total_equity", 0)
-        derived_holdings = summary.get("derived_holdings_plus_available_cash", 0)
-        
-        logger.info(f"T212 Reconciliation: {recon_status} | Equity: €{total_equity:,.2f} | Derived: €{derived_holdings:,.2f} | Diff: €{recon_diff:,.2f} (threshold: €{recon_threshold:,.2f})")
-        
-        if recon_status == "FAIL":
+        _r = _recon_result
+        logger.info(
+            "T212 canonical: equity=EUR %.2f | reported_cash=EUR %.2f | expected=EUR %.2f | "
+            "dedup=EUR %.2f | excluded=EUR %.2f | delta=EUR %+.2f (threshold EUR %.2f) -> %s",
+            _recon.get("total_equity", 0), _recon.get("reported_cash", 0),
+            getattr(_r, "expected_open_positions_value_eur", 0) or 0,
+            getattr(_r, "sum_deduplicated_broker_position_values_eur", 0) or 0,
+            getattr(_r, "sum_excluded_values_eur", 0) or 0,
+            _recon.get("cash_delta", 0), _recon.get("threshold", 0),
+            _recon.get("status", "UNKNOWN"))
+        if _recon.get("status") == "FAIL":
             reconciliation_ok = False
             logger.warning("T212 reconciliation FAILED - suppressing account-level P&L and derived return from report and LLM")
             # Mark t212_data as reconciled=false so downstream code knows
@@ -511,7 +694,9 @@ def run_engine(assets: List[Dict[str, Any]], portfolio_context: Dict[str, Any] |
         t212_data = t212_data or {"status": "failed", "reconciliation_ok": False}
 
     # 2. News (parallel, top 10 holdings)
-    news_by_symbol, all_news_items, trump_tracking, commodity_news, analyst_news, slovak_news, reddit_news, news_context_path = _fetch_all_news_parallel(settings_dict, all_active_assets)
+    news_by_symbol, all_news_items, trump_tracking, commodity_news, analyst_news, slovak_news, reddit_news, news_context_path = _fetch_all_news_parallel(
+        settings_dict, all_active_assets,
+        run_id=str((portfolio_context or {}).get("run_id", "") or ""))
 
     # Add Slovak and Reddit news to news_by_symbol so they appear in reports
     for item in slovak_news:
@@ -535,6 +720,65 @@ def run_engine(assets: List[Dict[str, Any]], portfolio_context: Dict[str, Any] |
 
     # 3. Earnings (parallel, fast)
     earnings = _fetch_earnings_fast(all_active_assets)
+
+    # 3b. Earnings layer 2 (Playwright calendar): fills displays the Yahoo
+    # fast path could not resolve. ETFs (intentionally skipped) and NO_EARNINGS
+    # instruments are never re-fetched. Capped, failure-isolated, serial.
+    playwright_earnings = 0
+    try:
+        from investment_engine.portfolio.symbols import NO_EARNINGS_YAHOO as _NOE
+        from investment_engine.portfolio.symbols import to_display_symbol as _td_earn
+        from investment_engine.portfolio.symbols import to_yahoo_symbol as _ty_earn
+        from investment_engine.research import web_researcher as _webr_earn
+        from investment_engine.research.market_data import is_etf_like as _is_etf_earn
+        if getattr(settings, "use_playwright_fallback", True):
+            _etf_displays: set[str] = set()
+            for _a in assets or []:
+                if isinstance(_a, dict) and _is_etf_earn(_a):
+                    for _ref in (_a.get("broker_symbol"), _a.get("yahoo_symbol")):
+                        try:
+                            if _ref:
+                                _etf_displays.add(_td_earn(str(_ref)))
+                        except Exception:
+                            continue
+            _earn_need = [d for d, v in (earnings or {}).items()
+                          if d not in _etf_displays and (
+                              str(v).startswith(("timeout", "error")) or v in ("no_data", "unavailable"))]
+            _earn_need = _earn_need[:15]
+            if _earn_need:
+                import time as _time_earn
+                _yahoo_by_disp: dict[str, str] = {}
+                for _a in assets or []:
+                    if not isinstance(_a, dict):
+                        continue
+                    try:
+                        _ref = str((_a or {}).get("broker_symbol") or (_a or {}).get("yahoo_symbol") or "")
+                        if not _ref:
+                            continue
+                        _dd = _td_earn(_ref)
+                        _yy = str((_a or {}).get("yahoo_symbol") or "")
+                        if not _yy:
+                            try:
+                                _yy = str(_ty_earn(_ref, _dd, None) or "")
+                            except Exception:
+                                _yy = ""
+                        if _dd and _yy:
+                            _yahoo_by_disp.setdefault(_dd, _yy)
+                    except Exception:
+                        continue
+                playwright_earnings += _fill_earnings_layer2(
+                    earnings, _earn_need,
+                    fetch_calendar=lambda: (_webr_earn.fetch_all_earnings_sync(7) or []),
+                    fetch_yahoo_date=recent_earnings_date,
+                    to_display=_td_earn,
+                    to_yahoo=_yahoo_by_disp.get,
+                    sleep=_time_earn.sleep)
+    except Exception as exc:
+        logger.debug("Earnings layer 2 skipped: %s: %s", type(exc).__name__, exc)
+
+    # NOTE: dividends block lives after the mapping layer is populated
+    # (yahoo_by_display/standalone); an earlier placement raised
+    # UnboundLocalError (run 066ac8be) and skipped silently.
 
     # 4. Market Regime
     regime_result = None
@@ -676,6 +920,15 @@ RECENT HEADLINES: {[f"{sym}: {e.get('title','')[:120]} ({e.get('source','')}, {e
     extra_tech: dict[str, dict] = {}
     extra_news: dict[str, list[dict]] = {}
     extra_earn: dict[str, str] = {}
+    playwright_stats: dict = {"technicals": 0, "facts": 0, "attempted": 0, "earnings": 0}
+    tvnews_stats: dict = {"items": 0, "symbols": 0, "attempted": 0}
+    corpus_info: dict = {"counts": {"total": 0, "decision": 0, "background": 0,
+                                    "undated": 0, "rejected": 0, "failed_buckets": 0,
+                                    "schema_invalid": 0},
+                         "path_md": None, "path_json": None, "path_rejected": None,
+                         "items": [], "decision_items": [], "rejected_items": []}
+    _corpus_run_id: str = ""
+    universe_info: dict = {"resolved": 0, "skipped_working": 0, "missed": 0}
     # display -> yahoo for every enrichment symbol (single mapping layer).
     yahoo_by_display: dict[str, str | None] = {}
     # Known clean tickers + names from pie CSVs and config assets.
@@ -789,6 +1042,27 @@ RECENT HEADLINES: {[f"{sym}: {e.get('title','')[:120]} ({e.get('source','')}, {e
                 s["display"] = disp
                 if disp not in yahoo_by_display:
                     yahoo_by_display[disp] = _to_yahoo(s["slice"], disp, aliases)
+        # Universe enrichment (default on): ISIN-keyed cross-listing discovery
+        # fills ONLY missing/unresolvable entries; working mappings (tables,
+        # config aliases) are never overridden. Degrades to a no-op on any
+        # failure (UNIVERSE_ENABLED=0 disables entirely).
+        try:
+            from investment_engine.research import universe as _uni
+            from investment_engine.portfolio.symbols import support_state as _ss
+            if _uni.enabled() and _snap is not None:
+                _snap_rows = [{
+                    "display_symbol": str(getattr(getattr(p, "instrument", None), "display_symbol", "") or ""),
+                    "isin": str(getattr(getattr(p, "instrument", None), "isin", "") or ""),
+                    "currency": str(getattr(getattr(p, "instrument", None), "currency", "") or ""),
+                } for p in (_snap.positions or [])]
+                universe_info = _uni.enrich_yahoo_map(
+                    yahoo_by_display, _snap_rows,
+                    is_working=lambda y: bool(y) and _ss(str(y), "market_data") == "SUPPORTED")
+                logger.info("Universe enrichment: %(resolved)d resolved, "
+                            "%(skipped_working)d kept, %(missed)d still missing",
+                            {k: universe_info.get(k, 0) for k in ("resolved", "skipped_working", "missed")})
+        except Exception as exc:
+            logger.debug("Universe enrichment skipped: %s", type(exc).__name__)
         # Yahoo lookup pairs, skipping unsupported instruments cleanly.
         yahoo_pairs = [(disp, y) for disp, y in yahoo_by_display.items() if y]
         extra_tech = _fetch_technicals_parallel(yahoo_pairs)
@@ -800,6 +1074,201 @@ RECENT HEADLINES: {[f"{sym}: {e.get('title','')[:120]} ({e.get('source','')}, {e
         extra_earn = _fetch_earnings_for_symbols(yahoo_by_display)
         # Technicals keyed by display symbol for row enrichment.
         unified_technicals_seed = dict(extra_tech or {})
+
+        # Playwright sweep (automatic): every display with a Yahoo mapping but
+        # no technicals gets one TradingView page (gauge technicals + key facts
+        # + analyst rating). Caps, serial loads, kill-switch; crypto and
+        # underivable venues are skipped, never guessed. Results merge into
+        # technicals (distinct TV_ keys) and news buckets (corpus built below).
+        playwright_stats: dict = {"technicals": 0, "facts": 0, "attempted": 0,
+                                  "earnings": playwright_earnings}
+        try:
+            from investment_engine.research.corpus import adapters_tradingview as _tv
+            _tv.reset()
+            if getattr(settings, "use_playwright_fallback", True):
+                _t212_by_display: dict[str, str] = {}
+                for _sp in standalone or []:
+                    if isinstance(_sp, dict) and _sp.get("display") and _sp.get("t212"):
+                        _t212_by_display[str(_sp["display"]).strip().upper()] = str(_sp["t212"])
+                _sweep_cands: list[tuple] = []
+                for _disp, _yh in (yahoo_by_display or {}).items():
+                    if not _yh or str(_yh).upper().endswith("-USD"):
+                        continue
+                    if _disp in (unified_technicals_seed or {}):
+                        continue
+                    _sweep_cands.append((_disp, _yh, _t212_by_display.get(_disp)))
+                    if len(_sweep_cands) >= 8:
+                        break
+                if _sweep_cands:
+                    _sweep = _tv.run_sweep(_sweep_cands, assets, max_symbols=8, timeout_ms=30000)
+                    for _d, _t in (_sweep.get("technicals") or {}).items():
+                        unified_technicals_seed.setdefault(_d, _t)
+                        extra_tech.setdefault(_d, _t)
+                    for _item in (_sweep.get("items") or []):
+                        _tags = _item.get("ticker_tags") or []
+                        if _tags:
+                            news_by_symbol.setdefault(_tags[0], []).append(_item)
+                    playwright_stats = {"technicals": len(_sweep.get("technicals", {}) or {}),
+                                        "facts": len(_sweep.get("items", []) or []),
+                                        "attempted": (_sweep.get("stats", {}) or {}).get("attempted", 0),
+                                        "earnings": playwright_earnings}
+                    logger.info("Playwright sweep: %(attempted)d pages, %(technicals)d technicals, "
+                                "%(facts)d facts", playwright_stats)
+        except Exception as exc:
+            logger.debug("Playwright sweep skipped: %s", type(exc).__name__)
+
+        # TradingView per-symbol news (plain HTTPS JSON, no browser): top-8
+        # resolvable displays BY BROKER VALUE get dated per-symbol headlines
+        # merged into news_by_symbol, so they enter the corpus (and decision
+        # sets) below with real timestamps. Caps, serial 1 req/s, kill-switch;
+        # crypto and underivable venues are skipped, never guessed.
+        try:
+            from investment_engine.research.corpus import adapters_tvnews as _tvn
+            _tvn.reset()
+            _t212_map = _t212_by_display if "_t212_by_display" in dir() else {}
+            _val_by_display: dict[str, float] = {}
+            try:
+                for _sp in (standalone if "standalone" in dir() else []) or []:
+                    if isinstance(_sp, dict) and _sp.get("display"):
+                        _val_by_display[str(_sp["display"]).strip().upper()] = float(
+                            _sp.get("value_eur", 0) or 0)
+                for _rp in (t212_positions_all if "t212_positions_all" in dir() else []) or []:
+                    if not isinstance(_rp, dict) or not _rp.get("symbol"):
+                        continue
+                    try:
+                        from investment_engine.portfolio.symbols import to_display_symbol as _td_tv
+                        _dd = str(_td_tv(str(_rp["symbol"]), known_clean
+                                         if "known_clean" in dir() else set())).strip().upper()
+                        _val_by_display.setdefault(_dd, float(_rp.get("value_eur", 0) or 0))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            _news_pool: list[tuple] = []
+            for _disp, _yh in (yahoo_by_display or {}).items():
+                if not _yh or str(_yh).upper().endswith("-USD"):
+                    continue
+                _news_pool.append((_val_by_display.get(str(_disp).strip().upper(), 0.0),
+                                   _disp, _yh, _t212_map.get(_disp)))
+            _news_pool.sort(key=lambda t: t[0], reverse=True)
+            _news_cands = [(_d, _y, _t) for _, _d, _y, _t in _news_pool[:8]]
+            if _news_cands:
+                _tvn_res = _tvn.fetch_symbol_news(_news_cands, assets, limit_per_symbol=10)
+                for _item in (_tvn_res.get("items") or []):
+                    _tags = _item.get("ticker_tags") or []
+                    if _tags:
+                        news_by_symbol.setdefault(_tags[0], []).append(_item)
+                _tvn_stats = _tvn_res.get("stats", {}) or {}
+                tvnews_stats = {"items": int(_tvn_stats.get("items", 0)),
+                                "symbols": int(_tvn_stats.get("symbols", 0)),
+                                "attempted": int(_tvn_stats.get("attempted", 0))}
+                logger.info("TV symbol news: %(attempted)d symbols attempted, "
+                            "%(symbols)d with news, %(items)d items", tvnews_stats)
+        except Exception as exc:
+            logger.debug("TV symbol news skipped: %s", type(exc).__name__)
+
+        # 3c. Dividends (trailing-12M, yfinance): top SUPPORTED non-crypto
+        # holdings by broker value, capped, failure-isolated, parallel.
+        # Broker truth untouched — informational yield/ex-date layer.
+        dividends_12m: dict[str, dict] = {}
+        try:
+            from investment_engine.portfolio.symbols import support_state as _ss_div
+            from investment_engine.research.market_data import fetch_dividend_summary as _div_one
+            from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+            _div_cands: list[tuple] = []
+            _div_seen: set[str] = set()
+            for _sp in (standalone if "standalone" in dir() else []) or []:
+                if not isinstance(_sp, dict):
+                    continue
+                _dd, _yy = _sp.get("display"), _sp.get("yahoo")
+                if _dd and _yy and not str(_yy).upper().endswith("-USD") \
+                        and _ss_div(_yy, "market_data") == "SUPPORTED":
+                    _div_cands.append((_dd, _yy))
+                    _div_seen.add(str(_dd).strip().upper())
+                    if len(_div_cands) >= 15:
+                        break
+            # Standalone covers only non-pie positions (3 of 96) — top up with
+            # pie members by broker value so the biggest payers are covered.
+            if len(_div_cands) < 15:
+                try:
+                    _pie_pool: list[tuple] = []
+                    for _rp in (t212_positions_all if "t212_positions_all" in dir() else []) or []:
+                        if not isinstance(_rp, dict) or not _rp.get("symbol"):
+                            continue
+                        try:
+                            from investment_engine.portfolio.symbols import to_display_symbol as _td_div
+                            from investment_engine.portfolio.symbols import to_yahoo_symbol as _ty_div
+                            _dd = str(_td_div(str(_rp["symbol"]), known_clean
+                                              if "known_clean" in dir() else set())).strip().upper()
+                            if not _dd or _dd in _div_seen:
+                                continue
+                            _yy = _ty_div(str(_rp["symbol"]), _dd, aliases
+                                          if "aliases" in dir() else {})
+                            if _yy and not str(_yy).upper().endswith("-USD") \
+                                    and _ss_div(_yy, "market_data") == "SUPPORTED":
+                                _pie_pool.append((float(_rp.get("value_eur", 0) or 0), _dd, _yy))
+                        except Exception:
+                            continue
+                    _pie_pool.sort(key=lambda t: t[0], reverse=True)
+                    for _, _dd, _yy in _pie_pool:
+                        _div_cands.append((_dd, _yy))
+                        _div_seen.add(_dd)
+                        if len(_div_cands) >= 15:
+                            break
+                except Exception:
+                    pass
+
+            def _div_fetch(pair):
+                _d, _y = pair
+                try:
+                    return _d, _div_one(_y)
+                except Exception:
+                    return _d, None
+
+            with _TPE(max_workers=5) as _ex:
+                _futs = {_ex.submit(_div_fetch, p): p[0] for p in _div_cands}
+                for _f in _ac(_futs):
+                    try:
+                        _d, _rec = _f.result(timeout=45)
+                        if _rec:
+                            dividends_12m[_d] = _rec
+                    except Exception:
+                        pass
+            logger.info("Dividends: %d holdings with TTM payouts (of %d checked)",
+                        len(dividends_12m), len(_div_cands))
+        except Exception as exc:
+            logger.debug("Dividends skipped: %s", type(exc).__name__)
+
+        # 2b. Research corpus (moved after the sweep so sweep items are included).
+        # Normalize + dedupe + classify everything fetched above into ResearchItems;
+        # persist full corpus + decision subset to ai_context/. Additive only.
+        # (corpus_info/_corpus_run_id pre-initialized at function level.)
+        _corpus_run_id = str((portfolio_context or {}).get("run_id", "") or "")
+        try:
+            from investment_engine.research.corpus.builder import build_corpus_files as _build_corpus
+            from investment_engine.research.corpus.builder import render_rejected_markdown as _render_rej
+            corpus_info = _build_corpus(
+                news_by_symbol,
+                run_id=_corpus_run_id,
+                output_dir=settings_dict.get("output_folder", "reports"),
+            )
+            logger.info("Research corpus: %(total)d items (%(decision)d decision, "
+                        "%(background)d background, %(undated)d undated, %(rejected)d rejected)",
+                        {k: corpus_info.get("counts", {}).get(k, 0)
+                         for k in ("total", "decision", "background", "undated", "rejected")})
+            try:
+                from pathlib import Path as _Path
+                _debug_dir = _Path("reports") / "debug" / _corpus_run_id
+                _debug_dir.mkdir(parents=True, exist_ok=True)
+                _rej_path = _debug_dir / "undated_or_rejected_research.md"
+                _rej_path.write_text(
+                    _render_rej(corpus_info.get("rejected_items", []) or [], _corpus_run_id),
+                    encoding="utf-8")
+                corpus_info["path_rejected"] = str(_rej_path)
+            except Exception as exc2:
+                logger.debug("Rejected-research ledger skipped: %s", type(exc2).__name__)
+        except Exception as exc:
+            logger.debug("Research corpus skipped: %s", type(exc).__name__)
 
         # NOTE (refactor): the per-position holdings live ONLY in the unified
         # "T212 Portfolio" table (regime_report._t212_portfolio). The legacy
@@ -836,16 +1305,25 @@ PIES:
 
 RECENT HEADLINES (48h, sampled constituents):
 {_headlines_block({k: v for k, v in extra_news.items() if any(k == (s.get('display') or s['slice']) for b in pie_blocks for s in b['sample'])})}"""
-            pie_section = _generate_with_fallback(provider, pie_prompt, settings, tokens=1200, stage="decision")
+            pie_section = _generate_with_fallback(provider, pie_prompt, settings, tokens=3072, stage="decision")
             pie_section = _enforce_canonical_in_pie_section(pie_section, canonical_map, known_clean)
             decision_sections.append(f"## PIEs — evaluation\n{pie_section}")
     except Exception as exc:
         logger.warning("T212/PIE deep-dive sections failed: %s", exc)
 
-    # Candidate section
+    # Candidate section. The discovery prompt MUST carry headlines: without
+    # them the model can only return the "None supported" fallback (seen live
+    # 2026-09-28: 86 prompt tokens, content_len=59). extra_news is keyed by
+    # display symbol; cap the block so the prompt stays bounded.
+    try:
+        _disco_block = _headlines_block(dict(list((extra_news or {}).items())[:40]))
+    except Exception:
+        _disco_block = "None"
     discovery_prompt = f"""Write a Markdown section called '## Potential New Ideas' in {language}.
-Using only these recent headlines, name at most three ticker candidates as WATCH, never BUY. Explain in one short line why each needs further verification. If no ticker is clearly identifiable and supported, write 'None supported by current evidence.'"""
-    candidate_section = _generate_with_fallback(provider, discovery_prompt, settings, tokens=400, stage="discovery")
+Using only these recent headlines, name at most three ticker candidates as WATCH, never BUY. Explain in one short line why each needs further verification. If no ticker is clearly identifiable and supported, write 'None supported by current evidence.'
+RECENT HEADLINES:
+{_disco_block}"""
+    candidate_section = _generate_with_fallback(provider, discovery_prompt, settings, tokens=1024, stage="discovery")
 
     # Summary (LLM) + Priority Actions (deterministic, unified).
     # Priority Actions are NEVER taken verbatim from the LLM: they are built
@@ -863,18 +1341,33 @@ CANONICAL: {canonical if canonical else 'none yet'}.
 
 DECISIONS:
 {chr(10).join(decision_sections + verbose_sections + [candidate_section])}"""
-    summary_llm = _generate_with_fallback(provider, summary_prompt, settings, tokens=600, stage="summary")
+    summary_llm = _generate_with_fallback(provider, summary_prompt, settings, tokens=1200, stage="summary")
     summary_section = _strip_priority_actions_from_summary(summary_llm)
 
     # Unified enrichment maps for portfolio table / KPIs / radar.
     # Names: display symbol -> company name (pie slices + config assets +
     # broker names + overrides). known_clean feeds display stripping.
     portfolio_names = _build_portfolio_names(all_active_assets, pie_blocks, t212_data, known_names_base)
+    # ISIN identity map for unified rows (same identity as broker_first):
+    # KNOWN_ISINS first, then per-position ISIN fields when the broker supplies them.
+    try:
+        from investment_engine.portfolio.broker_first import KNOWN_ISINS as _KNOWN_ISINS
+        _isin_map: dict[str, str] = dict(_KNOWN_ISINS)
+    except Exception:
+        _isin_map = {}
+    try:
+        _td_positions = ((t212_data or {}).get("all_positions") or []) + ((t212_data or {}).get("positions") or [])
+        for _p in _td_positions:
+            if isinstance(_p, dict) and _p.get("isin") and _p.get("symbol"):
+                _isin_map.setdefault(str(_p["symbol"]).strip().upper(), str(_p["isin"]).strip().upper())
+    except Exception:
+        pass
     try:
         from investment_engine.reporting.regime_report import build_unified_portfolio_rows as _build_rows
         portfolio_rows = _build_rows(
             t212_data, ai_recs, unified_technicals_seed, portfolio_names,
             known_clean, canonical_map, yahoo_by_display,
+            isin_map=_isin_map,
         )
     except Exception:
         portfolio_rows = []
@@ -920,31 +1413,107 @@ DECISIONS:
     except Exception:
         pass
     earnings_radar = _format_earnings_radar(earnings_status, portfolio_names, unavailable_earnings)
-    # Build canonical snapshot once; all reconciliation consumers use it.
-    _snap = None
-    _recon_result = None
-    _recon = {"total_equity": 0, "positions_value": 0, "implied_cash": 0,
-              "reported_cash": 0, "cash_delta": 0, "threshold": 0, "status": "UNKNOWN"}
+    # Phase 6 skills run after the canonical snapshot (built before news fetch).
+    skill_outputs: dict[str, dict] = {}
+    skill_versions: dict[str, str] = {}
+    # Phase 6 skills (first four): structured, evidence-gated outputs stored in
+    # the result + manifest. Deterministic fallbacks keep offline runs green;
+    # legacy prose sections above are unchanged (prompt cutover is P1).
     try:
-        from investment_engine.portfolio.broker_first import (
-            build_account_snapshot as _build_snap,
-            get_cached_catalog as _get_cat,
-            reconcile_snapshot as _reconcile_snap,
-        )
-        from trading212_portfolio import get_live_fx_rates as _live_fx
-        _dsum = (t212_data.get("account_summary", {}) or {}) if isinstance(t212_data, dict) else {}
-        _dpos = _dsum.get("raw_positions") or _dsum.get("all_positions") or (t212_data.get("all_positions", []) if isinstance(t212_data, dict) else [])
-        _snap = _build_snap(
-            {"free": _dsum.get("cash_free", 0), "pieCash": _dsum.get("cash_pie", 0),
-             "blocked": _dsum.get("cash_blocked", 0), "invested": _dsum.get("invested", 0),
-             "total": _dsum.get("total_equity", 0), "ppl": _dsum.get("unrealized_pnl_eur", 0)},
-            _dpos, None, known_clean=known_clean, live_rates=(_live_fx().get("rates") or {}),
-            catalog=_get_cat() or None,
-        )
-        _recon_result = _reconcile_snap(_snap)
-        _recon = _recon_result.to_reconciliation_dict()
+        from investment_engine.skills import registry as _skills
+        _corpus_items = (corpus_info or {}).get("items", []) or []
+        _corpus_decision = (corpus_info or {}).get("decision_items", []) or []
+        _cash_view = (t212_data.get("cash", {}) if isinstance(t212_data, dict) else {})
+        skill_outputs["risk"] = _skills.run_skill(
+            "portfolio_risk_manager",
+            {"portfolio_rows": portfolio_rows,
+             "reconciliation": _recon if isinstance(_recon, dict) else {"status": "UNKNOWN"},
+             "regime": getattr(regime_result, "regime", "UNKNOWN") if regime_result else "UNKNOWN",
+             "cash": _cash_view},
+            provider, settings, language)
+        skill_outputs["news_events"] = _skills.run_skill(
+            "news_event_analyst",
+            {"decision_items": _corpus_decision, "portfolio_rows": portfolio_rows},
+            provider, settings, language)
+        try:
+            from investment_engine.providers import attribution as _attr_sk
+            _sk_record = _attr_sk.new_stage_record("news_events")
+            # Only the chain hint is fresh when the skill actually called the
+            # LLM (enriched=True); otherwise the hint would be stale output
+            # from an earlier stage — record deterministic instead.
+            if bool((skill_outputs.get("news_events", {}) or {}).get("data", {}).get("enriched")):
+                _STAGE_ATTRIBUTION["news_events"] = _attr_sk.apply_chain_hint(_sk_record, provider)
+            else:
+                _STAGE_ATTRIBUTION["news_events"] = _attr_sk.note_deterministic(_sk_record, "skills")
+        except Exception:
+            pass
+        skill_outputs["equity_notes"] = _skills.run_skill(
+            "equity_research_analyst",
+            {"portfolio_rows": portfolio_rows, "technicals": unified_technicals,
+             "earnings_status": earnings_status, "corpus_items": _corpus_items},
+            provider, settings, language)
+        skill_outputs["committee"] = _skills.run_skill(
+            "investment_committee",
+            {"risk_output": skill_outputs["risk"], "news_output": skill_outputs["news_events"],
+             "equity_output": skill_outputs["equity_notes"], "canonical_map": canonical_map,
+             "portfolio_rows": portfolio_rows,
+             "reconciliation": _recon if isinstance(_recon, dict) else {"status": "UNKNOWN"}},
+            provider, settings, language)
+        skill_versions = dict(_skills.SKILL_VERSIONS)
+        try:
+            from investment_engine.providers import attribution as _attr_sk2
+            for _sk_stage in ("risk", "equity_notes", "committee"):
+                _STAGE_ATTRIBUTION[_sk_stage] = _attr_sk2.note_deterministic(
+                    _attr_sk2.new_stage_record(_sk_stage), "skills")
+        except Exception:
+            pass
+        logger.info("Skills complete: %s",
+                    {k: v.get("status", "?") for k, v in skill_outputs.items()})
     except Exception as exc:
-        logger.debug("Snapshot build skipped: %s", exc)
+        logger.debug("Skills skipped: %s", type(exc).__name__)
+        skill_outputs = {}
+    # Phase 7 advisory order plans (informational only, never executed).
+    order_plans: dict = {"plans": [], "blocked": [], "policy_version": "",
+                         "advisory_guard": "", "generated_at": ""}
+    policy_state: dict = {"status": "NOT SET", "policy": {}, "version": "", "problems": []}
+    try:
+        from investment_engine.risk import order_plan as _op
+        from investment_engine.risk import policy as _pol
+        from investment_engine.risk.order_plan import sleeve_for_group as _sleeve_of
+        from investment_engine.portfolio.symbols import to_display_symbol as _td_sleeve
+        policy_state = _pol.load_policy()
+        if policy_state.get("status") == "OK":
+            _sleeves: dict[str, str] = {}
+            for _a in assets or []:
+                try:
+                    _d = _td_sleeve(str((_a or {}).get("broker_symbol", "")), known_clean)
+                    _sleeves[_d] = _sleeve_of((_a or {}).get("group"))
+                except Exception:
+                    continue
+            _committee = (skill_outputs.get("committee", {}) or {}).get("data", {}) or {}
+            _news_ev = (skill_outputs.get("news_events", {}) or {}).get("data", {}) or {}
+            _cash = (t212_data.get("cash", {}) if isinstance(t212_data, dict) else {}) or {}
+            _dsum2 = (t212_data.get("account_summary", {}) or {}) if isinstance(t212_data, dict) else {}
+            order_plans = _op.build_plans(
+                committee_decisions=_committee.get("decisions", []) or [],
+                portfolio_rows=portfolio_rows,
+                recon_status=(_recon.get("status") if isinstance(_recon, dict) else "UNKNOWN"),
+                free_cash=float(_cash.get("free", 0) or 0),
+                total_equity=float(_dsum2.get("total_equity", 0) or 0),
+                earnings_status=earnings_status,
+                report_day=datetime.now(timezone.utc).date().isoformat(),
+                news_events=_news_ev.get("events", []) or [],
+                regime=getattr(regime_result, "regime", "UNKNOWN") if regime_result else "UNKNOWN",
+                risk_posture=((skill_outputs.get("risk", {}) or {}).get("data", {}) or {}).get("posture", ""),
+                policy=policy_state.get("policy", {}) or {},
+                sleeves=_sleeves)
+            logger.info("Order plans: %d advisory, %d blocked (policy %s)",
+                        len(order_plans.get("plans", [])), len(order_plans.get("blocked", [])),
+                        policy_state.get("version", ""))
+        else:
+            logger.info("Order plans disabled: investment policy %s", policy_state.get("status"))
+    except Exception as exc:
+        logger.debug("Order plans skipped: %s", type(exc).__name__)
     # Trade safety: reconcile-gated BUY demotion applied once.
     try:
         from investment_engine.reporting.regime_report import apply_trade_safety as _safety
@@ -1009,6 +1578,7 @@ DECISIONS:
     if settings.market_regime.enabled and regime_result:
         report_gen = RegimeReportGenerator(
             include_charts=settings.market_regime.reporting.get("include_charts", False),
+            canonical_recon=(_recon if isinstance(_recon, dict) else None),
         )
         regime_parts = report_gen.generate_parts(
             regime_result, t212_data, ai_recs, None, unified_technicals,
@@ -1052,7 +1622,7 @@ DECISIONS:
 
         # Build FX info
         try:
-            from trading212_portfolio import get_live_fx_rates as _live_fx2
+            from trading212.portfolio import get_live_fx_rates as _live_fx2
             fx_info = _live_fx2()
         except Exception:
             fx_info = {}
@@ -1065,9 +1635,22 @@ DECISIONS:
             _cat_path = _Path("data/cache/t212_instruments.json")
             if _cat_path.exists():
                 _cat_data = _json.loads(_cat_path.read_text(encoding="utf-8"))
+                _fetched_at = str(_cat_data.get("fetched_at", "") or "")
+                _age_days = None
+                if _fetched_at:
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        _fetched_dt = _dt.fromisoformat(_fetched_at.replace("Z", "+00:00"))
+                        if _fetched_dt.tzinfo is None:
+                            _fetched_dt = _fetched_dt.replace(tzinfo=_tz.utc)
+                        _age_days = round((_dt.now(_tz.utc) - _fetched_dt).total_seconds() / 86400.0, 2)
+                    except Exception:
+                        _age_days = None
                 catalog_meta = {
-                    "fetched_at": _cat_data.get("fetched_at", ""),
-                    "age_days": 0.0,
+                    "fetched_at": _fetched_at,
+                    # None (not 0.0) when unknown — the builder renders None as
+                    # "unavailable" and a real 0.0 as fresh (0.0 is falsy!).
+                    "age_days": _age_days,
                     "count": _cat_data.get("count", 0),
                 }
             else:
@@ -1101,17 +1684,21 @@ DECISIONS:
             except Exception:
                 pass
 
-        import uuid as _uuid
-        run_id = str(_uuid.uuid4())[:8]
+        # uuid here used to fork ai_context onto a different run_id (7e520fb5
+        # vs wrapper 524fffa0). "UNKNOWN" only when the caller passed none —
+        # the wrapper consistency check flags that case in the manifest.
+        run_id = str((portfolio_context or {}).get("run_id", "") or "") or "UNKNOWN"
 
-        # Collect model info for attribution
+        # Collect model info for attribution (configured intent + actual winners).
         model_info = {
             "decision_model": settings.decision_model,
             "summary_model": settings.writer_model,
-            "discovery_model": settings.decision_model,
-            "decision_detail_model": settings.decision_model,
+            "discovery_model": getattr(settings, "thinking_model", settings.decision_model),
+            "decision_detail_model": getattr(settings, "finance_model", settings.decision_model),
             "ai_aggressiveness": getattr(settings, "ai_aggressiveness", "balanced"),
+            "providers_per_stage": {k: dict(v) for k, v in _STAGE_ATTRIBUTION.items()},
         }
+        stage_attribution = {k: dict(v) for k, v in _STAGE_ATTRIBUTION.items()}
 
         context_file = _save_ai_context(
             regime_result=regime_result,
@@ -1129,11 +1716,13 @@ DECISIONS:
             run_id=run_id,
             model_info=model_info,
             news_context_path=news_context_path,
+            stage_attribution=stage_attribution,
         )
     except Exception as exc:
         logger.warning("AI context save failed: %s", exc)
-        # Fallback minimal context
-        import uuid as _uuid
+        # Fallback minimal context — MUST reuse the same run_id so the
+        # fallback file never forks onto a random id (see run 524fffa0:
+        # content carried 7e520fb5 while every other artifact said 524fffa0).
         context_file = _save_ai_context(
             regime_result=regime_result,
             t212_data=t212_data,
@@ -1147,9 +1736,10 @@ DECISIONS:
             fx_info={},
             catalog_meta={},
             output_dir=output_dir,
-            run_id=str(_uuid.uuid4())[:8],
+            run_id=run_id if "run_id" in dir() else "UNKNOWN",
             model_info=model_info,
             news_context_path=news_context_path,
+            stage_attribution=stage_attribution if "stage_attribution" in dir() else None,
         )
 
     # --- Two-document reporting: decision brief (concise) + snapshot (full) ---
@@ -1256,13 +1846,69 @@ DECISIONS:
         relevance_min=news_threshold, now=report_dt,
         include_macro_unlinked=True,
         min_tier_for_unlinked=1,
+        stats=(_news_filter_stats := {}),
     )
+    try:
+        logger.info(
+            "Decision-news filter: input=%d no_title_url=%d below_relevance=%d "
+            "too_old=%d unlinked=%d kept=%d",
+            _news_filter_stats.get("input", 0), _news_filter_stats.get("no_title_url", 0),
+            _news_filter_stats.get("below_relevance", 0), _news_filter_stats.get("too_old", 0),
+            _news_filter_stats.get("unlinked", 0), _news_filter_stats.get("kept", 0))
+    except Exception:
+        pass
+    # Relevance diagnostics (threshold review data): score distribution of
+    # valid candidates + top near-misses below the bar. No threshold change
+    # here — the numbers decide in a later run.
+    try:
+        _rel_scores: list[tuple[int, str]] = []
+        for _sym_entries in (news_by_symbol or {}).values():
+            for _rec in _sym_entries or []:
+                if isinstance(_rec, dict) and _rec.get("title") and _rec.get("url"):
+                    try:
+                        _rel_scores.append((int(_rec.get("relevance_score", 0) or 0),
+                                            str(_rec.get("title", ""))[:90]))
+                    except (TypeError, ValueError):
+                        pass
+        if _rel_scores:
+            _rel_scores.sort(key=lambda t: t[0])
+            _vals = [s for s, _ in _rel_scores]
+            _near = [f"{s}:{t}" for s, t in _rel_scores if s < news_threshold][-5:]
+            logger.info("News relevance: n=%d min=%d med=%d max=%d threshold=%s near-miss=%s",
+                        len(_vals), _vals[0], _vals[len(_vals) // 2], _vals[-1],
+                        news_threshold, _near or [])
+    except Exception:
+        pass
+
+    # Research coverage + execution-mode context for both briefs.
+    _corpus_decision_n = int((corpus_info.get("counts", {}) or {}).get("decision", 0) or 0)
+    if _corpus_decision_n < 3:
+        research_note = (
+            f"Research coverage insufficient: {_corpus_decision_n} "
+            f"validated decision-quality items in the last 48 hours.")
+    else:
+        research_note = ""
+    _api_only_run = bool(getattr(settings, "api_only", False))
+    try:
+        from investment_engine.config.settings import resolve_execution_mode as _mode2
+        _exec_mode = _mode2(settings)
+    except Exception:
+        _exec_mode = "public" if _api_only_run else "auto"
+    _api_only_run = (_exec_mode == "public")
+    execution_mode_lines = _execution_mode_lines(settings)
+    try:
+        from investment_engine.providers.factory import ProviderFactory as _PF2
+        disabled_providers = list(_PF2.API_ONLY_DISABLED) if _api_only_run else []
+    except Exception:
+        disabled_providers = ["LM Studio", "llama.cpp", "Ollama"] if _api_only_run else []
 
     if str((_recon.get("status") if isinstance(_recon, dict) else "")).upper() == "FAIL":
         cash_line = (f"€{_recon.get('reported_cash', 0):,.2f} reported cash — "
                      f"deployment withheld until account reconciliation passes.")
     else:
-        cash_line = _format_cash_deployment(regime_result, t212_data, ai_recs, portfolio_rows)
+        cash_line = _format_cash_deployment(
+            regime_result, t212_data, ai_recs, portfolio_rows,
+            recon_status=(_recon.get("status") if isinstance(_recon, dict) else None))
 
     # Account performance: broker equity vs verified net cash flows. Shown
     # even when position reconciliation FAILs; FAIL only blocks new
@@ -1280,6 +1926,9 @@ DECISIONS:
         rows=portfolio_rows, monitoring_items=monitoring_items, earnings_7d=earnings_7d,
         decision_news=decision_news, ideas=ideas, cash_line=cash_line,
         performance=account_performance,
+        research_note=research_note,
+        execution_mode_lines=execution_mode_lines,
+        order_plans=order_plans if isinstance(order_plans, dict) else None,
     )
     snapshot_md = _render_snapshot(
         generated_at=report_dt.strftime("%Y-%m-%d %H:%M %Z"),
@@ -1305,6 +1954,37 @@ DECISIONS:
                     "reported_cash", "cash_delta", "threshold", "status")
     }
 
+    # Deep-dive companion brief (15 fixed sections, deterministic, no LLM).
+    # Never breaks the run; falls back to a header-only document.
+    try:
+        from investment_engine.reporting.documents import (
+            build_deep_dive as _build_deep_dive,
+        )
+        deep_dive_md = _build_deep_dive(
+            generated_at=report_dt.strftime("%Y-%m-%d %H:%M %Z"),
+            run_id=str((portfolio_context or {}).get("run_id", "") or ""),
+            regime_result=regime_result,
+            recon=_recon if isinstance(_recon, dict) else {},
+            rows=portfolio_rows,
+            monitoring_items=monitoring_items,
+            t212_data=t212_data,
+            news_by_symbol=news_by_symbol,
+            decision_news=decision_news,
+            earnings_7d=earnings_7d,
+            ideas=ideas,
+            trump_tracking=trump_tracking,
+            commodity_news=commodity_news,
+            analyst_news=analyst_news,
+            order_plans=order_plans if isinstance(order_plans, dict) else None,
+            dividends_12m=dividends_12m if "dividends_12m" in dir() else {},
+            stage_attribution={k: dict(v) for k, v in _STAGE_ATTRIBUTION.items()},
+            result_modes={"api_execution_mode": {"public": "API_ONLY", "locals": "LOCALS"}.get(
+                _exec_mode if "_exec_mode" in dir() else "auto", "STANDARD")},
+        )
+    except Exception as exc:
+        logger.debug("Deep-dive brief skipped: %s", type(exc).__name__)
+        deep_dive_md = "# Portfolio Deep Dive\n\nNo coverage this run.\n"
+
     # Failed-ticker ledger: UNRESOLVED mappings + market-data fetch misses.
     # Never breaks the run; empty list when everything resolved.
     try:
@@ -1326,6 +2006,7 @@ DECISIONS:
         "markdown": brief_md,
         "brief_markdown": brief_md,
         "snapshot_markdown": snapshot_md,
+        "deep_dive_markdown": deep_dive_md,
         "brief_metadata": {
             "generated_at": report_dt.isoformat(),
             "timezone": "Europe/Bratislava",
@@ -1353,6 +2034,30 @@ DECISIONS:
         "settings": _sanitized_settings(settings),
         "report_mode": "decision_brief_and_snapshot",
         "market_regime": regime_result.to_dict() if regime_result else None,
+        "providers_per_stage": {k: dict(v) for k, v in _STAGE_ATTRIBUTION.items()},
+        "skill_outputs": skill_outputs,
+        "skill_versions": skill_versions,
+        "order_plans": order_plans,
+        "investment_policy": {"status": policy_state.get("status", "NOT SET"),
+                              "version": policy_state.get("version", ""),
+                              "problems": policy_state.get("problems", [])},
+        "universe": {
+            "enabled": True,
+            "counts": dict(universe_info or {}),
+        },
+        "playwright": dict(playwright_stats or {}),
+        "tvnews": dict(tvnews_stats or {}),
+        "research_corpus": {
+            "run_id": _corpus_run_id,
+            "counts": (corpus_info or {}).get("counts", {}),
+            "path_md": (corpus_info or {}).get("path_md"),
+            "path_json": (corpus_info or {}).get("path_json"),
+            "path_rejected": (corpus_info or {}).get("path_rejected"),
+        },
+        "research_note": research_note,
+        "execution_mode_lines": execution_mode_lines,
+        "api_execution_mode": {"public": "API_ONLY", "locals": "LOCALS"}.get(_exec_mode, "STANDARD"),
+        "disabled_providers": disabled_providers,
         "ai_recommendations": ai_recs,
         "t212_data": _sanitized_t212_data(t212_data),
         "reconciliation": reconciliation_diagnostic,
@@ -1365,6 +2070,7 @@ DECISIONS:
         "regime_result": regime_result,
         "decision_news": decision_news or [],
         "earnings_7d": earnings_7d or {},
+        "dividends_12m": dividends_12m or {},
         "ideas": ideas or [],
         "portfolio_names": portfolio_names or {},
         "failed_tickers": failed_tickers,
@@ -1468,7 +2174,7 @@ OUTPUT ONLY VALID JSON:
 RULES:
 - Max 2% risk per trade, min 1:2 R:R, mandatory stops, 50/50 scale-out
 - PEAK_HOLD = prioritize SELLs, reduce new BUYs
-- MUST_BUY = prioritize BUYs, deploy cash aggressively
+- POTENTIAL_ACCUMULATION_ZONE = research accumulation candidates, size any idea per policy
 - DECLINING = prepare watchlist, raise cash, no new positions
 - NEUTRAL = normal DCA
 - Use free cash for deployment, respect cash target
@@ -1478,12 +2184,39 @@ RULES:
 
     try:
         _rec_ctx: dict = {"max_output_tokens": 1024}
-        _rec_model = ((settings_dict or {}).get("decision_model")
-                      if isinstance(settings_dict, dict)
-                      else getattr(settings_dict, "decision_model", None))
+        try:
+            _rec_model = _model_for_stage(settings_dict, "ai_recommendations")
+        except Exception:
+            _rec_model = ((settings_dict or {}).get("decision_model")
+                          if isinstance(settings_dict, dict)
+                          else getattr(settings_dict, "decision_model", None))
         if _rec_model:
             _rec_ctx["model"] = _rec_model
-        result = provider.generate(prompt, stage="ai_recommendations", context=_rec_ctx)
+        _rec_served, _rec_direct = (None, None)
+        try:
+            _rec_served, _rec_direct = _try_lmstudio_stage(provider, prompt, settings=settings_dict,
+                                                          stage="ai_recommendations", tokens=1024)
+        except Exception:
+            _rec_served, _rec_direct = (None, None)
+        if _rec_served and _rec_direct:
+            result = _rec_direct
+            try:
+                from investment_engine.providers import attribution as _attr_rec
+                _rec_record = _attr_rec.new_stage_record("ai_recommendations",
+                                                         model_requested=_rec_served)
+                _STAGE_ATTRIBUTION["ai_recommendations"] = _attr_rec.note_chain_winner(
+                    _rec_record, "LM Studio", _rec_served, 0)
+            except Exception:
+                pass
+        else:
+            result = provider.generate(prompt, stage="ai_recommendations", context=_rec_ctx)
+            try:
+                from investment_engine.providers import attribution as _attr_rec
+                _rec_record = _attr_rec.new_stage_record("ai_recommendations",
+                                                         model_requested=_rec_ctx.get("model", ""))
+                _STAGE_ATTRIBUTION["ai_recommendations"] = _attr_rec.apply_chain_hint(_rec_record, provider)
+            except Exception:
+                pass
         # Clean up response - remove any markdown code fences or extra text
         cleaned = result.strip()
         # Remove markdown code fences if present
@@ -1517,6 +2250,7 @@ def _save_ai_context(
     run_id: str = "",
     model_info: dict | None = None,
     news_context_path: str | None = None,
+    stage_attribution: dict | None = None,
 ) -> Path:
     """Save machine-safe AI context report using broker-first model."""
     builder = AIContextReportBuilder()
@@ -1535,21 +2269,112 @@ def _save_ai_context(
         run_id=run_id,
         model_info=model_info,
         news_context_path=news_context_path,
+        stage_attribution=stage_attribution,
     )
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    context_file = output_dir / f"ai_context_{timestamp}.md"
+    # Single AI-context path (deduped): the ai_context/ layer owns this file.
+    # save_ai_context_layer() persists the sibling portfolio_analysis JSON and
+    # skips re-copying this identical .md (see report_structure).
+    layer_dir = Path(output_dir) / "ai_context"
+    layer_dir.mkdir(parents=True, exist_ok=True)
+    stamp = (run_id or "").strip() or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    context_file = layer_dir / f"ai_context_{stamp}.md"
     context_file.write_text(context, encoding="utf-8")
     return context_file
 
 
+# Stage sets: single source of truth lives in providers.presets; these
+# private aliases keep the old import path working (tests pin identity).
+from investment_engine.providers.presets import FINANCE_STAGES as _FINANCE_STAGES
+from investment_engine.providers.presets import THINKING_STAGES as _THINKING_STAGES
 from investment_engine.providers.presets import WRITER_STAGES as _WRITER_STAGES
 
 
 def _model_for_stage(settings, stage: str) -> str:
-    """Route stages to models: writer (fast) for summaries, reasoning otherwise."""
-    if stage in _WRITER_STAGES:
-        return getattr(settings, "writer_model", None) or settings.decision_model
-    return settings.decision_model
+    """Route stages to models: writer (fast) for summaries, reasoning otherwise.
+
+    Stage map (LM Studio server ids, LM_Studio_Optimiser "best" 2026-10-01):
+      summary            -> writer_model   (gemma-4-12b)
+      discovery          -> thinking_model (gpt-oss-20b, 32k ctx)
+      decision/ai_recs   -> finance_model  (qwen3.8-9b-distill, fast reasoning)
+      everything else    -> decision_model (qwen3.8-9b-distill, chain default)
+    The name is intent + attribution label; the chain serves its own fixed
+    models except the direct LM Studio attempt below, which honors it.
+    """
+    try:
+        from investment_engine.providers.presets import FINANCE_STAGES, THINKING_STAGES, WRITER_STAGES
+    except Exception:
+        FINANCE_STAGES, THINKING_STAGES, WRITER_STAGES = frozenset(), frozenset(), frozenset({"summary"})
+    get = (lambda k, d=None: settings.get(k, d)) if isinstance(settings, dict) else (lambda k, d=None: getattr(settings, k, d))
+    try:
+        if stage in WRITER_STAGES:
+            return get("writer_model", None) or get("decision_model")
+        if stage in THINKING_STAGES:
+            return get("thinking_model", None) or get("decision_model")
+        if stage in FINANCE_STAGES:
+            return get("finance_model", None) or get("decision_model")
+    except Exception:
+        pass
+    try:
+        return get("decision_model")
+    except Exception:
+        return "qwen3.8-9b-distill"
+
+
+def _cfg_get(settings, key, default=None):
+    """Read a setting from an EngineSettings object or a plain dict."""
+    try:
+        if isinstance(settings, dict):
+            return settings.get(key, default)
+        return getattr(settings, key, default)
+    except Exception:
+        return default
+
+
+def _try_lmstudio_stage(provider, prompt, *, settings, stage, tokens):
+    """Direct per-stage LM Studio attempt. Returns (served_model, result).
+
+    The chain strips per-call models (each link serves its fixed model), so
+    stages with a designated LM Studio model (finance/thinking/writer) call
+    the LM Studio link directly FIRST. (served_model, result) on success,
+    (None, None) when LM Studio is disabled/absent/failed — the caller then
+    uses the normal chain. Attribution stays truthful: served_model is the
+    model id actually sent to the server.
+    """
+    try:
+        if not bool(_cfg_get(settings, "lmstudio_enabled", False)):
+            return None, None
+        from investment_engine.providers.presets import FINANCE_STAGES, THINKING_STAGES, WRITER_STAGES
+        if stage not in (FINANCE_STAGES | THINKING_STAGES | WRITER_STAGES):
+            return None, None
+        stage_model = _model_for_stage(settings, stage)
+        if not stage_model:
+            return None, None
+        from investment_engine.providers.lmstudio import LMStudioProvider
+        from investment_engine.providers.fallback import ChainedFallbackProvider
+        link = None
+        if isinstance(provider, LMStudioProvider):
+            link = provider
+        elif isinstance(provider, ChainedFallbackProvider):
+            for p in getattr(provider, "providers", []) or []:
+                if isinstance(p, LMStudioProvider):
+                    link = p
+                    break
+        if link is None:
+            return None, None
+        ctx = {"model": stage_model, "max_output_tokens": tokens}
+        if stage in THINKING_STAGES:
+            ctx["read_timeout_s"] = 1200  # gpt-oss-20b ~12 tok/s needs room past the 5min default
+        elif stage in FINANCE_STAGES:
+            # qwen3.8-9b-distill ~30 tok/s: 3072-token finance outputs need
+            # ~2 min; 1200s keeps headroom (run 59adee12 showed the 300s
+            # default killing healthy generations mid-stream).
+            ctx["read_timeout_s"] = 1200
+        result = link.generate(prompt, stage=stage, context=ctx)
+        if result and not result.startswith(f"[{stage}]") and "error" not in result.lower():
+            return stage_model, result
+        return None, None
+    except Exception:
+        return None, None
 
 
 def _generate_with_fallback(provider, prompt, settings, tokens=800, stage="decision") -> str:
@@ -1564,22 +2389,44 @@ def _generate_with_fallback(provider, prompt, settings, tokens=800, stage="decis
         else:
             logger.warning("LLM stage=%s model=%s duration=%.1fs FAILED: %s", stage_name, model_name, duration, error)
 
-    # Single call - let the provider (FallbackProvider) handle fallback internally
+    # Single call - let the provider (FallbackProvider) handle fallback internally.
+    # Phase 4: record the actual winner (or deterministic fallback) per stage.
+    from investment_engine.providers import attribution as _attr
+
+    record = _attr.new_stage_record(stage, model_requested=model)
+    # Direct per-stage LM Studio attempt first (designated finance/thinking/
+    # writer model). The chain would strip the per-call model, so this is the
+    # only path where the routed model is actually served.
+    try:
+        _served, _direct = _try_lmstudio_stage(provider, prompt, settings=settings,
+                                               stage=stage, tokens=tokens)
+        if _served and _direct:
+            duration = _time.time() - start
+            _log_attempt(stage, _served, True, duration, len(_direct))
+            _STAGE_ATTRIBUTION[stage] = _attr.note_chain_winner(record, "LM Studio", _served, 0)
+            return _direct
+    except Exception:
+        pass
     try:
         result = provider.generate(prompt, stage=stage, context={"model": model, "max_output_tokens": tokens})
         duration = _time.time() - start
         if result and not result.startswith(f"[{stage}]") and "error" not in result.lower():
             _log_attempt(stage, model, True, duration, len(result))
+            _STAGE_ATTRIBUTION[stage] = _attr.apply_chain_hint(record, provider)
             return result
         else:
             _log_attempt(stage, model, False, duration, len(result) if result else 0, result)
             _record_fallback(stage, getattr(provider, "name", "provider") + " returned no usable content")
+            _attr.note_error(record, "no usable content")
     except Exception as exc:
         duration = _time.time() - start
         _log_attempt(stage, model, False, duration, 0, str(exc))
         _record_fallback(stage, "local endpoints unavailable")
-    
+        _attr.note_error(record, exc)
+
     # Deterministic fallback - configurable based on AI aggressiveness
+    _STAGE_ATTRIBUTION[stage] = _attr.note_deterministic(
+        record, str((settings.__dict__ if hasattr(settings, '__dict__') else {}).get("ai_aggressiveness", "balanced")))
     return _deterministic_fallback(stage, language=str((settings.__dict__ if hasattr(settings, '__dict__') else {}).get("language", "English")), aggressiveness=str((settings.__dict__ if hasattr(settings, '__dict__') else {}).get("ai_aggressiveness", "balanced")))
 
 
@@ -1668,11 +2515,21 @@ def _tech_summary_line(display: str, ind: dict | None) -> str:
             return fmt.format(float(v)) if v is not None else "N/A"
         except (TypeError, ValueError):
             return "N/A"
-    return (
+    line = (
         f"{display}: Price={_f('price')} | RSI={_f('RSI_14', '{:.1f}')} | "
         f"SMA20={_f('SMA_20')} | SMA50={_f('SMA_50')} | MACD={_f('MACD', '{:.4f}')} | "
         f"Support={_f('Support')} | Resistance={_f('Resistance')}"
     )
+    # TradingView sweep readings (distinct keys; shown only, never merged
+    # into Yahoo numerics or broker values).
+    tv_bits = []
+    if isinstance(ind.get("TV_TECHNICALS_RATING"), str) and ind["TV_TECHNICALS_RATING"]:
+        tv_bits.append(f"TV gauge: {ind['TV_TECHNICALS_RATING']}")
+    if isinstance(ind.get("TV_ANALYST_RATING"), str) and ind["TV_ANALYST_RATING"]:
+        tv_bits.append(f"TV analyst: {ind['TV_ANALYST_RATING']}")
+    if tv_bits:
+        line += " | " + " | ".join(tv_bits)
+    return line
 
 
 def _fetch_technicals_parallel(symbols: list) -> dict[str, dict]:
@@ -2066,7 +2923,7 @@ def _resolve_account_performance(t212_data: dict | None, portfolio_context: dict
     api_result: dict | None = None
     if isinstance(t212_data, dict) and t212_data.get("status") == "ok":
         try:
-            from trading212_integration import create_integration
+            from trading212.integration import create_integration
             _t212 = create_integration(config_file="api.env")
             _client = getattr(getattr(_t212, "monitor", None), "client", None)
             if _client is not None:
@@ -2198,7 +3055,10 @@ def _hold_trigger_reason(row: dict, earnings_date: str = "", tech: dict | None =
         pass
     try:
         px = float(row.get("current_price", 0) or 0)
-        for lvl in (row.get("support"), row.get("resistance")):
+        # EUR-vs-EUR: row prices are EUR, so proximity must use the converted
+        # levels (raw natives are USD/DKK/GBX-scale and would never match).
+        for lvl in (row.get("support_eur", row.get("support")),
+                    row.get("resistance_eur", row.get("resistance"))):
             if lvl is not None and px > 0 and abs(px - float(lvl)) / px <= 0.02:
                 return "price near key level"
     except (TypeError, ValueError, ZeroDivisionError):
@@ -2507,19 +3367,33 @@ def _derive_top_risks(regime_result, t212_data, portfolio_rows, earnings_status,
     return "; ".join(items[:3])
 
 
-def _format_cash_deployment(regime_result, t212_data, ai_recs, portfolio_rows) -> str:
+def _format_cash_deployment(regime_result, t212_data, ai_recs, portfolio_rows, recon_status: str | None = None) -> str:
     """Concrete cash allocation/action. Single allowed fallback when unknown."""
     # FAIL-state guard: deployment withheld until reconciliation passes.
-    try:
-        from investment_engine.reporting.regime_report import compute_reconciliation as _recon_fn2
-        _recon2 = _recon_fn2(t212_data, portfolio_rows)
-        if _recon2.get("status") == "FAIL":
-            return (
-                f"€{_recon2.get('reported_cash', 0):,.2f} reported cash — "
-                f"deployment withheld until account reconciliation passes."
-            )
-    except Exception:
-        pass
+    # Callers pass the canonical status; the recompute below is a fallback only.
+    _status = str(recon_status or "").upper()
+    if _status == "FAIL":
+        try:
+            from investment_engine.reporting.regime_report import compute_reconciliation as _recon_fn2
+            _recon2 = _recon_fn2(t212_data, portfolio_rows)
+            _cash2 = _recon2.get("reported_cash", 0)
+        except Exception:
+            _cash2 = 0
+        return (
+            f"€{_cash2:,.2f} reported cash — "
+            f"deployment withheld until account reconciliation passes."
+        )
+    if not _status:
+        try:
+            from investment_engine.reporting.regime_report import compute_reconciliation as _recon_fn2
+            _recon2 = _recon_fn2(t212_data, portfolio_rows)
+            if _recon2.get("status") == "FAIL":
+                return (
+                    f"€{_recon2.get('reported_cash', 0):,.2f} reported cash — "
+                    f"deployment withheld until account reconciliation passes."
+                )
+        except Exception:
+            pass
     free_cash = None
     deploy = None
     reserve = None
@@ -2670,12 +3544,18 @@ def _format_earnings_radar(
     return "\n".join(lines).rstrip()
 
 
-def _methodology_block(t212_data: dict | None, provider) -> str:
-    """Methodology & data-quality footer."""
+def _methodology_block(t212_data: dict | None, provider, canonical: dict | None = None) -> str:
+    """Methodology & data-quality footer (canonical recon preferred)."""
     recon = "N/A"
-    if isinstance(t212_data, dict):
+    if isinstance(canonical, dict) and str(canonical.get("status", "")).upper() in ("PASS", "FAIL", "UNKNOWN"):
+        recon = f"{canonical.get('status')} (diff €{canonical.get('cash_delta', 0):,.2f})"
+    elif isinstance(t212_data, dict):
         s = t212_data.get("account_summary", {}) or {}
-        recon = f"{s.get('reconciliation_status', 'UNKNOWN')} (diff €{s.get('reconciliation_difference', 0):,.2f})"
+        _v2m = s.get("reconciliation_v2", {}) or {}
+        if str(_v2m.get("reconciliation_status", "")).upper() in ("PASS", "FAIL"):
+            recon = f"{_v2m.get('reconciliation_status')} (diff €{_v2m.get('reconciliation_delta_eur', 0):,.2f})"
+        else:
+            recon = f"{s.get('reconciliation_status', 'UNKNOWN')} (diff €{s.get('reconciliation_difference', 0):,.2f})"
     chain = getattr(provider, "name", "LLM chain")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [

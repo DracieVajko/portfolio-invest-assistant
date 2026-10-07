@@ -36,6 +36,8 @@ def test_writer_stages_single_source():
     from investment_engine import main as engine_main
 
     assert engine_main._WRITER_STAGES is P.WRITER_STAGES
+    assert engine_main._THINKING_STAGES is P.THINKING_STAGES
+    assert engine_main._FINANCE_STAGES is P.FINANCE_STAGES
 
 
 def _capture_payload(monkeypatch, **context):

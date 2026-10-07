@@ -72,10 +72,16 @@ def reconcile_ledger(
     position_tolerance_pct: Decimal = Decimal("5.0"),  # 5% tolerance
 ) -> ReconciliationResult:
     """Reconcile historical ledger against broker-provided data.
-    
+
+    HISTORICAL LEDGER AUDIT ONLY (Phase 1 canonical core). This result must
+    never influence live account state: it cannot flip the status produced by
+    investment_engine.portfolio.broker_first.reconcile_snapshot, and no
+    reporting/regime_report code may import this module (guarded by
+    tests/test_phase1_canonical_core.py::test_ledger_cannot_flip_live_status).
+
     All comparisons are diagnostic only – they do not affect the live
     account reconciliation in trading212_portfolio.py.
-    
+
     Args:
         performance: PerformanceResult from calculate_performance()
         broker_net_deposits_eur: Total deposits - withdrawals from broker records

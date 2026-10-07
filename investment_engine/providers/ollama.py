@@ -41,7 +41,14 @@ class OllamaProvider(BaseLLMProvider):
 
         try:
             response = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=180)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except Exception as exc:
+                # Include the server body: Ollama 404s on unknown MODELS
+                # (e.g. model id exists elsewhere but not on this server),
+                # which is otherwise indistinguishable from a dead endpoint.
+                body = (response.text or "")[:200]
+                return f"[{stage}] Ollama error: {exc} | model={self.model} | body={body}"
             data = response.json()
             if isinstance(data, dict):
                 if content := data.get("message", {}).get("content"):

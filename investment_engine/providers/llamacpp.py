@@ -30,6 +30,17 @@ class LlamaCppProvider(BaseLLMProvider):
         self.max_output_tokens = max_output_tokens
 
     def generate(self, prompt: str, *, stage: str, context: dict | None = None) -> str:
+        # Context-budget guard: the Pi server runs n_ctx=4096 (probed
+        # 2026-09-27). Rough token estimate (~4 chars/token + reply budget);
+        # over-budget prompts return a chain-visible error so the next link
+        # (big-context Ollama/cloud) serves the stage instead of a truncation.
+        try:
+            _est = len(prompt or "") / 4.0 + float(self.max_output_tokens or 0)
+            if _est > float(self.max_context_tokens or 4096) * 0.85:
+                return (f"[{stage}] llama.cpp prompt exceeds context budget "
+                        f"(~{_est:.0f} > {self.max_context_tokens}).")
+        except Exception:
+            pass
         payload = {
             "model": self.model,
             "messages": [

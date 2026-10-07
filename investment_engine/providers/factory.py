@@ -20,9 +20,112 @@ logger = logging.getLogger(__name__)
 class ProviderFactory:
     """Create a provider instance using automatic selection and chained fallback."""
 
+    #: Providers excluded before generation starts in API-only mode.
+    API_ONLY_DISABLED = ("LM Studio", "llama.cpp", "Ollama")
+
+    @staticmethod
+    def api_only_chain(settings: EngineSettings) -> BaseLLMProvider:
+        """Gemini -> OpenRouter(:free) -> Mistral -> deterministic fallback. Locals never constructed."""
+        chain: list[BaseLLMProvider] = []
+        if getattr(settings, "gemini_api_key", ""):
+            try:
+                chain.append(ProviderFactory._gemini(settings))
+            except Exception:
+                pass
+        if getattr(settings, "openrouter_api_key", ""):
+            try:
+                chain.append(ProviderFactory._openrouter(settings))
+            except Exception:
+                pass
+        if getattr(settings, "mistral_api_key", ""):
+            try:
+                chain.append(ProviderFactory._mistral(settings))
+            except Exception:
+                pass
+        if len(chain) == 1:
+            return chain[0]
+        if chain:
+            logger.info("ProviderFactory: API-only chain %s",
+                        " -> ".join(p.name for p in chain))
+            return ChainedFallbackProvider(chain)
+        logger.warning("ProviderFactory: API-only mode with no cloud keys; deterministic fallback only")
+        return ProviderFactory._no_key_chain()
+
+    @staticmethod
+    def locals_chain(settings: EngineSettings) -> BaseLLMProvider:
+        """Locals only: LM Studio -> llama.cpp (Pi) -> Ollama (Pi) -> deterministic.
+
+        Cloud keys are never consulted here. Order note: llama.cpp holds the
+        strongest fine-tuned model so it precedes Ollama; over-budget prompts
+        (>85% of its n_ctx=4096) skip it via the context guard and fall to
+        Ollama (big context) instead of dying on the small-context link.
+        """
+        chain: list[BaseLLMProvider] = []
+        if bool(getattr(settings, "lmstudio_enabled", True)):
+            try:
+                chain.append(LMStudioProvider(
+                    base_url=settings.lm_studio_base_url,
+                    model=settings.lm_studio_model,
+                    max_context_tokens=settings.lm_studio_context_tokens,
+                    max_output_tokens=settings.lm_studio_max_output_tokens,
+                    timeout_seconds=settings.request_timeout_seconds,
+                ))
+            except Exception:
+                pass
+        else:
+            logger.info("ProviderFactory: LM Studio disabled by policy (LMSTUDIO_ENABLED=0)")
+        try:
+            chain.append(LlamaCppProvider(
+                base_url=getattr(settings, "llamacpp_base_url", "http://100.125.47.31:11435/v1"),
+                model=getattr(settings, "llamacpp_model", "qwen3.8-9b"),
+                max_context_tokens=getattr(settings, "llamacpp_context_tokens", 4096),
+                max_output_tokens=settings.lm_studio_max_output_tokens,
+            ))
+        except Exception:
+            pass
+        try:
+            chain.append(OllamaProvider(
+                base_url=settings.ollama_base_url,
+                model=settings.ollama_model,
+                max_context_tokens=settings.ollama_context_tokens,
+                max_output_tokens=settings.lm_studio_max_output_tokens,
+            ))
+        except Exception:
+            pass
+        if len(chain) == 1:
+            return chain[0]
+        if chain:
+            logger.info("ProviderFactory: locals chain %s",
+                        " -> ".join(p.name for p in chain))
+            return ChainedFallbackProvider(chain)
+        logger.warning("ProviderFactory: locals mode with no local providers; deterministic fallback only")
+        return ProviderFactory._no_key_chain("locals mode, no local provider reachable")
+
+    @staticmethod
+    def _no_key_chain(reason: str = "API-only mode, no key") -> BaseLLMProvider:
+        """No-provider path: a one-link chain whose link always errors, so
+        every stage degrades to the deterministic fallback without any probe."""
+        from investment_engine.providers.base import BaseLLMProvider as _Base
+
+        _reason = reason
+
+        class _NoKey(_Base):
+            name = "NoCloudKey"
+
+            def generate(self, prompt: str, *, stage: str, context: dict | None = None) -> str:
+                return f"[{stage}] provider unavailable ({_reason})"
+
+        return ChainedFallbackProvider([_NoKey()])
+
     @staticmethod
     def create(settings: EngineSettings | None = None) -> BaseLLMProvider:
         settings = settings or EngineSettings.from_defaults()
+        from investment_engine.config.settings import resolve_execution_mode as _mode
+        mode = _mode(settings)
+        if mode == "public":
+            return ProviderFactory.api_only_chain(settings)
+        if mode == "locals":
+            return ProviderFactory.locals_chain(settings)
         preferred = (settings.provider or "auto").lower()
 
         if preferred == "openrouter":
@@ -53,36 +156,42 @@ class ProviderFactory:
     @staticmethod
     def _build_chain(settings: EngineSettings) -> list[BaseLLMProvider]:
         chain: list[BaseLLMProvider] = []
-        # 1. LM Studio (laptop, 100.101.20.64:1234) – PRIMARY local
-        # Biggest models: gpt-oss-20b, gemma4-12b, fin-r1, etc.
-        # Keep in chain even if currently offline (fallback to next)
-        try:
-            lm = LMStudioProvider(
-                base_url=settings.lm_studio_base_url,
-                model=settings.lm_studio_model,
-                max_context_tokens=settings.lm_studio_context_tokens,
-                max_output_tokens=settings.lm_studio_max_output_tokens,
-                timeout_seconds=settings.request_timeout_seconds,
-            )
-            chain.append(lm)
-        except Exception:
-            pass
+        # 1. LM Studio (local workstation) – PRIMARY. Enabled by default
+        # (LMSTUDIO_ENABLED=1); disable explicitly with LMSTUDIO_ENABLED=0.
+        if bool(getattr(settings, "lmstudio_enabled", True)):
+            try:
+                lm = LMStudioProvider(
+                    base_url=settings.lm_studio_base_url,
+                    model=settings.lm_studio_model,
+                    max_context_tokens=settings.lm_studio_context_tokens,
+                    max_output_tokens=settings.lm_studio_max_output_tokens,
+                    timeout_seconds=settings.request_timeout_seconds,
+                )
+                chain.append(lm)
+            except Exception:
+                pass
+        else:
+            logger.info("ProviderFactory: LM Studio disabled by policy (LMSTUDIO_ENABLED=0)")
 
-        # 2. llama.cpp (Raspberry Pi 5, Tailscale IP) – SECONDARY fallback
-        # OpenAI-compatible API on port 11435, model: qwen3.8-9b
+        # 2. llama.cpp (Raspberry Pi 5, Tailscale IP) – strongest fine-tuned
+        # model on the Pi, so it precedes Ollama. Endpoint comes from settings
+        # (LLAMACPP_BASE_URL), never hardcoded.
+        # NOTE: the Pi server runs n_ctx=4096 (probed 2026-09-27); the provider
+        # skips over-budget prompts with a chain-visible error (see llamacpp.py)
+        # so long prompts fall through to Ollama/cloud instead of dying here.
         try:
             llama = LlamaCppProvider(
-                base_url="http://100.125.47.31:11435/v1",
+                base_url=getattr(settings, "llamacpp_base_url", "http://100.125.47.31:11435/v1"),
                 model=getattr(settings, "llamacpp_model", "qwen3.8-9b"),
-                max_context_tokens=getattr(settings, "llamacpp_context_tokens", 32768),
+                max_context_tokens=getattr(settings, "llamacpp_context_tokens", 4096),
                 max_output_tokens=settings.lm_studio_max_output_tokens,
             )
             chain.append(llama)
         except Exception:
             pass
 
-        # 3. Ollama (Raspberry Pi, 100.125.47.31:11434) – TERTIARY fallback
-        # Models: qwen3.8-9b-pi, qwen3-4b-pi, noema-2b
+        # 3. Ollama (Raspberry Pi 5, Tailscale) – big-context safety net
+        # behind llama.cpp. Models on Pi (probed): qwen3.8-9b-pi:latest, qwen3-4b-pi:latest, noema-2b.
         try:
             ollama = OllamaProvider(
                 base_url=settings.ollama_base_url,
@@ -94,22 +203,31 @@ class ProviderFactory:
         except Exception:
             pass
 
-        # 4. Gemini – free tier fallback (OpenRouter skipped: free tier too limited)
+        # 4. Gemini – free tier fallback (first cloud link)
         if getattr(settings, "gemini_api_key", ""):
             try:
                 chain.append(ProviderFactory._gemini(settings))
             except Exception:
                 pass
 
-        # 5. Mistral – free tier fallback
+        # 5. OpenRouter – :free models only (FREE_MODELS rotation inside the
+        # provider when model is "openrouter/free"; a user-pinned specific
+        # model is used as-is with no silent fallback). Skipped without key.
+        if getattr(settings, "openrouter_api_key", ""):
+            try:
+                chain.append(ProviderFactory._openrouter(settings))
+            except Exception:
+                pass
+
+        # 6. Mistral – free tier fallback (last cloud link)
         if getattr(settings, "mistral_api_key", ""):
             try:
                 chain.append(ProviderFactory._mistral(settings))
             except Exception:
                 pass
 
-        # Note: OpenRouter and OpenCode Zen NOT in auto chain (free tier too limited / empty responses).
-        # Available only with explicit PROVIDER=openrouter / opencode_zen.
+        # Note: OpenCode Zen NOT in auto chain (empty responses observed).
+        # Available only with explicit PROVIDER=opencode_zen.
 
         # Filter only key-based providers when key missing; keep local providers (LMStudio/llama.cpp/Ollama) even if not currently reachable
         filtered: list[BaseLLMProvider] = []
@@ -124,6 +242,18 @@ class ProviderFactory:
 
     @staticmethod
     def _lmstudio(settings: EngineSettings) -> BaseLLMProvider:
+        # Explicit provider="lmstudio": LM Studio is primary by policy
+        # (enabled by default). If disabled via LMSTUDIO_ENABLED=0, degrade
+        # to the auto chain without LM Studio and warn.
+        if not bool(getattr(settings, "lmstudio_enabled", True)):
+            logger.warning("ProviderFactory: LM Studio disabled (LMSTUDIO_ENABLED=0); using auto chain")
+            chain = [p for p in ProviderFactory._build_chain(settings)
+                     if not isinstance(p, LMStudioProvider)]
+            if len(chain) == 1:
+                return chain[0]
+            if chain:
+                return ChainedFallbackProvider(chain)
+            return ProviderFactory._ollama(settings)
         primary = LMStudioProvider(
             base_url=settings.lm_studio_base_url,
             model=settings.lm_studio_model,

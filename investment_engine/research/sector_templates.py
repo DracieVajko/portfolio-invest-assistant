@@ -52,6 +52,12 @@ _SECTOR_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
     "Crypto": {
         "queries": ["regulatory outlook", "ETF flows", "network adoption", "analyst ratings", "earnings guidance"],
     },
+    "Healthcare": {
+        "queries": ["clinical trial readout", "FDA approval decision", "drug pricing", "analyst ratings", "earnings guidance"],
+    },
+    "Biotech": {
+        "queries": ["pipeline catalyst", "PDUFA date", "trial enrollment", "analyst ratings", "cash runway"],
+    },
 }
 
 

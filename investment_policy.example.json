@@ -1,0 +1,45 @@
+{
+  "_comment": "TEMPLATE ONLY — copy to investment_policy.json (gitignored) and edit. Real file must never be committed. Deferred values stay REQUIRES_USER_VALUE and block the dependent plan type instead of guessing.",
+  "policy_version": "v1-preliminary",
+  "concentration": {
+    "default_max_position_pct": 20.0,
+    "by_sleeve": "REQUIRES_USER_VALUE"
+  },
+  "sector_caps_pct": "REQUIRES_USER_VALUE",
+  "theme_caps_pct": "REQUIRES_USER_VALUE",
+  "crypto_cap_pct": "REQUIRES_USER_VALUE",
+  "tactical_sleeve_cap_pct": "REQUIRES_USER_VALUE",
+  "risk_per_trade_pct": 2.0,
+  "risk_per_trade_applies_to": "tactical-only (test default)",
+  "adverse_move_assumption": 0.25,
+  "cash": {
+    "mandatory_floor_pct": 0.0,
+    "zero_cash_blocks_buys": true
+  },
+  "earnings_blackout": {
+    "before_bdays": 5,
+    "after_bdays": 2,
+    "estimated_conservative": true
+  },
+  "averaging_down": {
+    "allowed_sleeves": ["long_term", "core", "thematic"],
+    "max_add_count": 2,
+    "require_thesis_intact": true,
+    "block_on_red_flags": ["insolvency", "dilution", "delisting"]
+  },
+  "pies": {
+    "standalone_priority": true,
+    "whole_pie_ops_require_confirmation": "REQUIRES_USER_VALUE"
+  },
+  "overlap": {
+    "standalone_may_overlap_core": "REQUIRES_USER_VALUE"
+  },
+  "stops": {
+    "scope": "tactical-only (pending confirmation)"
+  },
+  "core_trims": "REQUIRES_USER_VALUE",
+  "discovery": {
+    "enabled": true,
+    "max_ideas_per_run": 3
+  }
+}

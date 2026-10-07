@@ -94,7 +94,7 @@ class MarketRegimeSettings:
         "declining_lower_highs": True,
         "declining_lower_lows": True,
 
-        # MUST_BUY
+        # POTENTIAL_ACCUMULATION_ZONE (keys keep must_buy_* names for config compat)
         "must_buy_near_200dma_tolerance_pct": 2.0,
         "must_buy_near_52w_low_tolerance_pct": 5.0,
         "must_buy_rsi_daily_max": 35,
@@ -179,15 +179,39 @@ class EngineSettings:
     research_depth: str = "moderate"
     provider: str = _env("PROVIDER", "auto")
     
-    # LM Studio (local GPU)
-    lm_studio_base_url: str = _env("LM_STUDIO_BASE_URL", "http://100.101.20.64:1234/v1")
-    lm_studio_model: str = _env("LM_STUDIO_MODEL", "qwen3.8-4b")
+    # LM Studio (local GPU). Enabled by default: LM Studio is the primary
+    # provider, Pi (llama.cpp -> Ollama) the secondary, cloud APIs the fallback.
+    # Disable explicitly with LMSTUDIO_ENABLED=0 or "lmstudio_enabled": false.
+    lmstudio_enabled: bool = _env_bool("LMSTUDIO_ENABLED", True)
+    # API-only mode: local providers (LM Studio, llama.cpp, Ollama) are removed
+    # from the chain before generation starts — never probed, called, or
+    # unloaded. Effective chain: Gemini -> OpenRouter(:free) -> Mistral
+    # -> deterministic fallback.
+    # API_ONLY=1 or config "api_only": true. OpenCode Zen stays out.
+    api_only: bool = _env_bool("API_ONLY", False)
+    # Execution mode (selectable per run via --execution-mode or config):
+    #   auto   = full chain, locals first (LM Studio -> Pi -> public APIs)
+    #   public = public APIs only (same as api_only; locals never touched)
+    #   locals = local endpoints only + deterministic fallback (no cloud keys)
+    execution_mode: str = _env("EXECUTION_MODE", "auto")
+    lm_studio_base_url: str = _env("LM_STUDIO_BASE_URL", "http://100.88.219.120:1234/v1")
+    lm_studio_model: str = _env("LM_STUDIO_MODEL", "qwen3.8-9b-distill")
     lm_studio_context_tokens: int = _env_int("LM_STUDIO_CONTEXT_TOKENS", 32768)
     lm_studio_max_output_tokens: int = _env_int("LM_STUDIO_MAX_OUTPUT_TOKENS", 32768)
+
+    # Per-stage LM Studio models (LM_Studio_Optimiser "best" winners, 2026-10-01;
+    # failed ids retired: fin-o1-14b, tongyi-30b, marco-deepresearch,
+    # ministral-14b-reasoning, fable5-glint).
+    # decision/primary/finance reasoning: qwen3.8-9b-distill (~30 tok/s).
+    # thinking/research (discovery): openai/gpt-oss-20b (32k ctx, ~12 tok/s).
+    # writer (summaries): google/gemma-4-12b. Fast local fallback: ministral-3-3b.
+    finance_model: str = _env("FINANCE_MODEL", "qwen3.8-9b-distill")
+    thinking_model: str = _env("THINKING_MODEL", "openai/gpt-oss-20b")
+    local_fallback_model: str = _env("LOCAL_FALLBACK_MODEL", "mistralai/ministral-3-3b")
     
     request_timeout_seconds: int = _env_int("REQUEST_TIMEOUT_SECONDS", 1800)
-    decision_model: str = _env("DECISION_MODEL", "qwen3.8-4b")
-    writer_model: str = _env("WRITER_MODEL", "qwen3.8-4b")
+    decision_model: str = _env("DECISION_MODEL", "qwen3.8-9b-distill")
+    writer_model: str = _env("WRITER_MODEL", "google/gemma-4-12b")
     fallback_model: str = _env("FALLBACK_MODEL", "openrouter/free")
     
     # OpenRouter
@@ -215,10 +239,12 @@ class EngineSettings:
     opencode_zen_base_url: str = _env("OPENCODE_ZEN_BASE_URL", "https://api.opencode.ai/v1")
     
     # llama.cpp (OpenAI-compatible API on Raspberry Pi 5, port 11435)
-    # Tries tailscale IP first, then docker internal
+    # Tries tailscale IP first, then docker internal. NOTE: the Pi server runs
+    # n_ctx=4096 (probed 2026-09-27) — long prompts exceed it; the provider
+    # skips itself with a chain-visible error instead of truncating silently.
     llamacpp_base_url: str = _env("LLAMACPP_BASE_URL", _DEFAULT_LLAMACPP_URLS[0])
     llamacpp_model: str = _env("LLAMACPP_MODEL", "qwen3.8-9b")
-    llamacpp_context_tokens: int = _env_int("LLAMACPP_CONTEXT_TOKENS", 32768)
+    llamacpp_context_tokens: int = _env_int("LLAMACPP_CONTEXT_TOKENS", 4096)
     
     # Ollama (separate from llama.cpp)
     ollama_base_url: str = _env("OLLAMA_BASE_URL", "http://100.125.47.31:11434")
@@ -309,3 +335,22 @@ class EngineSettings:
 
     def prompt_dir_path(self) -> Path:
         return Path(self.prompt_dir)
+
+
+def resolve_execution_mode(settings) -> str:
+    """Effective execution mode: 'public' | 'locals' | 'auto'.
+
+    Legacy API_ONLY=1 (or config api_only) maps to 'public'. Unknown values
+    fall back to 'auto'. Never raises.
+    """
+    try:
+        if bool(getattr(settings, "api_only", False)):
+            return "public"
+        mode = str(getattr(settings, "execution_mode", "auto") or "auto").strip().lower()
+        if mode in ("public", "api_only"):
+            return "public"
+        if mode in ("locals", "local", "local_only"):
+            return "locals"
+        return "auto"
+    except Exception:
+        return "auto"

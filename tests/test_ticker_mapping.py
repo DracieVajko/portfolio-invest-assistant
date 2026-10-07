@@ -90,7 +90,7 @@ def test_propose_candidates_exchange_suffix_ranked():
     assert EXCHANGE_SUFFIX_MAP.get("e") == ".MC"
     again = propose_yahoo_candidates("SUp_EQ", "SU", {"currencyCode": "EUR", "isin": "FR0000121972"})
     assert again == cands
-    assert "SU.PA" not in SUPPORTED_YAHOO
+    assert "SU.PA" in SUPPORTED_YAHOO  # verified live on Yahoo 2026-09-26
 def test_propose_candidates_currency_venue_labels():
     cands = propose_yahoo_candidates("ZZZl_EQ", "ZZZ", {"currencyCode": "GBX", "isin": "GB00BPVG5407"})
     by_cand = {c: s for c, s in cands}

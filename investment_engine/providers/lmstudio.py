@@ -16,13 +16,55 @@ _warmup_lock = threading.Lock()
 _model_warmed = set()
 _model_failed = set()  # Cache models that failed to load
 
+# Pre-flight cache: base_url -> (timestamp, frozenset(ids) | None).
+# None means "unknown" (endpoint unreachable) — never a reason to skip.
+_server_models_cache: dict[str, tuple[float, frozenset | None]] = {}
+_SERVER_MODELS_TTL_S = 120.0
+
+# Model loads on LM Studio take 6-60s (large models). The warmup read budget
+# must cover the load, otherwise our own disconnect aborts the server-side
+# startup ("Client disconnected. Stopping generation...") and every retry
+# fails the same way. Seen live 2026-09-28: qwen (~6s load) passed with a
+# 10s budget while slow loaders never finished in time.
+_WARMUP_CONNECT_S = 15
+_WARMUP_READ_S = 120
+
+
+def server_model_ids(base_url: str) -> frozenset | None:
+    """Best-effort ids from GET /v1/models. None = unknown, proceed as before.
+
+    Never raises. Cached briefly so per-stage pre-flights cost one request.
+    """
+    base = (base_url or "").rstrip("/")
+    now = time.time()
+    hit = _server_models_cache.get(base)
+    if hit is not None and (now - hit[0]) < _SERVER_MODELS_TTL_S:
+        return hit[1]
+    try:
+        r = requests.get(f"{base}/models", timeout=(_WARMUP_CONNECT_S, 15))
+        if r.status_code == 200:
+            data = r.json().get("data") or []
+            ids = frozenset(str(d.get("id", "")) for d in data
+                             if isinstance(d, dict) and d.get("id"))
+            _server_models_cache[base] = (now, ids)
+            return ids
+    except Exception as exc:
+        logger.debug("LM Studio /v1/models unreachable on %s: %s", base, exc)
+    _server_models_cache[base] = (now, None)
+    return None
+
+
+def reset_server_models_cache() -> None:
+    """Clear the pre-flight cache (tests, server model changes)."""
+    _server_models_cache.clear()
+
 
 class LMStudioProvider(BaseLLMProvider):
     """LM Studio provider using the configured local endpoint (OpenAI-compatible)."""
 
     def __init__(
         self,
-        base_url: str = "http://100.101.20.64:1234/v1",
+        base_url: str = "http://100.88.219.120:1234/v1",
         model: str = "oda-fin-rl-8b",
         max_context_tokens: int = 32000,
         max_output_tokens: int = 8192,
@@ -52,41 +94,81 @@ class LMStudioProvider(BaseLLMProvider):
                 return
             if key in _model_failed:
                 raise RuntimeError(f"Model '{model}' previously failed to load")
+            # Pre-flight: skip models the server does not serve instead of
+            # burning a warmup + 30s retry + failed generation on each stage.
+            # Transient (NOT cached in _model_failed): the user may load the
+            # model into LM Studio mid-run and the next stage retries.
+            known = server_model_ids(self.base_url)
+            if known is not None and model not in known:
+                raise RuntimeError(
+                    f"Model '{model}' not served by LM Studio "
+                    f"(server has: {sorted(known) or 'none'})")
             logger.info("Warming up model %s on %s...", model, self.base_url)
-            try:
-                payload = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": "Hi"}],
-                    "max_tokens": 5,
-                    "temperature": 0.1,
-                    "stream": False,
-                }
-                r = requests.post(
-                    f"{self.base_url}/chat/completions",
-                    json=payload,
-                    timeout=(5, 10),  # Fail fast: 5s connect, 10s read
-                )
-                if r.status_code == 200:
-                    _model_warmed.add(key)
-                    logger.info("Model %s warmed up successfully", model)
-                elif r.status_code == 400 and "Failed to load model" in r.text:
-                    # Model cannot be loaded - fail fast so fallback can trigger
-                    _model_failed.add(key)
-                    error_msg = f"Model '{model}' failed to load: {r.text[:500]}"
-                    logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-                else:
-                    # Transient (cold load, 5xx, ...): do NOT cache — the model
-                    # may become ready by the next stage. Only the definitive
-                    # 400 "Failed to load model" above is cached permanently.
-                    logger.warning("Model warmup returned %s: %s", r.status_code, r.text[:200])
-            except RuntimeError:
-                raise
-            except Exception as e:
-                # Timeouts / connection errors while the model is (cold) loading
-                # must not poison the model for the whole run — next stage
-                # retries the warmup instead of falling back immediately.
-                logger.warning("Model warmup failed (transient, will retry): %s", e)
+            _BUSY_MARKERS = (
+                "already loaded",
+                "already loaded",
+                "model is currently loaded",
+                "model is currently in use",
+                "currently in use",
+                "currently in use",
+                "is busy",
+                "model is busy",
+                "server is busy",
+            )
+            _MAX_WARMUP_RETRIES = 3
+            _WARMUP_RETRY_DELAY_S = 5.0
+
+            for attempt in range(_MAX_WARMUP_RETRIES):
+                try:
+                    payload = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "max_tokens": 5,
+                        "temperature": 0.1,
+                        "stream": False,
+                    }
+                    r = requests.post(
+                        f"{self.base_url}/chat/completions",
+                        json=payload,
+                        timeout=(_WARMUP_CONNECT_S, _WARMUP_READ_S),
+                    )
+                    if r.status_code == 200:
+                        _model_warmed.add(key)
+                        logger.info("Model %s warmed up successfully", model)
+                        return
+                    elif r.status_code == 400 and "Failed to load model" in r.text:
+                        # Model cannot be loaded - fail fast so fallback can trigger
+                        _model_failed.add(key)
+                        error_msg = f"Model '{model}' failed to load: {r.text[:500]}"
+                        logger.error(error_msg)
+                        raise RuntimeError(error_msg)
+                    elif r.status_code in (400, 503) and any(m in (r.text or "").lower() for m in _BUSY_MARKERS):
+                        # Model busy / already loaded / server busy — wait and retry
+                        if attempt < _MAX_WARMUP_RETRIES - 1:
+                            logger.warning(
+                                "Model %s busy (%s), waiting %.1fs before retry (%d/%d)",
+                                model, r.text[:200], _WARMUP_RETRY_DELAY_S, attempt + 1, _MAX_WARMUP_RETRIES
+                            )
+                            time.sleep(_WARMUP_RETRY_DELAY_S)
+                            continue
+                        # Last attempt exhausted — treat as transient, don't cache
+                        logger.warning(
+                            "Model %s busy after %d retries, treating as transient",
+                            model, _MAX_WARMUP_RETRIES
+                        )
+                    else:
+                        # Transient (cold load, 5xx, ...): do NOT cache — the model
+                        # may become ready by the next stage. Only the definitive
+                        # 400 "Failed to load model" above is cached permanently.
+                        logger.warning("Model warmup returned %s: %s", r.status_code, r.text[:200])
+                    return
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    # Timeouts / connection errors while the model is (cold) loading
+                    # must not poison the model for the whole run — next stage
+                    # retries the warmup instead of falling back immediately.
+                    logger.warning("Model warmup failed (transient, will retry): %s", e)
 
     def _server_root(self) -> str:
         """Server root without the /v1 suffix (for management endpoints)."""
@@ -110,9 +192,19 @@ class LMStudioProvider(BaseLLMProvider):
     def generate(self, prompt: str, *, stage: str, context: dict | None = None) -> str:
         requested_output_tokens = (context or {}).get("max_output_tokens", self.max_output_tokens)
         requested_model = str((context or {}).get("model", self.model))
+        # Thinking models (30B) need room past the 5min default read budget.
+        try:
+            read_timeout = int((context or {}).get("read_timeout_s", 300) or 300)
+        except (TypeError, ValueError):
+            read_timeout = 300
         
-        # Warm up the model on first use
-        self._warmup_model(requested_model)
+        # Warm up the model on first use. A pre-flight/warmup RuntimeError
+        # becomes a chain-visible error string (not an exception) so the
+        # caller falls through to the next link instead of failing the stage.
+        try:
+            self._warmup_model(requested_model)
+        except RuntimeError as exc:
+            return f"[{stage}] LM Studio model '{requested_model}' unavailable: {exc}."
         
         preset = preset_for(stage)
         sampling = merge_sampling(preset, context)
@@ -140,7 +232,7 @@ class LMStudioProvider(BaseLLMProvider):
             response = requests.post(
                 f"{self.base_url}/chat/completions",
                 json=payload,
-                timeout=(30, 300),  # 30s connect, 5min read
+                timeout=(30, read_timeout),  # 30s connect, stage read budget
             )
             if response.status_code == 400:
                 # Model is likely (cold) loading after a switch — the server
@@ -157,7 +249,7 @@ class LMStudioProvider(BaseLLMProvider):
                 response = requests.post(
                     f"{self.base_url}/chat/completions",
                     json=payload,
-                    timeout=(30, 300),
+                    timeout=(30, read_timeout),
                 )
             logger.info("LM Studio response: stage=%s status=%s", stage, response.status_code)
             response.raise_for_status()
@@ -166,8 +258,12 @@ class LMStudioProvider(BaseLLMProvider):
             if not choices:
                 return f"[{stage}] LM Studio returned no choices."
             message = choices[0].get("message", {})
-            # Some models (e.g., qwen3) put response in reasoning_content instead of content
-            content = message.get("content") or message.get("reasoning_content") or ""
+            # NOTE: reasoning_content is chain-of-thought, NEVER report content.
+            # Observed 2026-09-28: qwen fills the whole budget with reasoning
+            # and returns content="" — dumping that into reports produced
+            # thinking-process briefs. Empty content is an error so the chain
+            # falls back instead of publishing the model's inner monologue.
+            content = message.get("content") or ""
             content = str(content or "").strip()
             # Strip <answer> tags if present (some models wrap JSON in <answer> tags)
             if content.startswith("<answer>") and content.endswith("</answer>"):

@@ -51,6 +51,26 @@ def to_local_date(value, tz_name: str = BRATISLAVA_TZ_NAME):
         return None
 
 
+_ETF_NAME_KEYWORDS = frozenset({
+    "ETF", "ETC", "UCITS", "ISHARES", "WISDOMTREE", "VANECK", "GLOBAL X",
+    "INVESCO", "DEFIANCE", "SPDR", "VANGUARD", "PHYSICAL GOLD", "PHYSICAL SILVER",
+})
+
+
+def is_etf_like(asset) -> bool:
+    """True for funds/certs (no earnings calendar) and crypto (same reason).
+
+    Name-keyword heuristic over the config asset record. Conservative: plain
+    operating companies never match (single-word tickers are not keywords).
+    """
+    if not isinstance(asset, dict):
+        return False
+    if str(asset.get("group", "") or "").strip().upper() == "CRYPTO":
+        return True
+    name = str(asset.get("name", "") or "").upper()
+    return any(kw in name for kw in _ETF_NAME_KEYWORDS)
+
+
 def filter_earnings_window(
     events,
     report_dt=None,
@@ -151,6 +171,15 @@ def _check_supported(symbol: str, purpose: str) -> str | None:
         logger.debug("Skipping %s (FETCH_FAILED this run)", s)
         return None
     if support_state(s, purpose) != SUPPORTED:
+        # Universe fallback: ISIN-discovered + existence-probed listings are
+        # admitted even when no static table covers them (never auto-guessed).
+        try:
+            from investment_engine.research.universe import is_universe_verified as _uv
+            if _uv(s):
+                logger.debug("Allowing %s via universe-verified listing", s)
+                return s
+        except Exception:
+            pass
         logger.debug("Skipping %s (%s %s)", s, support_state(s, purpose), purpose)
         return None
     return s
@@ -293,13 +322,71 @@ def fetch_technical_indicators(symbol: str, period: str = "3mo", interval: str =
         _mark_fetch_failed(symbol)
         logger.debug("yfinance technical indicators unavailable for %s: %s", symbol, exc)
     
-    # Fallback to Playwright scraper (TradingView)
+    # Fallback to Playwright scraper (TradingView) with retry and caching
     try:
         from investment_engine.config.settings import EngineSettings
         settings = EngineSettings.from_defaults()
         if getattr(settings, "use_playwright_fallback", True):
             logger.info("Falling back to Playwright scraper for %s", symbol)
-            return _fetch_technical_playwright(symbol)
+            from investment_engine.research.playwright_adapter import fetch_with_playwright
+            
+            def _tv_scraper(page, symbol):
+                """Extract technical indicators from TradingView page."""
+                # ... extract indicators from page ...
+                # This would be a simplified version of _fetch_technical_playwright
+                indicators = {}
+                
+                # RSI
+                try:
+                    rsi_el = page.query_selector('[data-name="RSI"] .value, .technicals-RSI .value')
+                    if rsi_el:
+                        indicators["RSI_14"] = float(rsi_el.inner_text().strip())
+                except Exception:
+                    pass
+                
+                # MACD
+                try:
+                    macd_el = page.query_selector('[data-name="MACD"] .value, .technicals-MACD .value')
+                    if macd_el:
+                        indicators["MACD"] = float(macd_el.inner_text().strip())
+                except Exception:
+                    pass
+                
+                # SMAs
+                for ma_period in [20, 50, 200]:
+                    try:
+                        ma_el = page.query_selector(f'[data-name="SMA{ma_period}"] .value, .technicals-SMA{ma_period} .value')
+                        if ma_el:
+                            indicators[f"SMA_{ma_period}"] = float(ma_el.inner_text().strip().replace(",", ""))
+                    except Exception:
+                        pass
+                
+                # Support/Resistance
+                try:
+                    support_el = page.query_selector('[data-name="Support"] .value, .technicals-Support .value')
+                    if support_el:
+                        indicators["Support"] = float(support_el.inner_text().strip().replace(",", ""))
+                except Exception:
+                    pass
+                
+                try:
+                    resistance_el = page.query_selector('[data-name="Resistance"] .value, .technicals-Resistance .value')
+                    if resistance_el:
+                        indicators["Resistance"] = float(resistance_el.inner_text().strip().replace(",", ""))
+                except Exception:
+                    pass
+                
+                return indicators if indicators else None
+            
+            result = fetch_with_playwright(
+                symbol,
+                _tv_scraper,
+                use_cache=True,
+                cache_ttl_hours=6,
+                max_retries=3,
+            )
+            if result:
+                return result
     except Exception as exc:
         logger.debug("Playwright fallback failed for %s: %s", symbol, exc)
     
@@ -335,11 +422,11 @@ def _fetch_technical_yfinance(symbol: str, period: str = "3mo", interval: str = 
     sma_50 = close.rolling(50).mean()
     sma_200 = close.rolling(200).mean()
     
-    # MACD
-    ema_12 = close.ewm(span=12).mean()
-    ema_26 = close.ewm(span=26).mean()
+    # MACD (Phase 3 policy A: adjust=False, same as the canonical manual engine)
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
     macd = ema_12 - ema_26
-    signal = macd.ewm(span=9).mean()
+    signal = macd.ewm(span=9, adjust=False).mean()
     macd_hist = macd - signal
     
     # Bollinger Bands
@@ -371,9 +458,22 @@ def _fetch_technical_yfinance(symbol: str, period: str = "3mo", interval: str = 
     current_support = float(recent_low.iloc[-1]) if not pd.isna(recent_low.iloc[-1]) else None
     current_resistance = float(recent_high.iloc[-1]) if not pd.isna(recent_high.iloc[-1]) else None
     current_atr = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else None
-    
+
+    # Native quote currency for this Yahoo listing (USD/EUR/GBp/DKK/...).
+    # Adaptive per-ticker interpretation downstream depends on this field:
+    # without it support/resistance cannot be compared or converted.
+    quote_ccy = ""
+    try:
+        quote_ccy = str(ticker.fast_info.get("currency", "") or "").strip().upper()
+    except Exception:
+        quote_ccy = ""
+    if quote_ccy == "GBP":
+        # yfinance reports London listings as GBp (pence-scale).
+        quote_ccy = "GBX"
+
     return {
         "price": current_price,
+        "quote_currency": quote_ccy,
         "RSI_14": round(current_rsi, 1) if current_rsi else None,
         "SMA_20": round(current_sma20, 2) if current_sma20 else None,
         "SMA_50": round(current_sma50, 2) if current_sma50 else None,
@@ -422,7 +522,7 @@ def _fetch_technical_playwright(symbol: str) -> dict | None:
                 rsi_el = page.query_selector('[data-name="RSI"] .value, .technicals-RSI .value')
                 if rsi_el:
                     indicators["RSI_14"] = float(rsi_el.inner_text().strip())
-            except:
+            except Exception:
                 pass
             
             try:
@@ -430,7 +530,7 @@ def _fetch_technical_playwright(symbol: str) -> dict | None:
                 macd_el = page.query_selector('[data-name="MACD"] .value, .technicals-MACD .value')
                 if macd_el:
                     indicators["MACD"] = float(macd_el.inner_text().strip())
-            except:
+            except Exception:
                 pass
             
             # Extract moving averages
@@ -439,7 +539,7 @@ def _fetch_technical_playwright(symbol: str) -> dict | None:
                     ma_el = page.query_selector(f'[data-name="SMA{ma_period}"] .value, .technicals-SMA{ma_period} .value')
                     if ma_el:
                         indicators[f"SMA_{ma_period}"] = float(ma_el.inner_text().strip().replace(",", ""))
-                except:
+                except Exception:
                     pass
             
             # Support/Resistance
@@ -447,14 +547,14 @@ def _fetch_technical_playwright(symbol: str) -> dict | None:
                 support_el = page.query_selector('[data-name="Support"] .value, .technicals-Support .value')
                 if support_el:
                     indicators["Support"] = float(support_el.inner_text().strip().replace(",", ""))
-            except:
+            except Exception:
                 pass
             
             try:
                 resistance_el = page.query_selector('[data-name="Resistance"] .value, .technicals-Resistance .value')
                 if resistance_el:
                     indicators["Resistance"] = float(resistance_el.inner_text().strip().replace(",", ""))
-            except:
+            except Exception:
                 pass
             
             browser.close()
@@ -509,3 +609,60 @@ def _yahoo_to_tradingview(symbol: str) -> str:
         return symbol.replace(".AX", ":ASX")
     # US symbols - TradingView uses them directly
     return symbol
+
+
+def fetch_dividend_summary(symbol: str) -> dict | None:
+    """Trailing-12M dividend summary for a resolved Yahoo symbol (yfinance).
+
+    Returns {"ttm_per_share", "yield_pct", "last_ex_date", "payments_12m"}
+    or None when the symbol paid nothing / data is missing. Yield uses the
+    latest close as denominator. Never raises; no Playwright fallback
+    (dividends are a cheap single call — failure stays a miss).
+    """
+    try:
+        symbol = _assert_resolved_yahoo(symbol)
+    except ValueError:
+        return None
+    if _check_supported(symbol, "market_data") is None:
+        return None
+    try:
+        import yfinance as yf
+
+        ticker = yf.Ticker(symbol)
+        divs = ticker.dividends
+        if divs is None or getattr(divs, "empty", True):
+            return None
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=365)
+        try:
+            import pandas as _pd
+
+            idx = _pd.DatetimeIndex(_pd.to_datetime(divs.index, utc=True))
+            mask = [bool(m) for m in (idx >= _pd.Timestamp(cutoff))]
+            recent = divs[mask] if len(mask) == len(divs) else divs
+        except Exception:
+            recent = divs
+        try:
+            ttm = round(float(recent.sum()), 4)
+        except Exception:
+            return None
+        if ttm <= 0:
+            return None
+        try:
+            hist = ticker.history(period="5d", interval="1d")
+            price = float(hist["Close"].iloc[-1]) if hist is not None and not hist.empty else 0.0
+        except Exception:
+            price = 0.0
+        try:
+            last_ex = str(recent.index[-1].date().isoformat())
+        except Exception:
+            last_ex = ""
+        return {
+            "ttm_per_share": ttm,
+            "yield_pct": round(ttm / price * 100.0, 2) if price > 0 else None,
+            "last_ex_date": last_ex,
+            "payments_12m": int(len(recent)),
+        }
+    except Exception as exc:
+        logger.debug("Dividend summary unavailable for %s: %s", symbol, exc)
+        return None

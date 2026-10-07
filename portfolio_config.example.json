@@ -1,0 +1,62 @@
+{
+  "settings": {
+    "language": "English",
+    "output_folder": "reports",
+    "archive_folder": "reports/archive",
+    "cache_folder": "data/cache",
+    "log_folder": "logs",
+    "provider": "lmstudio",
+    "lmstudio_enabled": true,
+    "execution_mode": "auto",
+    "decision_model": "qwen3.8-9b",
+    "writer_model": "google/gemma-4-12b",
+    "lm_studio_base_url": "http://100.88.219.120:1234/v1",
+    "llamacpp_base_url": "http://100.125.47.31:11435/v1",
+    "ollama_base_url": "http://100.125.47.31:11434",
+    "use_trading212_api": false,
+    "t212_reconciliation_threshold_pct": 0.1,
+    "use_playwright_fallback": false,
+    "market_regime": {
+      "enabled": true,
+      "symbol": "EXI2.DE",
+      "news": {
+        "max_age_hours": 48,
+        "min_relevance_score": 30,
+        "max_articles_per_symbol": 5
+      }
+    }
+  },
+  "assets": [
+    {
+      "broker_symbol": "AAPL_US_EQ",
+      "yahoo_symbol": "AAPL",
+      "name": "Apple Inc (DEMO)",
+      "group": "tech",
+      "quantity": 1.0,
+      "average_price": 150.0,
+      "enabled": true
+    },
+    {
+      "broker_symbol": "MSFT_US_EQ",
+      "yahoo_symbol": "MSFT",
+      "name": "Microsoft Corp (DEMO)",
+      "group": "tech",
+      "quantity": 1.0,
+      "average_price": 300.0,
+      "enabled": true
+    },
+    {
+      "broker_symbol": "BTCUSD",
+      "yahoo_symbol": "BTC-USD",
+      "name": "Bitcoin (DEMO)",
+      "group": "crypto",
+      "quantity": 0.01,
+      "average_price": 60000.0,
+      "enabled": true
+    }
+  ],
+  "portfolio_rules": {},
+  "symbol_aliases": {
+    "AAPL": "AAPL"
+  }
+}

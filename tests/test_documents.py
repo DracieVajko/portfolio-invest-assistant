@@ -234,10 +234,11 @@ def test_news_age_boundaries():
         _rec("AAPL misses guidance badly", url="https://example.com/b", hours_ago=48 + 1 / 60),
     ]}
     out = filter_decision_news(recs, owned={"AAPL"}, relevance_min=30, now=now)
-    # Items older than max_age_hours (default 72) should be excluded
-    # The second item is 48h+1m old, which is within 72h default
-    # Test verifies the boundary logic works
-    assert len(out) >= 1  # At least the recent one
+    # Phase 5 policy: decision-relevant items are at most 48h old (default).
+    # The first item (47h59m) is kept; the second (48h01m) is excluded.
+    titles = [r["title"] for r in out]
+    assert "AAPL beats earnings expectations" in titles
+    assert "AAPL misses guidance badly" not in titles
 
 
 def test_news_dedupe_clickbait_and_macro():

@@ -263,3 +263,66 @@ def test_dedupe_thread_safe():
     with ThreadPoolExecutor(max_workers=4) as ex:
         results = list(ex.map(_work, chunks))
     assert sum(len(r) for r in results) == 10
+
+
+def test_tvnews_record_carries_relevance_score():
+    """TV per-symbol headlines must survive the decision-news relevance gate.
+
+    Run ccb9a975: 67 TV items entered news_by_symbol with no relevance_score
+    key -> filter read default 0 -> below_relevance. Same 70 precedent as
+    the sibling TradingView sweep adapter.
+    """
+    import time
+
+    from investment_engine.research.corpus.adapters_tvnews import _item_to_record
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+    rec = _item_to_record(
+        "AAPL",
+        {"title": "Apple beats earnings", "link": "https://example.com/a",
+         "published": time.time(), "provider": "Dow Jones"},
+        cutoff,
+    )
+    assert rec is not None
+    assert int(rec.get("relevance_score", 0) or 0) >= 60
+
+
+def test_rss_fallback_records_carry_relevance_score(monkeypatch):
+    """RSS fallback dicts must carry relevance_score (same gate starvation)."""
+    import email.utils as _eu
+
+    from investment_engine.research import news_sources as ns
+
+    fetcher = ns.EnhancedNewsFetcher(enable_slovak=False, enable_reddit=False)
+
+    entry = {"title": "Apple stock market rally on earnings", "link": "https://example.com/a",
+             "summary": "Apple stock market update",
+             "published_parsed": time.localtime(),
+             "published": _eu.formatdate(time.time(), usegmt=True)}
+
+    class _Feed:
+        entries = [entry]
+
+    class _Resp:
+        content = b"<rss/>"
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(fetcher._session, "get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(ns.feedparser, "parse", lambda content: _Feed())
+    out = fetcher.fetch_rss_fallbacks(["Apple", "stock market"], limit_total=4)
+    assert out, "expected at least one keyword-matched RSS item"
+    assert all(int(r.get("relevance_score", 0) or 0) >= 60 for r in out)
+
+
+def test_decision_filter_keeps_scored_tv_item():
+    """End-to-end gate check: scored + linked + fresh TV-shaped record passes."""
+    from investment_engine.research.news_engine import filter_decision_news as f
+
+    now = datetime.now(timezone.utc) - timedelta(hours=5)
+    rec = {"title": "Apple beats earnings expectations", "url": "https://example.com/a",
+           "source": "TradingView/Dow Jones", "published_dt": now,
+           "relevance_score": 70, "symbol_key": "AAPL", "symbol": "AAPL"}
+    out = f({"AAPL": [rec]}, owned={"AAPL"}, relevance_min=60, stats={})
+    assert len(out) == 1 and out[0]["title"].startswith("Apple beats")

@@ -478,6 +478,130 @@ def resolve_fx_rate(
     return None, "unresolved"
 
 
+# Quote codes that denote pence-scale prices (broker GBX, Yahoo GBp, misc).
+# Both must be divided by 100 before any FX lookup or EUR comparison.
+# (normalize_quote_currency maps Yahoo 'GBp' -> 'GBX' first, so 'GBP'
+# never reaches this set from either feed.)
+PENCE_UNITS = frozenset({"GBX", "GBXP", "PENCE", "P"})
+
+
+def normalize_quote_currency(ccy: object) -> str:
+    """Canonical quote code: Yahoo 'GBp' -> broker-style 'GBX', else upper-cased.
+
+    Both feeds quote London listings in pence; unifying the code lets the
+    VERIFIED-gate compare broker vs Yahoo natives without unit mismatch.
+    Genuine pound quotes ('GBP' major) do not occur on either feed.
+    """
+    c = str(ccy or "").strip().upper()
+    if c == "GBP":
+        return "GBX"
+    return c
+
+
+def convert_to_eur(
+    amount: object,
+    ccy: object,
+    live_rates: Optional[Dict[str, float]] = None,
+    *,
+    pence: Optional[bool] = None,
+) -> Tuple[Optional[float], str]:
+    """Adaptive per-ticker conversion of a native-denominated level to EUR.
+
+    Handles pence-scale quotes (GBX/GBp/PENCE: /100 first), EUR passthrough,
+    and the live -> static FX hierarchy via resolve_fx_rate. ``pence``
+    overrides the automatic unit detection (None = from the code): needed
+    when a feed labels pound-scale history as pence (seen live: Yahoo
+    "GBp" on pound-scale LITM.L history).
+
+    Returns (value_eur_rounded, status) with status in
+    {"EUR", "live-fx", "static-fallback", "unresolved", "invalid"}.
+    Never raises.
+    """
+    try:
+        import math as _math
+        v = float(amount)  # type: ignore[arg-type]
+        if not _math.isfinite(v):
+            return None, "invalid"
+    except (TypeError, ValueError):
+        return None, "invalid"
+    c = normalize_quote_currency(ccy) or "EUR"
+    is_pence = (c in PENCE_UNITS) if pence is None else bool(pence)
+    if is_pence:
+        v = v / 100.0
+        c = "GBP"
+    if c == "EUR":
+        return round(v, 2), "EUR"
+    try:
+        rate, src = resolve_fx_rate(c, live_rates or {})
+    except Exception:
+        return None, "unresolved"
+    if rate is None:
+        return None, "unresolved"
+    try:
+        return round(v * float(rate), 2), ("live-fx" if src == "live-fx" else "static-fallback")
+    except (TypeError, ValueError):
+        return None, "invalid"
+
+
+# Converted S/R must sit within this band around the broker EUR price;
+# outside it the unit assumption is wrong, not the market.
+_ANCHOR_BAND_LO = 0.05
+_ANCHOR_BAND_HI = 20.0
+
+
+def anchor_levels_to_eur(
+    support: object,
+    resistance: object,
+    ccy: object,
+    broker_price_eur: object,
+    live_rates: Optional[Dict[str, float]] = None,
+) -> Tuple[Optional[float], Optional[float], str]:
+    """Convert native S/R to EUR, anchored against the broker EUR price.
+
+    Primary interpretation first; when a pence-family code is present and
+    the primary lands outside the anchor band (Yahoo GBp label on
+    pound-scale history — LITM.L: 5.34 labelled GBX at a EUR 6.27 price),
+    retry as major units and keep whichever fits. When neither fits,
+    (None, None, "suspect") so renderers show n/a instead of garbage.
+    Never raises.
+    """
+    try:
+        from_code = normalize_quote_currency(ccy) or "EUR"
+    except Exception:
+        from_code = "EUR"
+    sup, sup_st = convert_to_eur(support, ccy, live_rates)
+    res, res_st = convert_to_eur(resistance, ccy, live_rates)
+    status = sup_st if sup_st == res_st else f"{sup_st}/{res_st}"
+    try:
+        import math as _math
+        price = float(broker_price_eur)  # type: ignore[arg-type]
+        if not _math.isfinite(price) or price <= 0:
+            return sup, res, status
+    except (TypeError, ValueError):
+        return sup, res, status
+
+    def _fits(v) -> bool:
+        try:
+            r = float(v) / price
+            return _ANCHOR_BAND_LO <= r <= _ANCHOR_BAND_HI
+        except (TypeError, ValueError, ZeroDivisionError):
+            return True  # missing level never vetoes
+
+    present = [v for v in (sup, res) if v is not None]
+    if present and all(_fits(v) for v in present):
+        return sup, res, status
+    if present and from_code in PENCE_UNITS:
+        alt_sup, alt_sup_st = convert_to_eur(support, ccy, live_rates, pence=False)
+        alt_res, alt_res_st = convert_to_eur(resistance, ccy, live_rates, pence=False)
+        alt_present = [v for v in (alt_sup, alt_res) if v is not None]
+        if alt_present and all(_fits(v) for v in alt_present):
+            alt_status = alt_sup_st if alt_sup_st == alt_res_st else f"{alt_sup_st}/{alt_res_st}"
+            return alt_sup, alt_res, f"{alt_status} (unit corrected {from_code}->GBP)"
+    if present:
+        return None, None, "suspect"
+    return None, None, status
+
+
 # ---------------------------------------------------------------------------
 # Snapshot builder (raw broker payloads in, normalized model out)
 # ---------------------------------------------------------------------------
@@ -674,7 +798,7 @@ def _resolve_currency(
         return ccy, ccy, "broker_metadata"
     try:
         from investment_engine.portfolio.symbols import to_display_symbol as _td
-        from trading212_portfolio import INSTRUMENT_CURRENCY_OVERRIDES as _ov
+        from trading212.portfolio import INSTRUMENT_CURRENCY_OVERRIDES as _ov
         disp = _td(ticker)
         for cand in (ticker, disp):
             if cand in _ov:
@@ -689,30 +813,66 @@ def _resolve_currency(
 # Dedupe + reconciliation
 # ---------------------------------------------------------------------------
 
-def dedupe_key(account_id: str, isin: Optional[str], broker_instrument_id: str) -> Tuple[str, str]:
-    """Primary: (account_id, isin); without ISIN: (account_id, broker_instrument_id)."""
+def _lot_suffix(quantity: Any = None, average_price: Any = None) -> str:
+    """Lot identity for same-ISIN positions. Returns "" when unavailable.
+
+    Two rows for one ISIN merge ONLY on identical (quantity, average price):
+    that is the signature of an API-mirrored row. Distinct lots (different
+    qty/avg — e.g. separate buys of AAPL on two venues) are real holdings and
+    must both count. Limitation: two genuinely distinct lots with bitwise
+    identical qty+avg merge (the API exposes no lot IDs); documented, rare.
+    """
+    try:
+        q: Any = float(quantity)
+        a: Any = float(average_price)
+    except (TypeError, ValueError):
+        return ""
+    if q != q or a != a:  # NaN never identifies a lot
+        return ""
+    import math as _math
+    if not (_math.isfinite(q) and _math.isfinite(a)):
+        return ""
+    return f"{q:.8f}|{a:.8f}"
+
+
+def dedupe_key(account_id: str, isin: Optional[str], broker_instrument_id: str,
+               quantity: Any = None, average_price: Any = None) -> Tuple[str, ...]:
+    """Primary: (account_id, isin[, lot]); without ISIN: (account_id, broker_id).
+
+    Backward compatible: callers passing only (account, isin, broker_id) get
+    the previous shapes — 2-tuple without ISIN, and (account, isin) when lot
+    data is unavailable.
+    """
+    account = str(account_id or "default")
     isin_norm = (isin or "").strip().upper()
     if isin_norm:
-        return (str(account_id or "default"), isin_norm)
-    return (str(account_id or "default"), str(broker_instrument_id or "").strip().upper())
+        lot = _lot_suffix(quantity, average_price)
+        if lot:
+            return (account, isin_norm, lot)
+        return (account, isin_norm)
+    return (account, str(broker_instrument_id or "").strip().upper())
 
 
 def deduplicate_positions(
     positions: List[BrokerPosition], account_id: str = "default"
 ) -> Tuple[List[BrokerPosition], List[BrokerPosition]]:
-    """Dedupe by (account_id, isin|instrument_id). First wins, never summed.
+    """Dedupe by (account_id, isin[, lot]|instrument_id). First wins, never summed.
 
+    Same-ISIN rows merge only on identical lot identity (quantity +
+    average price); distinct lots are distinct holdings and both count.
     Returns (unique, duplicates). Duplicates carry duplicate_of + reason.
     """
-    seen: Dict[Tuple[str, str], BrokerPosition] = {}
+    seen: Dict[Tuple[str, ...], BrokerPosition] = {}
     unique: List[BrokerPosition] = []
     duplicates: List[BrokerPosition] = []
     for pos in positions:
-        key = dedupe_key(account_id, pos.instrument.isin, pos.instrument.broker_instrument_id)
+        key = dedupe_key(account_id, pos.instrument.isin, pos.instrument.broker_instrument_id,
+                         pos.quantity, pos.average_price_raw)
         if key in seen:
             pos.included_in_position_total = False
             pos.duplicate_of = f"{key[0]}:{key[1]}"
-            pos.exclusion_reason = "duplicate instrument (same ISIN/broker ID) — kept first occurrence, not summed"
+            pos.exclusion_reason = ("duplicate instrument row (same ISIN/broker ID and lot) — "
+                                    "kept first occurrence, not summed")
             duplicates.append(pos)
         else:
             seen[key] = pos

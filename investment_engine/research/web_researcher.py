@@ -383,7 +383,21 @@ class WebResearcher:
     # 3. ALL Earnings (Finviz + EarningsHub only)
     # -------------------------------------------------------------------------
     async def fetch_all_earnings(self, days_ahead: int = 7) -> list[EarningsEvent]:
-        """Fetch and merge earnings from Finviz and EarningsHub only."""
+        """Fetch and merge earnings from Finviz and EarningsHub only.
+
+        NOTE (verified 2026-09-26, plain HTTPS GET, no browser): none of the
+        candidate no-browser replacements carry static data, so they are
+        deliberately NOT scraped here — no blind scrapers:
+          - investingcalendar.com/earnings-calendar?date=YYYY-MM-DD returns
+            200 but zero <table>/<tr> rows and no JSON payload (JS-rendered,
+            behind a Cloudflare challenge-platform script);
+          - finviz.com/calendar/earnings?dateFrom=YYYY-MM-DD returns 200 but
+            only the nav shell (no earnings table without JS/XHR);
+          - TradingView scanner calendar endpoint is undocumented (payload
+            shape unverifiable without guessing).
+        Order therefore stays: Yahoo fast path (main.py) -> this Playwright
+        layer -> merge. Revisit only with a verified static endpoint.
+        """
         tasks = [
             self.fetch_finviz_earnings(days_ahead),
             self.fetch_earnings_hub(days_ahead),
@@ -505,6 +519,25 @@ class WebResearcher:
                     data.financials_revenue_to_profit = await self._extract_financials_quadrant(page, "Revenue to profit")
                     data.financials_debt_coverage = await self._extract_financials_quadrant(page, "Debt level")
                     data.financials_earnings = await self._extract_financials_quadrant(page, "Earnings")
+
+                # 6. Text fallback: CSS selectors drift while body text stays
+                # stable. Fills only fields the selector path left empty.
+                if not data.price or not data.technicals_rating or not data.analyst_rating or not data.key_facts_today:
+                    try:
+                        body_text = await page.inner_text("body")
+                        fallback = extract_tv_text_signals(body_text or "", symbol)
+                        if data.price is None and fallback.get("price") is not None:
+                            data.price = fallback["price"]
+                        if data.change_pct is None and fallback.get("change_pct") is not None:
+                            data.change_pct = fallback["change_pct"]
+                        if not data.technicals_rating and fallback.get("technicals_rating"):
+                            data.technicals_rating = fallback["technicals_rating"]
+                        if not data.analyst_rating and fallback.get("analyst_rating"):
+                            data.analyst_rating = fallback["analyst_rating"]
+                        if not data.key_facts_today and fallback.get("key_facts_today"):
+                            data.key_facts_today = fallback["key_facts_today"]
+                    except Exception as e:
+                        logger.debug("TV text fallback failed for %s: %s", symbol, e)
 
                 self._save_cache(cache_name, data.to_dict())
                 return data
@@ -734,6 +767,64 @@ class WebResearcher:
         return script
 
 
+_TV_WS = r"[\s\ufeff|]*"
+_TV_RATINGS = ("Strong Buy", "Buy", "Neutral", "Sell", "Strong Sell")
+
+
+def extract_tv_text_signals(page_text: str, symbol: str) -> dict:
+    """Extract TradingView signals from rendered body text (pure function).
+
+    Selector-proof fallback: matches the stable text blocks (header quote,
+    gauge summaries, key-facts carousel) instead of CSS classes. Never raises.
+    Returns any subset of {price, change_pct, technicals_rating,
+    analyst_rating, key_facts_today}.
+    """
+    out: dict = {}
+    try:
+        text = str(page_text or "")
+        if not text:
+            return out
+        sym = re.escape(str(symbol or "").strip().upper())
+        # Header quote: "AAPL 341.07 USD +5.15 +1.53%" (first 2000 chars).
+        head = text[:2000]
+        m = re.search(sym + _TV_WS + r"([\d,\.]+)" + _TV_WS + r"([A-Z]{3})", head)
+        if m:
+            try:
+                out["price"] = float(m.group(1).replace(",", ""))
+            except (TypeError, ValueError):
+                pass
+            m2 = re.search(r"([+-][\d,\.]+%)", head[m.end():m.end() + 40])
+            if m2:
+                out["change_pct"] = m2.group(1)
+        # Gauge summaries. Tight local windows on purpose: a loose pattern can
+        # match a label in one block with the rating of another ("Analyst
+        # rating" tab text followed 89 chars later by the Technicals gauge).
+        # [^|] never crosses a "|" block separator.
+        _gauge = r"\|\s*(Strong Buy|Buy|Neutral|Sell|Strong Sell)"
+        m = re.search(r"Technicals\s*[\W_]+\s*Summarizing[^|]{0,150}" + _gauge,
+                      text, re.IGNORECASE)
+        if m:
+            out["technicals_rating"] = m.group(1)
+        m = re.search(r"Analyst rating\s*[\W_]+\s*An aggregate view[^|]{0,150}" + _gauge,
+                      text, re.IGNORECASE)
+        if m:
+            out["analyst_rating"] = m.group(1)
+        # Key-facts carousel: "Key facts today | fact1. | fact2. | N | ...".
+        # Counters ("| 1 |") are dropped; up to 3 facts are kept.
+        m = re.search(r"Key facts today", text)
+        if m:
+            segment = text[m.end():m.end() + 1500]
+            parts = [p.strip(" |;\u2014-\u2013") for p in segment.split("|")]
+            facts = [p for p in parts
+                     if len(p) > 25 and not re.fullmatch(r"[\d\s.,%\-–—]+", p)
+                     and re.search(r"[.!?]\s*$", p)]
+            if facts:
+                out["key_facts_today"] = "; ".join(facts[:3])[:600]
+    except Exception:
+        pass
+    return out
+
+
 # -------------------------------------------------------------------------
 # Synchronous wrappers
 # -------------------------------------------------------------------------
@@ -758,6 +849,25 @@ def fetch_all_earnings_sync(days_ahead: int = 7) -> list[EarningsEvent]:
     async def _run():
         async with WebResearcher() as researcher:
             return await researcher.fetch_all_earnings(days_ahead)
+    return run_web_research(_run())
+
+
+def fetch_tradingview_symbols_sync(
+    symbols: list[tuple[str, str]],
+    include_financials: bool = True,
+    headless: bool = True,
+    timeout_ms: int = 30000,
+    max_concurrent: int = 1,
+) -> list[TradingViewSymbolData]:
+    """Sync entry for the automatic sweep: one TradingView page load per symbol.
+
+    Serial by default (max_concurrent=1) to stay polite. Raises RuntimeError
+    when playwright/browser is missing — callers MUST catch and degrade.
+    """
+    async def _run():
+        async with WebResearcher(headless=headless, timeout_ms=timeout_ms,
+                                 max_concurrent=max_concurrent) as researcher:
+            return await researcher.fetch_tradingview_symbols_batch(symbols, include_financials)
     return run_web_research(_run())
 
 

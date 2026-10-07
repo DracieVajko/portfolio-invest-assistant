@@ -123,6 +123,8 @@ class ChainedFallbackProvider(BaseLLMProvider):
         if not providers:
             raise ValueError("ChainedFallbackProvider requires at least one provider")
         self.providers = providers
+        # Phase 4 attribution hint (read by providers.attribution.apply_chain_hint).
+        self.last_attribution: dict = {}
 
     @property
     def name(self) -> str:
@@ -143,7 +145,8 @@ class ChainedFallbackProvider(BaseLLMProvider):
         clean_context = {k: v for k, v in (context or {}).items() if k != "model"} if context else {}
         last_exc: Exception | None = None
         last_result: str | None = None
-        for provider in self._eligible():
+        self.last_attribution = {}
+        for depth, provider in enumerate(self._eligible()):
             try:
                 result = provider.generate(prompt, stage=stage, context=clean_context)
                 if _is_error_result(result, stage):
@@ -153,8 +156,10 @@ class ChainedFallbackProvider(BaseLLMProvider):
                     self._trip_breaker(provider, result)
                     continue
                 model = _provider_model(provider)
-                logger.info("ChainedFallback: provider %s%s succeeded at stage %s",
-                            provider.name, f" model={model}" if model else "", stage)
+                logger.info("ChainedFallback: provider %s%s succeeded at stage %s (served_model=%s fallback_depth=%d)",
+                            provider.name, f" model={model}" if model else "", stage,
+                            model or provider.name, depth)
+                self.last_attribution = {"provider": provider.name, "model": model or provider.name, "depth": depth}
                 return result
             except Exception as exc:
                 logger.warning("ChainedFallback: provider %s failed: %s", provider.name, exc)
@@ -172,7 +177,7 @@ class ChainedFallbackProvider(BaseLLMProvider):
         """Skip dead providers for the rest of the run (concise, no traceback)."""
         global _GEMINI_SKIP_UNTIL
         name = provider.name
-        if name in ("LM Studio", "Ollama"):
+        if name in ("LM Studio", "Ollama", "llama.cpp"):
             if name not in _SKIP_REST_OF_RUN:
                 _SKIP_REST_OF_RUN.add(name)
                 logger.info("CircuitBreaker: skipping %s for the rest of the run", name)

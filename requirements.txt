@@ -1,22 +1,42 @@
-# Core dependencies
-requests>=2.31.0
-yfinance>=1.6.0
-pandas>=2.0.0
-ddgs>=0.2.0
-python-dotenv>=1.0.0
-pydantic>=2.0.0
+# Phase 0 policy: Python 3.12 runtime (see README).
+# Pinned 2026-09-28: pandas 2.2.x + numpy 1.26.x + scipy 1.13.x is the only
+# verified combo. pandas 3.x breaks the frozen manual-v1 numerics and
+# pandas-ta is archived/incompatible — manual engine stays canonical.
+# Upper bounds below keep `pip install` reproducible (no surprise majors).
+#
+# --- Core (required; verify_environment.py fails without these) ---
+requests>=2.31.0,<3
+yfinance>=1.6.0,<1.8
+pandas==2.2.3
+numpy==1.26.4
+scipy==1.13.1
+ddgs>=0.2.0,<10
+python-dotenv>=1.0.0,<2
+pydantic>=2.0.0,<3
+feedparser>=6.0.10,<7
+finvizfinance>=1.0.0,<2
+tzdata>=2022.0,<2027  # Windows-safe zoneinfo database (Europe/Bratislava); no-op on most Linux/macOS
 
+# --- Browser (Playwright): installed, browser binary via install script ---
+# Pip package is required for the TradingView sweep + earnings layer 2 +
+# technicals fallback. The Chromium binary itself is fetched once per machine:
+#   py -3.12 -m playwright install chromium
+# All Playwright paths degrade gracefully when the browser is missing.
+playwright>=1.40.0
+
+# --- Optional technical (validation/reference only; never required) ---
 # Technical analysis (requires Python 3.12+ for numba)
 # pandas-ta>=0.4.71b0  # Requires Python 3.12+ for numba
-scipy>=1.10.0
-numpy>=1.24.0
-
-# News & data enrichment
-feedparser>=6.0.10
-finvizfinance>=1.0.0
+# NOTE: pandas-ta is archived/incompatible with the pinned pandas 2.2.3 +
+# numpy 1.26.4 + scipy 1.13.1 combo. The manual indicator engine in
+# investment_engine/research/technical_analysis.py stays canonical; the
+# "pandas-ta not installed" warning is expected and harmless.
 
 # Optional: TA-Lib for 60+ candlestick patterns (requires Visual C++ Build Tools on Windows)
 # ta-lib>=0.4.24  # pip install ta-lib (needs: brew install ta-lib / apt-get install libta-lib-dev)
+
+# (Playwright browser binary: see Browser section above. Without the binary the
+# sweep degrades gracefully and continues with Yahoo/RSS data only.)
 
 # Optional: FinBERT for better sentiment (uncomment if needed)
 # transformers>=4.30.0

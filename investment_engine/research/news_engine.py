@@ -222,6 +222,19 @@ class NewsItem:
     query: str
 
 
+def _slovak_status(exc: Exception) -> int | None:
+    """HTTP status of a requests failure, else None."""
+    try:
+        return int(getattr(getattr(exc, "response", None), "status_code", 0) or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def _slovak_hard_failure(exc: Exception) -> bool:
+    """403/404 mean the feed is gone/blocked: disable the site for the run."""
+    return _slovak_status(exc) in (403, 404)
+
+
 class StrictNewsFetcher:
     """
     Fetches news with STRICT temporal validation.
@@ -252,6 +265,8 @@ class StrictNewsFetcher:
         self._query_cache = {}
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "PortfolioAI/2.0"})
+        # Slovak sites with a hard failure (HTTP 403/404) stay disabled rest of run.
+        self._slovak_disabled: set[str] = set()
 
     @classmethod
     def from_settings(cls, settings=None, **overrides):
@@ -526,12 +541,15 @@ class StrictNewsFetcher:
         self.reset_run_state()
 
     # -----------------------------------------------------------------
-    # Slovak news sites (sme.sk, pravda.sk, aktuality.sk)
+    # Slovak news sites (Aktuality, Pravda, TERAZ/TASR, Google News SK).
+    # Verified live 2026-09-26 (all HTTP 200 + XML). SME's rss.sme.sk
+    # endpoint is dead (HTTP 403, robots-blocked) and was removed;
+    # Pravda moved from /rss/ (404) to /spravy/rss/xml (200).
     # -----------------------------------------------------------------
 
     def fetch_slovak_news(self, symbols: list[str] | None = None,
                           companies: list[str] | None = None) -> list[NewsItem]:
-        """Fetch news from Slovak news sites (sme.sk, pravda.sk, aktuality.sk).
+        """Fetch news from Slovak news sites.
 
         Filters by symbols/company names if provided.
         """
@@ -539,17 +557,26 @@ class StrictNewsFetcher:
         cutoff = datetime.now(timezone.utc) - self.max_age
         all_items: list[NewsItem] = []
         _slovak_sites = [
-            ("SME", "https://www.sme.sk/rss/aktuality/"),
-            ("Pravda", "https://www.pravda.sk/rss/"),
             ("Aktuality", "https://www.aktuality.sk/rss/"),
+            ("Pravda", "https://www.pravda.sk/spravy/rss/xml"),
+            ("TERAZ", "https://www.teraz.sk/rss/vsetky-spravy.rss"),
+            ("Google News", "https://news.google.com/rss?hl=sk&gl=SK&ceid=SK:sk"),
         ]
         for source_name, rss_url in _slovak_sites:
+            if source_name in self._slovak_disabled:
+                continue
             try:
                 resp = self._session.get(rss_url, timeout=self.timeout)
                 resp.raise_for_status()
                 feed = _fp.parse(resp.content)
             except Exception as exc:
-                logger.debug("Slovak news fetch failed for %s: %s", source_name, exc)
+                if _slovak_hard_failure(exc):
+                    self._slovak_disabled.add(source_name)
+                    logger.warning("Slovak source unavailable: %s (HTTP %s); "
+                                   "disabled for the rest of the run",
+                                   source_name, _slovak_status(exc))
+                else:
+                    logger.debug("Slovak news fetch failed for %s: %s", source_name, exc)
                 continue
             for entry in feed.entries:
                 try:
@@ -894,7 +921,11 @@ def symbol_sentiment_line(symbol, items):
         if isinstance(it, NewsItem):
             norm.append(it)
         elif isinstance(it, dict):
-            dt = _item_published_dt(it) or now
+            # Phase 5: undated items must not borrow "now" (that would fake
+            # freshness); they are excluded from sentiment aggregation.
+            dt = _item_published_dt(it)
+            if dt is None:
+                continue
             norm.append(
                 NewsItem(
                     title=str(it.get("title", "")), url=str(it.get("url", "")),
@@ -1113,18 +1144,25 @@ def filter_decision_news(
     earnings=None,
     names=None,
     relevance_min=30,
-    max_age_hours=72,
+    max_age_hours=48,
     now=None,
     macro_keys=("MACRO", "CRYPTO-MACRO", "TRUMP", "SPY", "BTC"),
     include_macro_unlinked=True,
     min_tier_for_unlinked=1,
+    stats: dict | None = None,
 ):
     """Central decision-news filter for the daily brief.
 
-    Keeps fetched records newer than max_age_hours tied to an owned position,
-    a held PIE constituent, a watchlist candidate, or an earnings event.
+    Phase 5 policy: decision-relevant items are at most 48h old. Keeps fetched
+    records newer than max_age_hours tied to an owned position, a held PIE
+    constituent, a watchlist candidate, or an earnings event. Older materials
+    belong to explicitly labelled BACKGROUND sets (see research.corpus).
     Macro records (SPY, BTC, TRUMP) are included even without held links
     if from tier 0-1 sources (official/wire).
+
+    When ``stats`` is given, it is filled with per-stage dropout counts
+    (input/title_url/relevance/age/link/output) so runs can log exactly
+    where candidate news is rejected.
     """
     owned = {str(x).strip().upper() for x in (owned or set()) if x}
     constituents = {str(x).strip().upper() for x in (constituents or set()) if x}
@@ -1140,22 +1178,28 @@ def filter_decision_news(
         flat = [(r.get("symbol_key", r.get("symbol", "")), r) for r in (news_by_symbol or [])]
 
     best = {}
+    _st = {"input": 0, "no_title_url": 0, "below_relevance": 0,
+           "too_old": 0, "unlinked": 0, "kept": 0}
     for symbol_key, record in flat:
         if not isinstance(record, dict):
             continue
+        _st["input"] += 1
         title = str(record.get("title", "") or "").strip()
         url = str(record.get("url", "") or "").strip()
         source = str(record.get("source", "") or "unknown").strip()
         if not title or not canonical_url(url):
+            _st["no_title_url"] += 1
             continue
         try:
             relevance = int(record.get("relevance_score", 0) or 0)
         except (TypeError, ValueError):
             relevance = 0
         if relevance < relevance_min:
+            _st["below_relevance"] += 1
             continue
         pub_dt = _record_published_dt(record)
         if pub_dt is None or (now_utc - pub_dt) >= timedelta(hours=max_age_hours):
+            _st["too_old"] += 1
             continue
         links = _record_links(title, symbol_key, owned, constituents, watchlist, earnings, names or {})
         sym_upper = str(symbol_key or "").strip().upper()
@@ -1165,8 +1209,10 @@ def filter_decision_news(
             if tier <= min_tier_for_unlinked:
                 links = {"MACRO"}
             else:
+                _st["unlinked"] += 1
                 continue
         elif not links:
+            _st["unlinked"] += 1
             continue
         tier = source_tier(source, url)
         key = news_dedupe_key(title, source, pub_dt.date().isoformat(), url)
@@ -1192,4 +1238,7 @@ def filter_decision_news(
         out.append({"title": r["title"], "url": r["url"], "source": r["source"],
                     "published": r["published_dt"].strftime("%Y-%m-%d %H:%M UTC"),
                     "age": age, "tier": r["tier"], "links": r["links"], "why": why})
+    _st["kept"] = len(out)
+    if stats is not None and isinstance(stats, dict):
+        stats.update(_st)
     return out
