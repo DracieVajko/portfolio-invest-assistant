@@ -487,31 +487,40 @@ class WebResearcher:
                 except Exception as e:
                     logger.debug("Key facts extraction failed for %s: %s", symbol, e)
 
-                # 3. Technicals Rating (gauge)
-                try:
-                    # Look for the gauge with "Technicals" label
-                    tech_section = await page.query_selector('text="Technicals" >> .. >> ..')
-                    if tech_section:
-                        gauge_text = await tech_section.inner_text()
-                        # Extract rating: Strong sell, Sell, Neutral, Buy, Strong buy
-                        for rating in ["Strong buy", "Buy", "Neutral", "Sell", "Strong sell"]:
-                            if rating.lower() in gauge_text.lower():
-                                data.technicals_rating = rating
-                                break
-                except Exception as e:
-                    logger.debug("Technicals extraction failed for %s: %s", symbol, e)
+                # 3-4. Gauge ratings via CSS. Wrapped in a helper: the
+                # overview page only carries the "Technicals" NAV TAB (no
+                # values) — the live gauge lives on the /technicals/ subpage
+                # (probed 2026-10-10: overview body has price/facts but no
+                # gauge ratings, hence sweep counted 0 technicals).
+                async def _read_gauges(pg):
+                    try:
+                        tech_section = await pg.query_selector('text="Technicals" >> .. >> ..')
+                        if tech_section:
+                            gauge_text = await tech_section.inner_text()
+                            # Skip bare nav-tab matches: a real gauge block
+                            # names its summary ("Summarizing...").
+                            if "summarizing" in gauge_text.lower():
+                                for rating in ["Strong buy", "Buy", "Neutral", "Sell", "Strong sell"]:
+                                    if rating.lower() in gauge_text.lower():
+                                        if not data.technicals_rating:
+                                            data.technicals_rating = rating
+                                        break
+                    except Exception as e:
+                        logger.debug("Technicals extraction failed for %s: %s", symbol, e)
+                    try:
+                        analyst_section = await pg.query_selector('text="Analyst rating" >> .. >> ..')
+                        if analyst_section:
+                            gauge_text = await analyst_section.inner_text()
+                            if "aggregate view" in gauge_text.lower():
+                                for rating in ["Strong buy", "Buy", "Neutral", "Sell", "Strong sell"]:
+                                    if rating.lower() in gauge_text.lower():
+                                        if not data.analyst_rating:
+                                            data.analyst_rating = rating
+                                        break
+                    except Exception as e:
+                        logger.debug("Analyst rating extraction failed for %s: %s", symbol, e)
 
-                # 4. Analyst Rating (gauge)
-                try:
-                    analyst_section = await page.query_selector('text="Analyst rating" >> .. >> ..')
-                    if analyst_section:
-                        gauge_text = await analyst_section.inner_text()
-                        for rating in ["Strong buy", "Buy", "Neutral", "Sell", "Strong sell"]:
-                            if rating.lower() in gauge_text.lower():
-                                data.analyst_rating = rating
-                                break
-                except Exception as e:
-                    logger.debug("Analyst rating extraction failed for %s: %s", symbol, e)
+                await _read_gauges(page)
 
                 # 5. Financials (4 quadrants) - if requested
                 if include_financials:
@@ -519,6 +528,18 @@ class WebResearcher:
                     data.financials_revenue_to_profit = await self._extract_financials_quadrant(page, "Revenue to profit")
                     data.financials_debt_coverage = await self._extract_financials_quadrant(page, "Debt level")
                     data.financials_earnings = await self._extract_financials_quadrant(page, "Earnings")
+
+                # 5b. Technicals subpage: one extra load only when the gauges
+                # are still empty (overview never has them). The text fallback
+                # in step 6 then reads the fresh subpage body.
+                if not data.technicals_rating and not data.analyst_rating:
+                    try:
+                        await self._safe_goto(page, url + "technicals/")
+                        await asyncio.sleep(3)
+                        await self._dismiss_popups(page)
+                        await _read_gauges(page)
+                    except Exception as e:
+                        logger.debug("TV technicals subpage failed for %s: %s", symbol, e)
 
                 # 6. Text fallback: CSS selectors drift while body text stays
                 # stable. Fills only fields the selector path left empty.
@@ -784,6 +805,10 @@ def extract_tv_text_signals(page_text: str, symbol: str) -> dict:
         text = str(page_text or "")
         if not text:
             return out
+        # TradingView renders U+2212 MINUS / U+2013-2014 dashes / NBSPs
+        # ("-1.11%"); normalize so ASCII patterns match (probed 2026-10-10).
+        text = (text.replace("\u2212", "-").replace("\u2013", "-")
+                    .replace("\u2014", "-").replace("\u00a0", " "))
         sym = re.escape(str(symbol or "").strip().upper())
         # Header quote: "AAPL 341.07 USD +5.15 +1.53%" (first 2000 chars).
         head = text[:2000]
@@ -809,6 +834,15 @@ def extract_tv_text_signals(page_text: str, symbol: str) -> dict:
                       text, re.IGNORECASE)
         if m:
             out["analyst_rating"] = m.group(1)
+        # Technicals subpage layout (live 2026-10-10): standalone "Summary"
+        # heading followed by the overall gauge value ("Summary\nBuy"), plus
+        # counter rows ("Sell 3 / Neutral 10 / Buy 13"). No "Summarizing..."
+        # sentence exists anymore — the patterns above cannot match there.
+        if "technicals_rating" not in out:
+            m = re.search(r"\nSummary\s*\n\s*(Strong buy|Buy|Neutral|Sell|Strong sell)\b",
+                          text, re.IGNORECASE)
+            if m:
+                out["technicals_rating"] = m.group(1)
         # Key-facts carousel: "Key facts today | fact1. | fact2. | N | ...".
         # Counters ("| 1 |") are dropped; up to 3 facts are kept.
         m = re.search(r"Key facts today", text)

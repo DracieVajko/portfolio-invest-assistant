@@ -68,8 +68,14 @@ def _note_unreachable_local_providers(settings) -> None:
         _record_fallback("provider-chain", "API-only mode: LM Studio, llama.cpp, Ollama disabled, never probed")
         return
     lm_enabled = bool(getattr(settings, "lmstudio_enabled", True))
+    try:
+        from investment_engine.providers.fallback import skip_for_run as _skip
+        from investment_engine.providers.fallback import PREFLIGHT_COOLDOWN_S as _CD
+    except Exception:
+        _skip, _CD = None, 300.0
     for label, url in (
         ("LM Studio", f"{str(getattr(settings, 'lm_studio_base_url', '')).rstrip('/')}/models"),
+        ("llama.cpp", f"{str(getattr(settings, 'llamacpp_base_url', '')).rstrip('/')}/models"),
         ("Ollama", f"{str(getattr(settings, 'ollama_base_url', '')).rstrip('/')}/api/tags"),
     ):
         if label == "LM Studio" and not lm_enabled:
@@ -77,12 +83,24 @@ def _note_unreachable_local_providers(settings) -> None:
             continue
         if not url or "://" not in url:
             continue
-        try:
-            _r = _rq.get(url, timeout=2)
-            if _r.status_code != 200:
-                _record_fallback("provider-chain", f"{label} unreachable")
-        except Exception:
+        # LM Studio is the primary provider: patient probe (slow Tailscale or
+        # a model-load start must not exile it for the whole run on a hiccup).
+        attempts = 2 if label == "LM Studio" else 1
+        timeout = 10 if label == "LM Studio" else 2
+        _ok, _detail = False, "pre-flight connect failed"
+        for _a in range(attempts):
+            try:
+                _r = _rq.get(url, timeout=timeout)
+                if _r.status_code == 200:
+                    _ok = True
+                    break
+                _detail = f"pre-flight HTTP {_r.status_code}"
+            except Exception:
+                _detail = "pre-flight connect failed"
+        if not _ok:
             _record_fallback("provider-chain", f"{label} unreachable")
+            if _skip is not None:
+                _skip(label, _detail, _CD)
 
 
 def _provider_fallback_note() -> str:
@@ -2330,6 +2348,56 @@ def _cfg_get(settings, key, default=None):
         return default
 
 
+def _revive_locals_if_due(provider) -> None:
+    """Re-probe pre-flight-skipped locals whose cooldown expired.
+
+    Keeps LM Studio priority across long runs: a server that comes back
+    mid-run is revived for all later stages. Cheap (one <=3s GET per due
+    link); never raises.
+    """
+    try:
+        from investment_engine.providers.fallback import (
+            due_for_reprobe as _due,
+            revive as _revive,
+            skip_for_run as _skip,
+            PREFLIGHT_COOLDOWN_S as _CD,
+        )
+        from investment_engine.providers.fallback import ChainedFallbackProvider as _Chain
+        from investment_engine.providers.lmstudio import LMStudioProvider as _LM
+        from investment_engine.providers.llamacpp import LlamaCppProvider as _LC
+        from investment_engine.providers.ollama import OllamaProvider as _OL
+        import requests as _rq
+    except Exception:
+        return
+    try:
+        if isinstance(provider, _Chain):
+            links = list(getattr(provider, "providers", []) or [])
+        else:
+            links = [provider]
+    except Exception:
+        return
+    for link in links:
+        try:
+            name = getattr(link, "name", "")
+            if not isinstance(link, (_LM, _LC, _OL)) or not _due(name):
+                continue
+            base = str(getattr(link, "base_url", "") or "").rstrip("/")
+            url = (base + "/api/tags") if name == "Ollama" else (base + "/models")
+            if "://" not in url:
+                continue
+            _r = _rq.get(url, timeout=3)
+            if _r.status_code == 200:
+                _revive(name)
+                logger.info("Preflight: %s is back, revived for later stages", name)
+            else:
+                _skip(name, f"re-probe HTTP {_r.status_code}", _CD)
+        except Exception:
+            try:
+                _skip(name, "re-probe connect failed", _CD)
+            except Exception:
+                pass
+
+
 def _try_lmstudio_stage(provider, prompt, *, settings, stage, tokens):
     """Direct per-stage LM Studio attempt. Returns (served_model, result).
 
@@ -2343,6 +2411,14 @@ def _try_lmstudio_stage(provider, prompt, *, settings, stage, tokens):
     try:
         if not bool(_cfg_get(settings, "lmstudio_enabled", False)):
             return None, None
+        try:
+            from investment_engine.providers.fallback import is_skipped as _is_skipped
+            if _is_skipped("LM Studio"):
+                # Pre-flight already proved the server unreachable — skip the
+                # direct attempt too (it would only burn warmup retries).
+                return None, None
+        except Exception:
+            pass
         from investment_engine.providers.presets import FINANCE_STAGES, THINKING_STAGES, WRITER_STAGES
         if stage not in (FINANCE_STAGES | THINKING_STAGES | WRITER_STAGES):
             return None, None
@@ -2394,6 +2470,12 @@ def _generate_with_fallback(provider, prompt, settings, tokens=800, stage="decis
     from investment_engine.providers import attribution as _attr
 
     record = _attr.new_stage_record(stage, model_requested=model)
+    # Revive pre-flight-skipped locals whose cooldown expired (LM Studio
+    # priority across long runs) before the direct attempt and the chain.
+    try:
+        _revive_locals_if_due(provider)
+    except Exception:
+        pass
     # Direct per-stage LM Studio attempt first (designated finance/thinking/
     # writer model). The chain would strip the per-call model, so this is the
     # only path where the routed model is actually served.
@@ -3400,10 +3482,14 @@ def _format_cash_deployment(regime_result, t212_data, ai_recs, portfolio_rows, r
     targets: list[dict] = []
     if isinstance(ai_recs, dict) and isinstance(ai_recs.get("cash_deployment"), dict):
         cd = ai_recs["cash_deployment"]
-        free_cash, deploy, reserve = cd.get("free_cash"), cd.get("deploy_amount"), cd.get("reserve")
+        deploy, reserve = cd.get("deploy_amount"), cd.get("reserve")
         if isinstance(cd.get("targets"), list):
             targets = [t for t in cd["targets"] if isinstance(t, dict)]
-    if free_cash is None and isinstance(t212_data, dict):
+    # Free cash is ALWAYS the broker figure. Model-proposed "free_cash" is
+    # advisory math at best (probed 2026-10-10: Gemini 518.75 vs broker
+    # 0.00) and must never override it in the brief line.
+    free_cash = None
+    if isinstance(t212_data, dict):
         free_cash = (t212_data.get("cash") or {}).get("free")
         if free_cash is None:
             free_cash = (t212_data.get("account_summary") or {}).get("cash_free")

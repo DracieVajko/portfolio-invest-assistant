@@ -158,6 +158,52 @@ def test_extract_tv_text_signals_empty_safe():
     assert extract_tv_text_signals("no relevant content here", "AAPL") == {}
 
 
+def test_extract_tv_text_signals_unicode_minus_change():
+    """Live 2026-10-10: TV renders U+2212 MINUS ("-1.11%")."""
+    from investment_engine.research.web_researcher import extract_tv_text_signals
+
+    text = "AAPL\n336.64\nUSD\n\u22123.78\n\u22121.11%\nSee on Supercharts"
+    out = extract_tv_text_signals(text, "AAPL")
+    assert out["price"] == 336.64
+    assert out["change_pct"] == "-1.11%"
+
+
+def test_extract_tv_text_signals_no_gauge_on_overview_nav_tab():
+    """Overview body only carries the Technicals NAV TAB (no values) —
+    must not invent a rating (live 2026-10-10 shape)."""
+    from investment_engine.research.web_researcher import extract_tv_text_signals
+
+    text = ("OverviewFinancialsDocumentsNewsCommunityTechnicalsForecasts"
+            "1 day -1.11% 5 days 1.01% Key facts today | Shares near high. | 1 |")
+    out = extract_tv_text_signals(text, "AAPL")
+    assert "technicals_rating" not in out and "analyst_rating" not in out
+
+
+def test_extract_tv_text_signals_technicals_subpage_summary_gauge():
+    """Technicals subpage shape (live 2026-10-10): standalone Summary
+    heading + gauge value, then counter rows."""
+    from investment_engine.research.web_researcher import extract_tv_text_signals
+
+    text = ("Indicators' summary\nSee technical analysis overview.\n"
+            "Oscillators\nSell\nSell\n2\nNeutral\n9\nBuy\n0\n"
+            "Summary\nBuy\nSell\n3\nNeutral\n10\nBuy\n13\n"
+            "Moving Averages\nStrong buy\n")
+    out = extract_tv_text_signals(text, "AAPL")
+    assert out["technicals_rating"] == "Buy"
+
+
+def test_extract_tv_text_signals_summary_gauge_needs_standalone_heading():
+    """The descriptive sentence ('...in the Summary gauge, where... buy,
+    sell...') must not match — only a standalone heading counts."""
+    from investment_engine.research.web_researcher import extract_tv_text_signals
+
+    text = ("It includes key data summed up in the Summary gauge, where you "
+            "can instantly see whether indicators suggest a buy, sell, or "
+            "neutral signal.")
+    out = extract_tv_text_signals(text, "AAPL")
+    assert "technicals_rating" not in out
+
+
 def test_tech_summary_line_renders_tv_readings():
     from investment_engine.main import _tech_summary_line
 

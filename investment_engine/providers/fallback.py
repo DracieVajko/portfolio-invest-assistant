@@ -14,7 +14,12 @@ logger = logging.getLogger(__name__)
 # the run instead of retried at every stage (LM Studio/Ollama down, Gemini
 # 429 rate-limit). No stack traces; one concise log line per trip.
 _SKIP_REST_OF_RUN: set[str] = set()
+_SKIP_UNTIL: dict[str, float] = {}
 _GEMINI_SKIP_UNTIL: float = 0.0
+
+#: Pre-flight skips are cooldown-based (not permanent): a local server that
+#: comes back mid-run is revived by _revive_locals_if_due (LM Studio priority).
+PREFLIGHT_COOLDOWN_S = 300.0
 
 
 def _provider_model(provider: BaseLLMProvider) -> str:
@@ -37,8 +42,84 @@ def _retry_after_seconds(result: str) -> float:
 def reset_circuit_breaker() -> None:
     """Clear per-run skip state (called at engine start)."""
     _SKIP_REST_OF_RUN.clear()
+    _SKIP_UNTIL.clear()
     global _GEMINI_SKIP_UNTIL
     _GEMINI_SKIP_UNTIL = 0.0
+
+
+def is_skipped(name: str) -> bool:
+    """True when a provider is currently skipped.
+
+    Permanent run-skips and unexpired pre-flight cooldowns both count.
+    Never mutates state, never raises.
+    """
+    try:
+        key = str(name or "")
+        if not key:
+            return False
+        if key in _SKIP_REST_OF_RUN:
+            return True
+        until = _SKIP_UNTIL.get(key)
+        if until is None:
+            return False
+        return time.time() < float(until)
+    except Exception:
+        return False
+
+
+def due_for_reprobe(name: str) -> bool:
+    """True when a pre-flight cooldown expired and the link deserves one cheap re-probe."""
+    try:
+        key = str(name or "")
+        until = _SKIP_UNTIL.get(key) if key else None
+        if until is None:
+            return False
+        return time.time() >= float(until)
+    except Exception:
+        return False
+
+
+def revive(name: str) -> None:
+    """Clear any skip state for a provider (pre-flight revival). Never raises."""
+    try:
+        key = str(name or "")
+        _SKIP_REST_OF_RUN.discard(key)
+        _SKIP_UNTIL.pop(key, None)
+    except Exception:
+        pass
+
+
+def skip_for_run(name: str, reason: str = "", cooldown_s: float = 0.0) -> None:
+    """Mark a provider skipped.
+
+    cooldown_s > 0: pre-flight path — skipped until now+cooldown, then one
+    cheap re-probe may revive it (LM Studio priority across long runs).
+    cooldown_s <= 0: permanent run-skip (mid-run failure after burnt retries).
+    One concise log line on first trip; never raises.
+    """
+    try:
+        key = str(name or "")
+        if not key:
+            return
+        try:
+            cooldown = float(cooldown_s or 0.0)
+        except (TypeError, ValueError):
+            cooldown = 0.0
+        if cooldown > 0:
+            if key in _SKIP_REST_OF_RUN:
+                return
+            first = key not in _SKIP_UNTIL
+            _SKIP_UNTIL[key] = time.time() + cooldown
+            if first:
+                logger.info("Preflight: skipping %s for ~%.0fs%s",
+                            key, cooldown, f" ({reason})" if reason else "")
+            return
+        if key not in _SKIP_REST_OF_RUN:
+            _SKIP_REST_OF_RUN.add(key)
+            logger.info("Preflight: skipping %s for the rest of the run%s",
+                        key, f" ({reason})" if reason else "")
+    except Exception:
+        pass
 
 
 def _is_error_result(result: str, stage: str) -> bool:
@@ -134,7 +215,7 @@ class ChainedFallbackProvider(BaseLLMProvider):
         now = time.time()
         out = []
         for p in self.providers:
-            if p.name in _SKIP_REST_OF_RUN:
+            if is_skipped(p.name):
                 continue
             if p.name == "Gemini" and now < _GEMINI_SKIP_UNTIL:
                 continue

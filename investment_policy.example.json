@@ -37,6 +37,9 @@
   "stops": {
     "scope": "tactical-only (pending confirmation)"
   },
+  "trims": {
+    "trim_fraction_pct": 50.0
+  },
   "core_trims": "REQUIRES_USER_VALUE",
   "discovery": {
     "enabled": true,

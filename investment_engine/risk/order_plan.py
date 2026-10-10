@@ -24,6 +24,45 @@ def sleeve_for_group(group: str | None) -> str:
     return _GROUP_SLEEVE.get(str(group or "").upper(), "unknown")
 
 
+#: Plans below this notional are noise, not advice (probed 2026-10-10:
+#: "EGT TRIM ~€0.00"). Such decisions land in `blocked` with a reason.
+MIN_NOTIONAL_EUR = 1.00
+
+
+def trim_sizing_eur(*, weight_pct: float, cap_pct: float, total_equity: float,
+                    policy: dict[str, Any]) -> dict[str, Any]:
+    """Position-based TRIM sizing (BUY headroom math does not apply to sells).
+
+    Overweight → trim-to-cap exceedance; otherwise a policy fraction of the
+    position (trims.trim_fraction_pct, default 50.0). Never negative.
+    """
+    try:
+        equity = max(0.0, float(total_equity))
+    except (TypeError, ValueError):
+        equity = 0.0
+    try:
+        position_value = max(0.0, float(weight_pct) / 100.0 * equity)
+    except (TypeError, ValueError):
+        position_value = 0.0
+    try:
+        cap_value = max(0.0, float(cap_pct)) / 100.0 * equity
+    except (TypeError, ValueError):
+        cap_value = 0.0
+    if position_value > cap_value:
+        return {"notional_eur": round(position_value - cap_value, 2),
+                "binding_constraint": "trim-to-cap",
+                "inputs": {"position_value_eur": round(position_value, 2),
+                           "cap_value_eur": round(cap_value, 2)}}
+    try:
+        frac = float((policy.get("trims", {}) or {}).get("trim_fraction_pct", 50.0) or 50.0)
+    except (TypeError, ValueError):
+        frac = 50.0
+    return {"notional_eur": round(position_value * frac / 100.0, 2),
+            "binding_constraint": "trim-fraction",
+            "inputs": {"position_value_eur": round(position_value, 2),
+                       "trim_fraction_pct": frac}}
+
+
 def build_plans(*, committee_decisions: list[dict[str, Any]],
                 portfolio_rows: list[dict[str, Any]],
                 recon_status: str, free_cash: float, total_equity: float,
@@ -95,6 +134,14 @@ def build_plans(*, committee_decisions: list[dict[str, Any]],
             weight_pct=weight, cap_pct=cap_default, total_equity=total_equity,
             risk_pct=risk_pct, adverse_move=adverse,
             sector_headroom_eur=sector_headroom_eur, deployable_cash_eur=free_cash)
+        if direction == "TRIM":
+            # Sells are not funded by cash: size from the position itself.
+            sizing = trim_sizing_eur(weight_pct=weight, cap_pct=cap_default,
+                                     total_equity=total_equity, policy=policy)
+            if sizing["notional_eur"] < MIN_NOTIONAL_EUR:
+                blocked.append({"ticker": ticker,
+                                "reason": f"trim size below minimum (€{sizing['notional_eur']:,.2f})"})
+                continue
         tech = {}
         stop_hint = limit_hint = None
         if needs_levels and all(g["pass"] for g in gates if g["rule"] == "mapping-verified"):

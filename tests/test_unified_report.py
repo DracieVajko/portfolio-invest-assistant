@@ -390,6 +390,22 @@ def test_fail_suppresses_deployment_and_buys():
     assert guarded["cash_deployment"]["targets"] == []
 
 
+def test_cash_line_prefers_broker_over_ai_free_cash():
+    """2026-10-10: Gemini invented free_cash 518.75 vs broker 0.00 — the
+    broker figure must win in the brief line."""
+    from types import SimpleNamespace
+
+    from investment_engine.main import _format_cash_deployment
+    regime = SimpleNamespace(implications={})
+    t212 = {"cash": {"free": 0.0},
+            "account_summary": {"total_equity": 3328.24, "cash_free": 0.0}}
+    ai = {"cash_deployment": {"free_cash": 518.755, "deploy_amount": 0.0,
+                              "reserve": 0.0, "targets": []}}
+    line = _format_cash_deployment(regime, t212, ai, [], recon_status="PASS")
+    assert line.startswith("€0.00 free")
+    assert "518" not in line
+
+
 # --- Fix 2: BUY safety gates ---------------------------------------------------
 
 def _safety_row(display, signal="BUY", weight=1.0, pnl=1.0, price=10.0, value=100.0):

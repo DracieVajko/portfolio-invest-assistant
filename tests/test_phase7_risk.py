@@ -146,6 +146,38 @@ def test_core_trims_allowed_generates_long_term_trim():
     assert plan["human_confirmation_required"] is True
 
 
+def test_trim_sizing_ignores_zero_cash():
+    """EGT-like 2026-10-10: zero free cash must not produce a €0.00 TRIM plan."""
+    from investment_engine.risk import order_plan as op
+
+    bundle = op.build_plans(
+        committee_decisions=[{"ticker": "AAPL", "action": "TRIM", "basis": []}],
+        portfolio_rows=[_row(signal="SELL", weight=5.0)], recon_status="PASS",
+        free_cash=0.0, total_equity=10000.0, earnings_status={},
+        report_day="2026-09-24", news_events=[], regime="NEUTRAL",
+        risk_posture="NORMAL", policy=_policy(core_trims=True),
+        sleeves={"AAPL": "tactical"})
+    assert len(bundle["plans"]) == 1
+    plan = bundle["plans"][0]
+    # 5% of €10k = €500 position, default 50% trim fraction.
+    assert plan["indicative_notional_eur"] == 250.0
+    assert plan["binding_constraint"] == "trim-fraction"
+
+
+def test_trim_dust_lands_in_blocked_not_zero_plan():
+    from investment_engine.risk import order_plan as op
+
+    bundle = op.build_plans(
+        committee_decisions=[{"ticker": "AAPL", "action": "TRIM", "basis": []}],
+        portfolio_rows=[_row(signal="SELL", weight=0.0)], recon_status="PASS",
+        free_cash=0.0, total_equity=10000.0, earnings_status={},
+        report_day="2026-09-24", news_events=[], regime="NEUTRAL",
+        risk_posture="NORMAL", policy=_policy(core_trims=True),
+        sleeves={"AAPL": "tactical"})
+    assert bundle["plans"] == []
+    assert "below minimum" in bundle["blocked"][0]["reason"]
+
+
 def test_v1_policy_file_shape(tmp_path):
     """Local v1 policy: loads OK, deferred keys stay deferred, caps present."""
     import json
