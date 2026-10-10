@@ -1,0 +1,57 @@
+{
+  "strategy": "tech_pie_pullback_v1",
+  "version": "1.0.0",
+  "description": "Weekly trend filter + daily pullback, long-only, advisory research only. Phase 1 exits: hard stop, weekly break, time stop.",
+  "fx_config": "experimental/backtest/config/fx_rates.json",
+  "start_equity_eur": 10000.0,
+  "execution": {
+    "signal_lag_bars": 1,
+    "fill": "next_open",
+    "long_only": true
+  },
+  "costs": {
+    "commission_bps": 10,
+    "slippage_bps": 5,
+    "fx_spread_bps": 10,
+    "min_ticket_eur": 1.0
+  },
+  "risk": {
+    "max_alloc_per_instrument_pct": 8.0,
+    "max_gross_exposure_pct": 80.0,
+    "min_cash_reserve_pct": 20.0,
+    "max_positions": 10
+  },
+  "weekly_trend_gate": {
+    "sma50_period": 50,
+    "sma200_period": 200,
+    "rsi_period": 14,
+    "adx_period": 14,
+    "rsi_min": 45,
+    "rsi_max": 70,
+    "adx_min": 18,
+    "require_weeks": 2,
+    "resample_rule": "W-FRI"
+  },
+  "daily_entry": {
+    "rsi_period": 14,
+    "rsi_min": 35,
+    "rsi_max": 50,
+    "sma20_period": 20,
+    "sma200_period": 200,
+    "dist_sma20_min_pct": -8.0,
+    "dist_sma20_max_pct": -2.0,
+    "volume_sma_period": 20,
+    "volume_ratio_min": 0.8,
+    "earnings_blackout_before_bdays": 5,
+    "earnings_blackout_after_bdays": 2
+  },
+  "exits": {
+    "hard_stop_pct": 7.0,
+    "time_stop_bars": 20,
+    "weekly_break_enabled": true
+  },
+  "validation": {
+    "allow_gap_larger_than_two_bdays": false,
+    "stale_threshold_bdays": 3
+  }
+}

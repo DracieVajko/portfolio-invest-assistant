@@ -1,0 +1,50 @@
+{
+  "run_id": null,
+  "description": "Phase 2 research comparison: buy-and-hold equal-weight vs periodic-rebalance vs tech_pie_pullback_v1. Research only, no live data.",
+  "strategy_config_path": "experimental/backtest/config/tech_pie_pullback_v1.json",
+  "start_date": "2020-01-01",
+  "end_date": "2024-12-31",
+  "initial_equity": 10000.0,
+  "universe": null,
+  "universe_from_data": true,
+  "benchmarks": {
+    "buy_and_hold": {
+      "enabled": true,
+      "label": "equal_weight_buy_and_hold"
+    },
+    "periodic_rebalance": {
+      "enabled": true,
+      "label": "periodic_equal_weight_rebalance",
+      "frequency": "monthly"
+    }
+  },
+  "rebalance_frequency": "monthly",
+  "costs": {
+    "commission_bps": 10,
+    "slippage_bps": 5,
+    "fx_spread_bps": 10,
+    "min_ticket_eur": 1.0
+  },
+  "data_input_path": "experimental/tests/fixtures/sample_ohlcv.csv",
+  "fx_config_path": "experimental/backtest/config/fx_rates.json",
+  "risk_free_rate": 0.0,
+  "annualization_trading_days": 252,
+  "output_dir": "experimental/reports",
+  "random_seed": 42,
+  "data_quality_policy": {
+    "allow_gap_larger_than_two_bdays": false
+  },
+  "minimum_history_required_per_symbol": 252,
+  "minimum_eligible_symbols": 5,
+  "max_excluded_pct": 20,
+  "validation": {
+    "allow_gap_larger_than_two_bdays": false,
+    "stale_threshold_bdays": 30
+  },
+  "coverage": {
+    "min_bars_per_symbol": 252,
+    "min_symbols": 5,
+    "max_excluded_pct": 20
+  },
+  "notes": "All input data, FX config and strategy config hashes stored in each result. Research-only backtest. Historical performance does not predict future results."
+}

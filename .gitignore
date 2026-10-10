@@ -80,13 +80,12 @@ reports/portfolio_analysis*
 reports/run_manifest*
 
 # Old project versions and backups (do not commit).
-# NOTE: trading212/ and scripts/ are LIVE code (imported by the engine and
-# tests) and must stay committable - do not re-add them here.
+# NOTE: trading212/, scripts/, experimental/ and PIEs/ are LIVE content
+# (imported by the engine and tests, or committed example data) and must
+# stay committable - do not re-add them here.
 AsistantV5/
 portfolio-invest-assistant-clean/
 Zalohy/
-experimental/
-PIEs/
 docs/
 runtime/
 accounting/
@@ -94,8 +93,8 @@ accounting/
 # Auto-backup snapshots (*_V2415_*) - never commit; canonical files live beside them
 *_V2415_*
 
-# Temporary scripts and files
-install_requirements.bat
+# Temporary scripts and files (install entry points ARE tracked:
+# install.bat + install_requirements.bat + install.sh).
 cleanup.bat
 data/
 *.md.bak
