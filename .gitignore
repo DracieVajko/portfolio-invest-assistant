@@ -94,7 +94,7 @@ accounting/
 *_V2415_*
 
 # Temporary scripts and files (install entry points ARE tracked:
-# install.bat + install_requirements.bat + install.sh).
+# install.bat + install.sh).
 cleanup.bat
 data/
 *.md.bak

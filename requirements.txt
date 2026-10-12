@@ -27,6 +27,11 @@ playwright>=1.40.0
 # --- Optional technical (validation/reference only; never required) ---
 # Technical analysis (requires Python 3.12+ for numba)
 # pandas-ta>=0.4.71b0  # Requires Python 3.12+ for numba
+# DO NOT install pandas-ta alongside the pinned stack: 0.4.x pulls
+# pandas 3.x + numpy 2.x + numba and breaks the frozen manual-v1 numerics
+# (verified 2026-10-12: pip install pandas-ta upgraded pandas 2.2.3 -> 3.0.6,
+# had to be rolled back). The engine default is "manual", so a missing
+# pandas-ta changes nothing; reference runs are opt-in via engine="reference".
 # NOTE: pandas-ta is archived/incompatible with the pinned pandas 2.2.3 +
 # numpy 1.26.4 + scipy 1.13.1 combo. The manual indicator engine in
 # investment_engine/research/technical_analysis.py stays canonical; the

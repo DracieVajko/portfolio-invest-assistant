@@ -148,14 +148,19 @@ from investment_engine.research.indicators import (
 
 class TechnicalAnalyzer:
     """
-    Comprehensive technical analysis engine using pandas-ta.
+    Comprehensive technical analysis engine. Canonical: deterministic manual
+    engine (research/indicators.py). The pandas-ta reference engine is
+    opt-in only (engine="reference") for validation runs.
     Supports multi-timeframe analysis with 150+ indicators.
     """
 
-    def __init__(self, config: IndicatorConfig | None = None, engine: str = "auto"):
+    def __init__(self, config: IndicatorConfig | None = None, engine: str = "manual"):
         self.config = config or IndicatorConfig()
-        # Policy A: "manual" forces the canonical engine; "reference" requires
-        # pandas-ta (raises when missing); "auto" preserves legacy behavior.
+        # Policy A: default "manual" (canonical engine, identical on every
+        # PC regardless of stray site-packages). "reference" requires
+        # pandas-ta (raises when missing); "auto" is legacy behavior
+        # (reference if installed, else manual) — avoid it in production
+        # paths, it makes numerics environment-dependent.
         self.engine = engine
         self.resolved_engine = resolve_engine(engine, HAS_PANDAS_TA)
         self._validate_dependencies()

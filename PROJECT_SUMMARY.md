@@ -12,7 +12,7 @@ enriches every holding/watchlist asset with market data + technicals + news,
 runs local-LLM stages, and publishes deterministic Markdown + JSON reports.
 Entry point: `portfolio_ai_assistant.py` (CLI, `--config portfolio_config.json`).
 Batch helpers: `run_full_report.bat`, `run_automated.bat`, `run_t212_analysis.bat`,
-`run_t212_export.bat`, `install.bat` → `install_requirements.bat`, `cleanup.bat`.
+`run_t212_export.bat`, `install.bat` / `install.sh`, `cleanup.bat`.
 
 ## 2. How a run works (pipeline)
 
@@ -97,7 +97,7 @@ the chain serves its own fixed models. Real winner per stage is recorded in
   `pip check` clean.
 - Playwright pip 1.63.0 + Chromium installed and smoke-tested (`chromium launch OK`);
   TV sweep / earnings layer-2 / technicals fallback are now live (were dormant).
-- `install.bat` → `install_requirements.bat` installs everything incl. browser.
+- `install.bat` / `install.sh` installs everything incl. browser.
 - 469/469 tests green.
 
 ## 7. What does NOT work / known issues

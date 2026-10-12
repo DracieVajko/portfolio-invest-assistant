@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Portfolio AI Assistant - POSIX setup (Python 3.12).
-# Mirror of install_requirements.bat; requirements.txt stays the single
+# Mirror of install.bat; requirements.txt stays the single
 # source of truth for dependencies.
 set -euo pipefail
 cd "$(dirname "$0")"
