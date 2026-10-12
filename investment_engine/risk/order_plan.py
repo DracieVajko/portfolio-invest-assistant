@@ -70,7 +70,8 @@ def build_plans(*, committee_decisions: list[dict[str, Any]],
                 news_events: list[dict[str, Any]], regime: str,
                 risk_posture: str, policy: dict[str, Any],
                 sleeves: dict[str, str] | None = None,
-                sector_headroom_eur: float = float("inf")) -> dict[str, Any]:
+                sector_headroom_eur: float = float("inf"),
+                hold_thesis: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build advisory plans for committee BUY/TRIM decisions that pass gates."""
     from investment_engine.risk import eligibility as _elig
     from investment_engine.risk import sizing as _sizing
@@ -100,6 +101,16 @@ def build_plans(*, committee_decisions: list[dict[str, Any]],
             continue
         sleeve = (sleeves or {}).get(ticker, "unknown")
         direction = "BUY" if action in ("BUY", "ACCUMULATE") else "TRIM"
+        # User-declared hold thesis: never plan an exit on a thesis ticker.
+        try:
+            _thesis = hold_thesis if isinstance(hold_thesis, dict) else {}
+            _note = _thesis.get(ticker)
+        except Exception:
+            _note = None
+        if direction == "TRIM" and _note:
+            blocked.append({"ticker": ticker,
+                            "reason": f"hold-thesis — HOLD ({_note})"})
+            continue
         # Deferred: core trim permission unknown → HOLD+REVIEW text, no plan.
         if direction == "TRIM" and sleeve in ("long_term", "core") and is_deferred(core_trims):
             blocked.append({"ticker": ticker,

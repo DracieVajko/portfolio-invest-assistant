@@ -564,9 +564,9 @@ def _symbol(asset: dict[str, Any]) -> str:
 def run_engine(assets: List[Dict[str, Any]], portfolio_context: Dict[str, Any] | None = None, settings: EngineSettings | None = None) -> Dict[str, Any]:
     """Create a compact, live-data report with short model calls per active category."""
     settings = settings or EngineSettings.from_defaults()
-    # Reduce third-party library debug noise (yfinance/peewee/urllib3); engine
-    # messages stay at the configured level.
-    for _noisy in ("yfinance", "peewee", "urllib3.connectionpool", "urllib3"):
+    # Reduce third-party library debug noise (yfinance/peewee/urllib3/numba);
+    # engine messages stay at the configured level.
+    for _noisy in ("yfinance", "peewee", "urllib3.connectionpool", "urllib3", "numba"):
         try:
             logging.getLogger(_noisy).setLevel(logging.WARNING)
         except Exception:
@@ -838,7 +838,8 @@ def run_engine(assets: List[Dict[str, Any]], portfolio_context: Dict[str, Any] |
         from investment_engine.reporting.regime_report import build_canonical_signals as _build_canon
         from investment_engine.reporting.regime_report import ensure_canonical_defaults as _ensure_defaults
         from investment_engine.portfolio.symbols import to_display_symbol as _td_canon
-        canonical_map: dict = _build_canon(ai_recs, known_clean)
+        canonical_map: dict = _build_canon(ai_recs, known_clean,
+                                             settings_dict.get("hold_thesis", {}))
         # Pre-fill HOLD defaults for every authoritative holding so the PIE
         # prompt and every downstream section share one complete mapping.
         _auth = ((t212_data or {}).get("account_summary", {}) or {}).get("all_positions") or (t212_data or {}).get("all_positions") or []
@@ -1524,7 +1525,8 @@ DECISIONS:
                 regime=getattr(regime_result, "regime", "UNKNOWN") if regime_result else "UNKNOWN",
                 risk_posture=((skill_outputs.get("risk", {}) or {}).get("data", {}) or {}).get("posture", ""),
                 policy=policy_state.get("policy", {}) or {},
-                sleeves=_sleeves)
+                sleeves=_sleeves,
+                hold_thesis=settings_dict.get("hold_thesis", {}))
             logger.info("Order plans: %d advisory, %d blocked (policy %s)",
                         len(order_plans.get("plans", [])), len(order_plans.get("blocked", [])),
                         policy_state.get("version", ""))
@@ -1875,6 +1877,18 @@ DECISIONS:
             _news_filter_stats.get("unlinked", 0), _news_filter_stats.get("kept", 0))
     except Exception:
         pass
+    # Catalyst radar (V1, informational): explicit future dates in linked
+    # news titles per ticker. Never breaks the run; no signal changes.
+    catalyst_radar: list = []
+    try:
+        from investment_engine.research.news_engine import extract_catalysts as _extract_catalysts
+        catalyst_radar = _extract_catalysts(decision_news, now=report_dt) or []
+        if catalyst_radar:
+            logger.info(
+                "Catalyst radar: %d dated events (%s)", len(catalyst_radar),
+                ", ".join(f"{c['ticker']} {c['date']}" for c in catalyst_radar[:8]))
+    except Exception as exc:
+        logger.debug("Catalyst radar skipped: %s", type(exc).__name__)
     # Relevance diagnostics (threshold review data): score distribution of
     # valid candidates + top near-misses below the bar. No threshold change
     # here — the numbers decide in a later run.
@@ -1944,6 +1958,7 @@ DECISIONS:
         rows=portfolio_rows, monitoring_items=monitoring_items, earnings_7d=earnings_7d,
         decision_news=decision_news, ideas=ideas, cash_line=cash_line,
         performance=account_performance,
+        catalyst_radar=catalyst_radar,
         research_note=research_note,
         execution_mode_lines=execution_mode_lines,
         order_plans=order_plans if isinstance(order_plans, dict) else None,
@@ -2087,6 +2102,7 @@ DECISIONS:
         "monitoring_items": monitoring_items or [],
         "regime_result": regime_result,
         "decision_news": decision_news or [],
+        "catalyst_radar": catalyst_radar or [],
         "earnings_7d": earnings_7d or {},
         "dividends_12m": dividends_12m or {},
         "ideas": ideas or [],
@@ -3510,8 +3526,10 @@ def _format_cash_deployment(regime_result, t212_data, ai_recs, portfolio_rows, r
         total_equity = float(((t212_data or {}).get("account_summary") or {}).get("total_equity", 0) or 0)
     except Exception:
         pass
-    # Explicit AI targets win.
-    if targets and deploy:
+    # Explicit AI targets win — but never from empty cash (live 2026-10-12:
+    # model proposed Deploy €450 with broker free €0.00). Zero-cash falls
+    # through to the no-deployment branch below.
+    if targets and deploy and fc > 0.01:
         try:
             from investment_engine.portfolio.symbols import to_display_symbol as _td4
             _disp_map = {}
@@ -3528,7 +3546,7 @@ def _format_cash_deployment(regime_result, t212_data, ai_recs, portfolio_rows, r
             return f"€{fc:,.2f} free — Deploy €{float(deploy):,.2f} to {tstr}; keep €{float(reserve or 0):,.2f} reserve (cash target {cash_target_pct:.0f}%)"
         except Exception:
             pass
-    if deploy:
+    if deploy and fc > 0.01:
         try:
             return f"€{fc:,.2f} free — Deploy €{float(deploy):,.2f}; keep €{float(reserve if reserve is not None else fc - float(deploy)):,.2f} reserve (cash target {cash_target_pct:.0f}%)"
         except Exception:

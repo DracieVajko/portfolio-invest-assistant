@@ -199,12 +199,10 @@ class EngineSettings:
     lm_studio_context_tokens: int = _env_int("LM_STUDIO_CONTEXT_TOKENS", 32768)
     lm_studio_max_output_tokens: int = _env_int("LM_STUDIO_MAX_OUTPUT_TOKENS", 32768)
 
-    # Per-stage LM Studio models (LM_Studio_Optimiser "best" winners, 2026-10-01;
-    # failed ids retired: fin-o1-14b, tongyi-30b, marco-deepresearch,
-    # ministral-14b-reasoning, fable5-glint).
-    # decision/primary/finance reasoning: qwen3.8-9b-distill (~30 tok/s).
-    # thinking/research (discovery): openai/gpt-oss-20b (32k ctx, ~12 tok/s).
-    # writer (summaries): google/gemma-4-12b. Fast local fallback: ministral-3-3b.
+    # Per-stage LM Studio models (verified served 2026-10-12).
+    # reasoning/math/thinking: openai/gpt-oss-20b (fast, 32k ctx).
+    # writer (summaries): google/gemma-4-26b-a4b-qat (alt: prism-ml/bonsai-27b,
+    # mistralai/ministral-3-3b). Fast local fallback: mistralai/ministral-3-3b.
     finance_model: str = _env("FINANCE_MODEL", "qwen3.8-9b-distill")
     thinking_model: str = _env("THINKING_MODEL", "openai/gpt-oss-20b")
     local_fallback_model: str = _env("LOCAL_FALLBACK_MODEL", "mistralai/ministral-3-3b")

@@ -271,6 +271,24 @@ def test_news_quality_order_and_why():
     assert "MSFT" in out[0]["why"]
 
 
+def test_short_ticker_no_plain_word_collision():
+    """Live 2026-10-12: 'AI may change the price of your Big Mac' must NOT
+    link Air Liquide (AI) — the word is 'artificial intelligence'. Two-letter
+    tickers link via company-name match only."""
+    now = datetime.now(timezone.utc)
+    recs = {"AI": [_rec("AI may change the price of your Big Mac",
+                        url="https://example.com/ai-burger", key="AI")]}
+    out = filter_decision_news(recs, owned={"AI"}, relevance_min=30, now=now,
+                               names={"AI": "Air Liquide"})
+    assert out == []
+    # Same bucket, but the company IS named -> links correctly.
+    recs2 = {"AI": [_rec("Air Liquide raises guidance on hydrogen demand",
+                         url="https://example.com/ai-gas", key="AI")]}
+    out2 = filter_decision_news(recs2, owned={"AI"}, relevance_min=30, now=now,
+                                names={"AI": "Air Liquide"})
+    assert len(out2) == 1 and "AI" in out2[0]["why"]
+
+
 def test_macro_news_unlinked_included():
     """Test that macro news from tier 1 sources is included without held links."""
     now = datetime.now(timezone.utc)

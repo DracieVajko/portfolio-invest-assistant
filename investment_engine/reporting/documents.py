@@ -528,6 +528,7 @@ def render_brief(
     decision_news: list[dict],
     ideas: list[dict],
     cash_line: str,
+    catalyst_radar: list[dict] | None = None,
     performance: dict | None = None,
     research_note: str = "",
     execution_mode_lines: list[str] | None = None,
@@ -613,6 +614,15 @@ def render_brief(
         tag = "(confirmed)" if nxt.get("status") == "confirmed" else "(estimated)"
         lines.append(f"Next relevant earnings after this window: {_mday(nxt['date'])} — "
                      f"{nxt['display']}, {nxt['company']} — earnings {tag}.")
+    lines += ["", "## Catalyst Radar — Dated events from linked news", ""]
+    if not catalyst_radar:
+        lines.append("No dated catalysts found in linked news.")
+    else:
+        for ev in catalyst_radar or []:
+            if not isinstance(ev, dict):
+                continue
+            lines.append(f"- {_mday(str(ev.get('date', '')))} — {ev.get('ticker', '?')} — "
+                         f"{ev.get('title', '')} ({ev.get('url', '')})")
     lines += ["", "## Decision-Relevant News — Last 48 Hours", ""]
     if research_note:
         lines.append(str(research_note))

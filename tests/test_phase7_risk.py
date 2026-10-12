@@ -178,6 +178,32 @@ def test_trim_dust_lands_in_blocked_not_zero_plan():
     assert "below minimum" in bundle["blocked"][0]["reason"]
 
 
+def test_hold_thesis_blocks_trim_plans():
+    """TTWO/GTA VI thesis: TRIM decisions become blocked, BUY still allowed."""
+    from investment_engine.risk import order_plan as op
+
+    thesis = {"TTWO": "GTA VI hold"}
+    rows = [_row(display="TTWO", signal="SELL", weight=12.5)]
+    bundle = op.build_plans(
+        committee_decisions=[{"ticker": "TTWO", "action": "TRIM", "basis": []}],
+        portfolio_rows=rows, recon_status="PASS",
+        free_cash=0.0, total_equity=10000.0, earnings_status={},
+        report_day="2026-09-24", news_events=[], regime="NEUTRAL",
+        risk_posture="NORMAL", policy=_policy(core_trims=True),
+        sleeves={"TTWO": "tactical"}, hold_thesis=thesis)
+    assert bundle["plans"] == []
+    assert "hold-thesis" in bundle["blocked"][0]["reason"]
+    buys = op.build_plans(
+        committee_decisions=[{"ticker": "TTWO", "action": "BUY", "basis": ["x"]}],
+        portfolio_rows=rows, recon_status="PASS",
+        free_cash=1000.0, total_equity=10000.0, earnings_status={},
+        report_day="2026-09-24",
+        news_events=[{"ticker": "TTWO"}], regime="NEUTRAL",
+        risk_posture="NORMAL", policy=_policy(core_trims=True),
+        sleeves={"TTWO": "tactical"}, hold_thesis=thesis)
+    assert len(buys["plans"]) == 1
+
+
 def test_v1_policy_file_shape(tmp_path):
     """Local v1 policy: loads OK, deferred keys stay deferred, caps present."""
     import json

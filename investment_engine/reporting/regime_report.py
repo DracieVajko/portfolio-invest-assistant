@@ -48,6 +48,7 @@ def signal_emoji(sig: str) -> str:
 def build_canonical_signals(
     ai_recs: dict | None,
     known_clean: set | None = None,
+    hold_thesis: dict | None = None,
 ) -> dict[str, dict]:
     """Build display-keyed ticker -> {signal, raw, conflict, confidence}.
 
@@ -91,6 +92,21 @@ def build_canonical_signals(
     for a in ai_recs.get("portfolio_actions", []) or []:
         if isinstance(a, dict) and a.get("asset"):
             _store(a["asset"], a.get("action", "HOLD"), "portfolio_action")
+    # User-declared hold theses (e.g. TTWO held for GTA VI): a SELL on a
+    # thesis ticker becomes HOLD with provenance, so monitoring, plans and
+    # brief text all agree. Never raises.
+    try:
+        thesis = hold_thesis if isinstance(hold_thesis, dict) else {}
+        for disp, note in thesis.items():
+            key = str(disp or "").strip().upper()
+            entry = canon.get(key) if key else None
+            if entry is not None and entry.get("signal") == "SELL":
+                entry["signal"] = "HOLD"
+                entry["raw"].append("hold-thesis")
+                entry["sources"].append("hold-thesis")
+                entry["thesis"] = str(note or "")
+    except Exception:
+        pass
     return canon
 
 

@@ -103,9 +103,9 @@ portfolio_ai_assistant/
 
 | Stage | Model (`portfolio_config.json` key) |
 |-------|--------------------------------------|
-| `summary` | `writer_model` (`google/gemma-4-12b`, fast) |
+| `summary` | `writer_model` (`google/gemma-4-26b-a4b-qat`, writing; alt: `prism-ml/bonsai-27b`, `mistralai/ministral-3-3b`) |
 | `discovery` | `thinking_model` (`openai/gpt-oss-20b`, 32k ctx) |
-| `decision`, `ai_recommendations` | `finance_model` (`qwen3.8-9b-distill`, reasoning) |
+| `decision`, `ai_recommendations` | `finance_model` (`openai/gpt-oss-20b`, reasoning + math) |
 | everything else | `decision_model` (chain default) |
 
 Chain: LM Studio → llama.cpp (Pi) → Ollama (Pi) → Gemini → OpenRouter `:free` →

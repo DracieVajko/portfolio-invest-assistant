@@ -406,6 +406,41 @@ def test_cash_line_prefers_broker_over_ai_free_cash():
     assert "518" not in line
 
 
+def test_cash_line_suppresses_ai_deploy_on_zero_cash():
+    """Live 2026-10-12: model proposed Deploy €450 with broker free €0.00 —
+    the deploy sentence must not render; the buffer line wins."""
+    from types import SimpleNamespace
+
+    from investment_engine.main import _format_cash_deployment
+    regime = SimpleNamespace(implications={})
+    t212 = {"cash": {"free": 0.0},
+            "account_summary": {"total_equity": 3335.68, "cash_free": 0.0}}
+    ai = {"cash_deployment": {"free_cash": 0.0, "deploy_amount": 450.0,
+                              "reserve": 450.0,
+                              "targets": [{"asset": "CASH", "amount": 450.0}]}}
+    line = _format_cash_deployment(regime, t212, ai, [], recon_status="PASS")
+    assert "Deploy" not in line
+    assert line.startswith("€0.00 free")
+
+
+def test_hold_thesis_downgrades_sell_to_hold():
+    """User-declared hold thesis (TTWO/GTA VI): SELL becomes HOLD with
+    provenance; non-thesis tickers untouched."""
+    from investment_engine.reporting.regime_report import build_canonical_signals
+
+    recs = {"trades": [{"asset": "TTWO_US_EQ", "side": "SELL"},
+                       {"asset": "EGT_EQ", "side": "SELL"}],
+            "portfolio_actions": []}
+    plain = build_canonical_signals(recs, KNOWN_CLEAN)
+    assert plain["TTWO"]["signal"] == "SELL"
+    with_thesis = build_canonical_signals(
+        recs, KNOWN_CLEAN, {"TTWO": "GTA VI hold"})
+    assert with_thesis["TTWO"]["signal"] == "HOLD"
+    assert "hold-thesis" in with_thesis["TTWO"]["sources"]
+    assert with_thesis["TTWO"]["thesis"] == "GTA VI hold"
+    assert with_thesis["EGT"]["signal"] == "SELL"
+
+
 # --- Fix 2: BUY safety gates ---------------------------------------------------
 
 def _safety_row(display, signal="BUY", weight=1.0, pnl=1.0, price=10.0, value=100.0):

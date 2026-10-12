@@ -1122,11 +1122,17 @@ def _record_links(
     links = set()
     key = (symbol_key or "").strip().upper()
     universe = set(owned) | set(constituents) | set(watchlist) | set(earnings)
-    if key and key in universe:
+    if key and key in universe and len(key) != 2:
+        # Two-letter tickers (AI, SU, ...) collide with plain words AND their
+        # fetch buckets are polluted by the same collision (live 2026-10-12:
+        # an "AI pricing" article landed in the Air Liquide bucket). They link
+        # via company-name match below only. Single letters keep bucket-only.
         links.add(key)
     upper_title = (title or "").upper()
     for disp in universe:
-        if len(disp) >= 2 and re.search(r"\b" + re.escape(disp) + r"\b", upper_title):
+        if len(disp) <= 2:
+            continue  # never bare-title-scan short tickers (C, O, AI, ...)
+        if re.search(r"\b" + re.escape(disp) + r"\b", upper_title):
             links.add(disp)
     for disp, company in (names or {}).items():
         if disp in universe and company and len(str(company)) >= 5 \
@@ -1241,4 +1247,81 @@ def filter_decision_news(
     _st["kept"] = len(out)
     if stats is not None and isinstance(stats, dict):
         stats.update(_st)
+    return out
+
+
+_CATALYST_MONTHS = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9, "october": 10,
+    "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+_CATALYST_RE = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|October|"
+    r"November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
+    r"\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?\b",
+    re.IGNORECASE,
+)
+
+
+def extract_catalysts(items, *, now=None, max_days: int = 120) -> list[dict]:
+    """Explicit future dates in linked news titles, per ticker.
+
+    V1 (informational only): turns "GTA VI Nov 19 release" linked to TTWO
+    into {"ticker": "TTWO", "date": "2026-11-19", ...}. Year is explicit or
+    inferred (this year when still ahead, else next). Past dates, missing
+    dates and non-ticker links (MACRO) are skipped. Pure, never raises.
+    """
+    from datetime import date as _date
+    from datetime import datetime as _dt
+
+    try:
+        today = (_dt.now(timezone.utc).date() if now is None
+                 else (now.date() if isinstance(now, _dt) else now))
+    except Exception:
+        return []
+    try:
+        horizon = int(max_days)
+    except (TypeError, ValueError):
+        horizon = 120
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items or []:
+        try:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "") or "")
+            if not title:
+                continue
+            m = _CATALYST_RE.search(title)
+            if not m:
+                continue
+            month = _CATALYST_MONTHS.get(str(m.group(1)).lower(), 0)
+            day = int(m.group(2))
+            year = int(m.group(3)) if m.group(3) else today.year
+            try:
+                event = _date(year, month, day)
+            except ValueError:
+                continue  # e.g. Feb 30
+            if event < today and not m.group(3):
+                try:
+                    event = _date(year + 1, month, day)
+                except ValueError:
+                    continue
+            delta = (event - today).days
+            if delta < 0 or delta > horizon:
+                continue
+            for ticker in item.get("links", []) or []:
+                tick = str(ticker or "").strip().upper()
+                if not tick or tick == "MACRO":
+                    continue
+                if (tick, event.isoformat()) in seen:
+                    continue
+                seen.add((tick, event.isoformat()))
+                out.append({"ticker": tick, "date": event.isoformat(),
+                            "title": title,
+                            "url": str(item.get("url", "") or "")})
+        except Exception:
+            continue
+    out.sort(key=lambda e: (e["date"], e["ticker"]))
     return out

@@ -152,3 +152,34 @@ def test_no_reference_imports_outside_allowed_modules():
             src = path.read_text(encoding="utf-8")
             assert "import pandas_ta" not in src, path
             assert "import talib" not in src, path
+
+
+def test_reference_engine_e2e_when_pandas_ta_present():
+    """Full reference analyze() on yfinance-shaped data (DatetimeIndex).
+
+    Skipped where pandas-ta is absent. Locks in the production path both
+    user PCs use (verified 2026-10-12: 50 columns, key gauges populated).
+    """
+    pytest.importorskip("pandas_ta")
+    import numpy as np
+    import pandas as pd
+
+    from investment_engine.research.technical_analysis import TechnicalAnalyzer
+
+    n = 300
+    rng = np.random.RandomState(42)
+    idx = pd.date_range("2024-01-01", periods=n, freq="B")
+    close = 100 * np.cumprod(1 + rng.normal(0.0008, 0.012, n))
+    df = pd.DataFrame({
+        "open": np.concatenate([[100], close[:-1]]),
+        "high": close * 1.004,
+        "low": close * 0.996,
+        "close": close,
+        "volume": rng.randint(500_000, 5_000_000, n).astype(float),
+    }, index=idx)
+    analyzer = TechnicalAnalyzer()  # default auto -> reference when installed
+    assert analyzer.resolved_engine == "reference"
+    out = analyzer.analyze(df)
+    for col in ("SMA_20", "RSI_14", "ATR_14", "VWAP", "OBV"):
+        assert col in out.columns, col
+        assert out[col].iloc[-1] == out[col].iloc[-1], col  # not NaN at tail

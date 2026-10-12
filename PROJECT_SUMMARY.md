@@ -69,9 +69,9 @@ Batch helpers: `run_full_report.bat`, `run_automated.bat`, `run_t212_analysis.ba
 Order: **LM Studio → llama.cpp (Pi 5, :11435) → Ollama (Pi, :11434) → Gemini →
 OpenRouter (:free rotation) → Mistral → deterministic fallback**.
 Zen is explicit-only (`PROVIDER=opencode_zen`). Stage routing
-(`_model_for_stage`): `summary→writer_model` (gemma-4-12b), `discovery→thinking`
-(gpt-oss-20b, 32k ctx), `decision/ai_recommendations→finance` (qwen3.8-9b-distill),
-rest→decision_model. Only the direct LM Studio attempt honors the stage model;
+(`_model_for_stage`): `summary→writer_model` (gemma-4-26b, alt bonsai-27b /
+ministral-3-3b), `discovery→thinking` (gpt-oss-20b, 32k ctx),
+`decision/ai_recommendations→finance` (gpt-oss-20b), rest→decision_model. Only the direct LM Studio attempt honors the stage model;
 the chain serves its own fixed models. Real winner per stage is recorded in
 `run_manifest.json` (`providers_per_stage`). Live endpoints are Tailscale IPs
 (`100.88.219.120:1234`, `100.125.47.31:11434/11435`).
