@@ -15,6 +15,14 @@ python-dotenv>=1.0.0,<2
 pydantic>=2.0.0,<3
 feedparser>=6.0.10,<7
 finvizfinance>=1.0.0,<2
+# Plotting for the TA chart pack (Appendix B6). WARNING: install with the
+# pinned numpy intact — `pip install matplotlib` alone re-resolves and pulls
+# numpy 2.x (seen 2026-10-13: numpy 1.26.4 -> 2.5.4, rolled back). If numpy
+# moves, force it back:  py -3.12 -m pip install "numpy==1.26.4"
+# NOTE: mpl>=3.10 needs contourpy>=1.6 which needs numpy>=2.0; the pair
+# below keeps the pinned numpy 1.26.4 intact (verified 2026-10-13).
+matplotlib>=3.9.0,<3.10
+contourpy>=1.2,<1.3
 tzdata>=2022.0,<2027  # Windows-safe zoneinfo database (Europe/Bratislava); no-op on most Linux/macOS
 
 # --- Browser (Playwright): installed, browser binary via install script ---

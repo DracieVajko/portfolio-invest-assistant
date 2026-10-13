@@ -89,6 +89,12 @@ portfolio_ai_assistant/
 ├── requirements.txt
 ├── api.env                     # Secrets (gitignored)
 ├── .gitignore
+├── agent_data/                 # Investor operating data (examples tracked, real files local)
+│   ├── investor_profile.example.yaml
+│   ├── decision_log/           # Append-only decision records (gitignored)
+│   ├── scratch/                # Working files, snapshots (gitignored)
+│   └── charts/                 # Rendered chart pack (gitignored)
+├── scripts/                    # verify_environment, ta_snapshot, fundamentals, decision_log
 ├── trading212/                 # T212 modules
 │   ├── auth.py                 # Authentication
 │   ├── portfolio.py            # Portfolio analysis
@@ -98,6 +104,24 @@ portfolio_ai_assistant/
 ├── data/                       # Cache/data
 └── run_*.bat                   # Windows batch helpers
 ```
+
+## Agent tooling (TA snapshots, charts, fundamentals, decision log)
+
+```cmd
+py -3.12 scripts/ta_snapshot.py --symbol AAPL --exchange NASDAQ --currency USD --benchmark SPY
+py -3.12 scripts/ta_snapshot.py --symbol AAPL --charts agent_data/charts
+py -3.12 scripts/fundamentals.py --symbol AAPL
+py -3.12 scripts/decision_log.py new --ticker AAPL --mode M1 --verdict HOLD --confidence medium
+py -3.12 scripts/verify_environment.py   :: preflight incl. matplotlib + pip-check gate
+```
+
+- `ta_snapshot.py` writes an Appendix-B7 JSON (`agent_data/scratch/`, gitignored):
+  exact Wilder/SMA/EMA/Bollinger math, B3 regimes, zones, drawdowns, percentiles.
+- `--charts` renders C1–C5 PNGs (12×7", 150 dpi, colorblind-safe) into `agent_data/charts/`.
+- `fundamentals.py` builds the §5.2 pack (TTM, margins, FCF, ROIC, growth) from
+  yfinance statements; gaps are null with notes, never invented.
+- Copy `agent_data/*.example.*` to the real names and fill them in; without a
+  profile, suitability conclusions are provisional.
 
 ## AI Models (LM Studio, per-stage routing)
 

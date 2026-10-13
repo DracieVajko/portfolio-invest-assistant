@@ -21,7 +21,7 @@ echo "Installing requirements from requirements.txt..."
 "$PY" -m pip install -r requirements.txt
 
 echo "Verifying core installations..."
-"$PY" -c "import yfinance, pandas, scipy, feedparser, finvizfinance, numpy; print('Core packages OK!')"
+"$PY" -c "import yfinance, pandas, scipy, feedparser, finvizfinance, numpy, matplotlib; print('Core packages OK!')"
 
 echo "Checking pinned versions (pandas 2.2.x + numpy 1.26.x + scipy 1.13.x)..."
 "$PY" -c "import pandas, numpy, scipy, sys; ok = pandas.__version__.startswith('2.2.') and numpy.__version__.startswith('1.26.') and scipy.__version__.startswith('1.13.'); print(f'pandas={pandas.__version__} numpy={numpy.__version__} scipy={scipy.__version__}'); sys.exit(0 if ok else 1)"

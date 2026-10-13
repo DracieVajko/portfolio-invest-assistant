@@ -45,7 +45,7 @@ if errorlevel 1 (
 
 echo.
 echo Verifying core installations...
-py -3.12 -c "import yfinance; import pandas; import scipy; import feedparser; import finvizfinance; import numpy; print('Core packages OK!')"
+py -3.12 -c "import yfinance; import pandas; import scipy; import feedparser; import finvizfinance; import numpy; import matplotlib; print('Core packages OK!')"
 
 echo.
 echo Checking pinned versions (pandas 2.2.x + numpy 1.26.x + scipy 1.13.x)...

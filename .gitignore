@@ -93,6 +93,19 @@ accounting/
 # Auto-backup snapshots (*_V2415_*) - never commit; canonical files live beside them
 *_V2415_*
 
+# Agent operating data (personal; examples tracked, real files local).
+# See agent_data/README.md. Real profile/tax/base-rate files, the decision
+# log and working files must never be committed.
+agent_data/investor_profile.yaml
+agent_data/tax_facts.yaml
+agent_data/base_rates.md
+agent_data/decision_log/*
+!agent_data/decision_log/.gitkeep
+agent_data/scratch/*
+!agent_data/scratch/.gitkeep
+agent_data/charts/*
+!agent_data/charts/.gitkeep
+
 # Temporary scripts and files (install entry points ARE tracked:
 # install.bat + install.sh).
 cleanup.bat

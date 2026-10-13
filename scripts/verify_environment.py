@@ -42,6 +42,7 @@ CORE_MODULES = [
     "feedparser",
     "finvizfinance",
     "tzdata",
+    "matplotlib",
 ]
 
 OPTIONAL_MODULES = ["pandas_ta", "talib", "playwright", "tzdata"]
@@ -89,7 +90,18 @@ def _check_pip() -> tuple[bool, str]:
         return False, f"pip check could not run: {type(exc).__name__}"
     if proc.returncode == 0:
         return True, "pip check: OK (no broken requirements)"
-    first_lines = "\n".join(proc.stdout.splitlines()[:5])
+    # Documented divergences (requirements.txt): pandas-ta 0.4.x metadata
+    # demands pandas>=2.3.2/numpy>=2.2.6/numba==0.61.2, but the pinned stack
+    # (pandas 2.2.3/numpy 1.26.4) is verified at runtime instead. Anything
+    # else still fails the gate.
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    tolerated = [ln for ln in lines
+                 if ln.startswith("pandas-ta 0.4.71b0 has requirement")]
+    rest = [ln for ln in lines if ln not in tolerated]
+    if not rest:
+        return True, ("pip check: OK modulo documented pandas-ta metadata "
+                      f"({len(tolerated)} tolerated lines)")
+    first_lines = "\n".join(rest[:5])
     return False, f"pip check FAILED:\n{first_lines}"
 
 

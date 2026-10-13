@@ -1,0 +1,16 @@
+# TEMPLATE ONLY — copy to tax_facts.yaml (gitignored) and maintain.
+# Rules (§9.5): one entry per rule with value, source URL, date checked and
+# review-by date. Use entries checked within 90 days; otherwise write
+# "unverified: check Finančná správa or a tax advisor". Never invent rates.
+- topic: example_capital_gains_time_test
+  value: "unverified: check Finančná správa or a tax advisor"
+  source_url: ""
+  date_checked: ""
+  review_by: ""
+  maintained_by: user
+- topic: example_us_dividend_withholding
+  value: "unverified: check IRS/Form W-8BEN or a tax advisor"
+  source_url: ""
+  date_checked: ""
+  review_by: ""
+  maintained_by: user

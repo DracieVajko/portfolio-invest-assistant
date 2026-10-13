@@ -1,0 +1,45 @@
+# TEMPLATE ONLY — copy to investor_profile.yaml (gitignored) and fill in.
+# See operating instructions, Appendix A. If a field is empty, dependent
+# conclusions are provisional.
+schema_version: 1
+last_reviewed: ""                   # YYYY-MM-DD, set when the user confirms the profile
+language: sk
+timezone: Europe/Bratislava
+base_currency: EUR                   # default assumption; confirm
+tax_residency: SK                    # default assumption; confirm
+accounts:                            # defines what "not found" means
+  - broker: ""                       # e.g. Trading212
+    account_type: ""                 # e.g. invest, ISA-like, pie, crypto
+    coverage: complete               # complete | partial
+    data_source: ""                  # api | export | manual
+goals:
+  - name: ""
+    horizon_years: null
+    target_amount: null
+horizon_default_years: null          # if null the agent assumes strategic (>3y) and states it
+risk_tolerance: null                 # low | medium | high
+max_drawdown_tolerance_pct: null     # loss in portfolio value the investor can accept
+max_single_stock_pct: null
+max_single_etf_pct: null
+max_sector_pct: null
+max_country_pct: null
+max_speculative_pct: null            # crypto, unprofitable, small caps, leveraged (if permitted)
+max_loss_per_position_pct: null      # per-position loss budget, often 0.5 to 2; not the same as max_drawdown_tolerance_pct
+target_allocation: {}                # e.g. {global_equity: 70, bonds: 10, cash: 10, satellite: 10}
+rebalance_band_pct: null
+monthly_contribution: null
+emergency_fund_months: null
+income_stability: null           # stable | variable | none
+debts: []                          # type, rate, amount (excluded from risk assets)
+leverage_allowed: false
+account_tax_type: ""               # taxable | tax-advantaged
+market_drawdown_plan: ""           # pre-committed rule for a market-wide 20 percent fall
+liquidity_needs: []                  # earmarked money and dates; excluded from risk assets
+restrictions:
+  - ""                               # e.g. "UCITS only", "no leverage", "no derivatives", "no crypto", "ESG exclusions"
+benchmark: ""                        # name and ticker; same currency and total-return basis
+high_stakes_threshold_pct: 5         # new position at or above this share of the portfolio triggers DEEP
+preferences:
+  detail_level: standard             # quick | standard | deep
+  number_format: ""                  # mirror the user's formatting if empty
+notes: ""

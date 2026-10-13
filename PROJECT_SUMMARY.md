@@ -143,3 +143,18 @@ the chain serves its own fixed models. Real winner per stage is recorded in
 - Follow existing per-file patterns; keep diffs minimal; update the affected
   `tests/test_*.py` in the same change.
 - Verify with `py -3.12 -m pytest tests/ -q` and `py -3.12 -m pip check`.
+
+## 10. Agent tooling (2026-10-13, v1.3)
+
+- `investment_engine/research/ta_snapshot.py` — exact Appendix-B math
+  (Wilder RSI/ATR/ADX, EMA seed=SMA, Bollinger ddof=0, B3 regimes in order,
+  zones, drawdowns, percentiles); null+notes for every gap, never raises.
+- `investment_engine/research/ta_charts.py` — C1–C5 PNG pack (Agg,
+  colorblind-safe); `scripts/ta_snapshot.py --charts` renders it.
+- `investment_engine/research/fundamentals.py` + `scripts/fundamentals.py` —
+  §5.2 pack (TTM, margins, FCF, ROIC with statement-effective tax rate,
+  growth over present years only).
+- `agent_data/` — profile/tax/base-rate templates (examples tracked, real
+  files gitignored) + `scripts/decision_log.py` (append-only Appendix-C log).
+- Pins: `matplotlib>=3.9,<3.10` + `contourpy>=1.2,<1.3` keep numpy 1.26.4;
+  `verify_environment.py` tolerates only the documented pandas-ta metadata.
