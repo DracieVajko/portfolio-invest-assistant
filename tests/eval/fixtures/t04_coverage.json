@@ -1,0 +1,15 @@
+{
+  "accounts": [
+    {"id": "A", "coverage": "complete"},
+    {"id": "B", "coverage": "partial"}
+  ],
+  "holdings_A": [
+    {"symbol": "Y", "quantity": 10, "price": 100.0, "currency": "EUR",
+     "price_unit": "EUR", "account": "A"}
+  ],
+  "log_record_X": {
+    "asset": {"ticker": "X", "name": " discussed co"},
+    "mode": "M1", "verdict": "WATCH", "confidence": "medium",
+    "portfolio_status": "discussed_only"
+  }
+}

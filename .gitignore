@@ -105,6 +105,7 @@ agent_data/scratch/*
 !agent_data/scratch/.gitkeep
 agent_data/charts/*
 !agent_data/charts/.gitkeep
+tests/eval/runs/
 
 # Temporary scripts and files (install entry points ARE tracked:
 # install.bat + install.sh).

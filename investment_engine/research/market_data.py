@@ -23,6 +23,62 @@ def report_now_bta():
     return datetime.now(_tz.utc).astimezone(ZoneInfo(BRATISLAVA_TZ_NAME))
 
 
+def _as_utc(value) -> datetime | None:
+    """Coerce datetime/ISO to aware UTC. None when unparseable. Never raises."""
+    try:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        s = str(value or "").strip()
+        if not s:
+            return None
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def quote_freshness(quote_ts, session_close_ts, as_of=None) -> dict:
+    """Fresh/stale/missing quote vs the last completed session close.
+
+    Fresh when quote_ts >= session_close_ts (and not in the future).
+    Pure; never raises.
+    """
+    try:
+        now = _as_utc(as_of) or datetime.now(timezone.utc)
+        quote = _as_utc(quote_ts)
+        session = _as_utc(session_close_ts)
+        if quote is None:
+            return {"state": "missing", "reason": "no quote timestamp"}
+        if session is None:
+            return {"state": "missing", "reason": "no session close reference"}
+        if quote > now:
+            return {"state": "stale", "reason": "quote timestamp is in the future"}
+        if quote >= session:
+            return {"state": "fresh", "reason": ""}
+        return {"state": "stale",
+                "reason": "older than the last completed session close"}
+    except Exception:
+        return {"state": "missing", "reason": "unparsable timestamps"}
+
+
+def staleness_gate(states: dict[str, str]) -> dict:
+    """Decision gate over per-symbol freshness states.
+
+    Any stale/missing entry caps confidence at provisional and lists the
+    symbols; all-fresh allows high confidence. Pure; never raises.
+    """
+    try:
+        bad = sorted(s for s, st in (states or {}).items() if st != "fresh")
+        if bad:
+            return {"confidence_cap": "provisional", "insufficient": bad,
+                    "allow_high_confidence": False}
+        return {"confidence_cap": "ok", "insufficient": [],
+                "allow_high_confidence": True}
+    except Exception:
+        return {"confidence_cap": "provisional", "insufficient": ["unknown"],
+                "allow_high_confidence": False}
+
+
 def to_local_date(value, tz_name: str = BRATISLAVA_TZ_NAME):
     """Normalize a date/datetime/ISO string to a local calendar date.
 

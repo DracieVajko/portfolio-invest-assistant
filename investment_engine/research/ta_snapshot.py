@@ -714,6 +714,7 @@ def build_snapshot(
     hist_ok = n >= 756
     if not hist_ok:
         notes.append("history <756 bars: percentiles not computed")
+        quality_flags.append("short_history (<756 bars)")
     ext_hist = ((cl - sma50) / atr14)[(3 * 50):] if hist_ok else np.array([])
     ext_pct = _percentile(ext_atr, ext_hist) if hist_ok else None
     bw_hist = bw[(3 * 20):] if hist_ok else np.array([])

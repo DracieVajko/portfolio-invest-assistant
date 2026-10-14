@@ -30,6 +30,23 @@ def classify_coverage(accounts: list[dict] | None) -> dict:
                             if partial else "complete coverage")}
 
 
+def classify_holding_status(*, held: bool, log_status: str | None = None,
+                            coverage_complete: bool = True) -> str:
+    """Portfolio status class (AGENTS.md 4.2).
+
+    Absent + partial coverage -> "unknown" (never "not_found").
+    Pure; never raises.
+    """
+    try:
+        if held:
+            return "confirmed_current_holding"
+        if log_status:
+            return str(log_status)
+        return "not_found" if coverage_complete else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def position_values(holdings: list[dict], *, base_ccy: str = "EUR",
                     fx: dict | None = None, include_cash: float = 0.0) -> dict:
     """Native + base values and weights. Denominator = positions + cash.

@@ -1,0 +1,19 @@
+{
+  "portfolio_value": 10000,
+  "cases": {
+    "case1": {"loss_budget_pct": null, "adverse_move_pct": 40,
+              "caps": {"max_single_stock_pct": 5}},
+    "case2": {"loss_budget_pct": 2, "adverse_move_pct": 25,
+              "caps": {"max_single_stock_pct": 5}},
+    "case4": {"loss_budget_pct": null, "adverse_move_pct": 40,
+              "caps": {"max_single_stock_pct": 5},
+              "max_drawdown_tolerance_pct": 30}
+  },
+  "holdings_3": [
+    {"symbol": "A", "value_base": 5000.0, "sector": "T", "currency": "USD"},
+    {"symbol": "B", "value_base": 3000.0, "sector": "T", "currency": "EUR"},
+    {"symbol": "C", "value_base": 2000.0, "sector": "E", "currency": "EUR"}
+  ],
+  "candidate_D": {"symbol": "D", "amount_base": 1000.0, "sector": "E",
+                  "currency": "USD"}
+}

@@ -1,0 +1,18 @@
+[
+  {"name": "Alphabet Inc Class C", "isin": "US02079K1079",
+   "tickers": {"NASDAQ": "GOOG"}, "broker_ids": ["GOOG_US_EQ"],
+   "instrument_type": "common", "currency": "USD",
+   "keywords": ["Alphabet", "Google"]},
+  {"name": "Alphabet Inc Class A", "isin": "US02079K3059",
+   "tickers": {"NASDAQ": "GOOGL"}, "broker_ids": ["GOOGL_US_EQ"],
+   "instrument_type": "common", "currency": "USD",
+   "keywords": ["Alphabet", "Google"]},
+  {"name": "Apple Inc", "isin": "US0378331005",
+   "tickers": {"NASDAQ": "AAPL"}, "broker_ids": ["AAPL_US_EQ"],
+   "instrument_type": "common", "currency": "USD",
+   "keywords": ["Apple", "iPhone"]},
+  {"name": "Leverage Shares 3x Apple ETP", "isin": "XS000APPLE03",
+   "tickers": {"LSE": "AAP3"}, "broker_ids": ["AAP3_L_EQ"],
+   "instrument_type": "etp-leveraged", "leverage_factor": 3.0,
+   "currency": "USD", "keywords": ["Apple"]}
+]
