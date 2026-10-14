@@ -15,6 +15,7 @@ python-dotenv>=1.0.0,<2
 pydantic>=2.0.0,<3
 feedparser>=6.0.10,<7
 finvizfinance>=1.0.0,<2
+pyyaml>=6.0  # investor_profile.yaml / tax_facts.yaml parsing (setup_agent)
 # Plotting for the TA chart pack (Appendix B6). WARNING: install with the
 # pinned numpy intact — `pip install matplotlib` alone re-resolves and pulls
 # numpy 2.x (seen 2026-10-13: numpy 1.26.4 -> 2.5.4, rolled back). If numpy

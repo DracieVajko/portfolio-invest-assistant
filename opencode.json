@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.md"],
+  "provider": {
+    "ollama": {
+      "models": {
+        "YOUR-LOCAL-MODEL-ID": {
+          "name": "Local model (rename the key to your ollama model id)",
+          "options": {
+            "num_ctx": 65536
+          }
+        }
+      }
+    }
+  }
+}
