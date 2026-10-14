@@ -241,12 +241,49 @@ def build_pack(
     if history and dps is not None:
         history[-1]["dps"] = dps
 
+    # GAAP vs adjusted labeling: record exactly which yfinance row fed each
+    # series, so a mixed basis can never pass silently (T15).
+    def _source_of(frame: pd.DataFrame, metric: str) -> str:
+        row = pick_row(frame, metric)
+        if row is None:
+            return ""
+        try:
+            return str(row.name)
+        except AttributeError:
+            return ""
+
+    row_sources = {
+        "revenue": _source_of(annual_fin, "revenue"),
+        "eps_diluted": _source_of(annual_fin, "eps_diluted"),
+        "net_income": _source_of(annual_fin, "net_income"),
+    }
+
+    fcf_latest = fcf[-1] if fcf else None
+    sbc_latest = sbc[-1] if sbc else None
+    fcf_after_sbc = (fcf_latest - sbc_latest
+                     if fcf_latest is not None and sbc_latest is not None else None)
+    ttm_sbc = None
+    if n_q:
+        _sbc_row = pick_row(quarterly_fin, "sbc")
+        if _sbc_row is not None:
+            try:
+                _vals = pd.to_numeric(_sbc_row, errors="coerce").to_numpy(dtype=float)[:4]
+                _vals = _vals[~np.isnan(_vals)]
+                ttm_sbc = float(np.sum(_vals)) if _vals.size else None
+            except Exception:
+                ttm_sbc = None
+    if ttm_sbc is None and sbc:
+        ttm_sbc = sbc[-1]
+    ttm_fcf_after_sbc = (ttm_fcf - ttm_sbc
+                         if ttm_fcf is not None and ttm_sbc is not None else None)
+
     pack = {
         "symbol": symbol, "currency": currency, "standard": standard,
         "fiscal_year_end": fiscal_year_end,
         "statements_available": {"annual": n_annual, "quarterly": n_q},
         "ttm": {"revenue": ttm_rev,
                 "fcf": ttm_fcf,
+                "fcf_after_sbc": ttm_fcf_after_sbc,
                 "fcf_margin": (ttm_fcf / ttm_rev) if ttm_fcf is not None and ttm_rev else None,
                 "net_income": ttm_ni,
                 "fcf_conversion": (ttm_fcf / ttm_ni) if ttm_fcf is not None and ttm_ni else None},
@@ -254,8 +291,9 @@ def build_pack(
                            "fcf": margin(fcf, rev)},
         "cash_generation": {"ocf_latest": ocf[-1] if ocf else None,
                             "capex_latest": capex[-1] if capex else None,
-                            "fcf_latest": fcf[-1] if fcf else None,
-                            "sbc_latest": sbc[-1] if sbc else None,
+                            "fcf_latest": fcf_latest,
+                            "fcf_after_sbc": fcf_after_sbc,
+                            "sbc_latest": sbc_latest,
                             "sbc_to_revenue": margin(sbc, rev),
                             "sbc_to_fcf": (abs(sbc[-1] / fcf[-1])) if sbc and fcf
                             and sbc[-1] is not None and fcf[-1] else None},
@@ -274,7 +312,147 @@ def build_pack(
         "growth": {"revenue_cagr_3y": _cagr(rev[-4:]) if len(rev) >= 4 else None,
                    "revenue_cagr_5y": _cagr(rev[-6:]) if len(rev) >= 6 else None,
                    "revenue_cagr_10y": _cagr(rev[-11:]) if len(rev) >= 11 else None},
+        "valuation_percentile": "not computable",
+        "valuation_note": ("no point-in-time historical multiples from free "
+                           "vendor data; percentiles need 5-10y of dated multiples"),
+        "row_sources": row_sources,
         "history": history,
         "notes": notes,
     }
     return pack
+
+
+def dcf_value(*, fcf_base: float, growth: float, discount: float,
+              years: int = 10, terminal_growth: float = 0.02) -> float | None:
+    """Enterprise value for a constant-FCF-growth path (Appendix D notes).
+
+    Pure helper behind reverse_dcf; terminal growth is capped at 3%.
+    Never raises (None on bad inputs).
+    """
+    try:
+        fcf = float(fcf_base)
+        g = float(growth)
+        r = float(discount)
+        n = int(years)
+        tg = min(float(terminal_growth), 0.03)
+        if n <= 0 or r <= tg:
+            return None
+    except (TypeError, ValueError):
+        return None
+    try:
+        pv = sum(fcf * (1 + g) ** t / (1 + r) ** t for t in range(1, n + 1))
+        tv = fcf * (1 + g) ** n * (1 + tg) / ((r - tg) * (1 + r) ** n)
+        return float(pv + tv)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+
+def reverse_dcf(*, ev: float, fcf_ttm: float,
+                discount_range: tuple[float, float] = (0.08, 0.10),
+                years: int = 10, terminal_growth: float = 0.02,
+                growth_grid: tuple[float, ...] = (-0.05, 0.0, 0.05, 0.10, 0.15)
+                ) -> dict:
+    """Implied FCF CAGR priced in at today's EV, per discount rate.
+
+    Binary-searches g in [-50%, +100%] so that dcf_value == ev, plus an
+    EV sensitivity grid over (discount x assumed growth). Pure; never raises.
+    Terminal growth capped at 3% (long-run nominal ceiling).
+    """
+    out: dict = {"implied_growth": {}, "sensitivity": [], "inputs": {},
+                 "note": ""}
+    try:
+        target = float(ev)
+        fcf = float(fcf_ttm)
+        lo_r, hi_r = float(discount_range[0]), float(discount_range[1])
+        if target <= 0 or fcf <= 0 or lo_r <= 0 or hi_r < lo_r:
+            out["note"] = "needs positive EV/FCF and a valid discount range"
+            return out
+    except (TypeError, ValueError, IndexError):
+        out["note"] = "non-numeric inputs"
+        return out
+    out["inputs"] = {"ev": target, "fcf_ttm": fcf,
+                     "discount_range": [lo_r, hi_r], "years": years,
+                     "terminal_growth": min(float(terminal_growth), 0.03)}
+    steps = max(1, int(round((hi_r - lo_r) / 0.01)))
+    rates = sorted({round(lo_r + i * (hi_r - lo_r) / steps, 4)
+                    for i in range(steps + 1)})
+
+    def implied(r: float) -> float | None:
+        lo_g, hi_g = -0.5, 1.0
+        v_lo = dcf_value(fcf_base=fcf, growth=lo_g, discount=r, years=years,
+                         terminal_growth=terminal_growth)
+        v_hi = dcf_value(fcf_base=fcf, growth=hi_g, discount=r, years=years,
+                         terminal_growth=terminal_growth)
+        if v_lo is None or v_hi is None:
+            return None
+        if not (v_lo <= target <= v_hi):
+            return None
+        for _ in range(60):
+            mid = (lo_g + hi_g) / 2.0
+            v = dcf_value(fcf_base=fcf, growth=mid, discount=r, years=years,
+                          terminal_growth=terminal_growth)
+            if v is None:
+                return None
+            if v < target:
+                lo_g = mid
+            else:
+                hi_g = mid
+        return round((lo_g + hi_g) / 2.0, 4)
+
+    for r in rates:
+        g = implied(r)
+        out["implied_growth"][str(r)] = g
+        row: dict = {"discount": r, "implied_growth": g, "ev_at_assumed": {}}
+        for ga in growth_grid:
+            try:
+                row["ev_at_assumed"][str(ga)] = dcf_value(
+                    fcf_base=fcf, growth=float(ga), discount=r, years=years,
+                    terminal_growth=terminal_growth)
+            except (TypeError, ValueError):
+                row["ev_at_assumed"][str(ga)] = None
+        out["sensitivity"].append(row)
+    out["note"] = ("what you need to believe: FCF CAGR in implied_growth; "
+                   "sensitivity shows model EV at assumed growth rates")
+    return out
+
+
+def scenarios(*, revenue_base: float, cases: dict[str, dict],
+              shares_outstanding: float, net_debt: float = 0.0,
+              dividends_per_share: float = 0.0) -> dict:
+    """Bear/base/bull equity value per share from explicit drivers.
+
+    cases: {name: {revenue_growth, net_margin, exit_pe, years}}.
+    value = (EPS_yearN x exit_PE + DPS x years - net_debt/shares);
+    undiscounted, labeled judgment. Pure; never raises.
+    """
+    out: dict = {"cases": {}, "inputs_echo": {},
+                 "note": "undiscounted; judgment, not a forecast"}
+    try:
+        rev = float(revenue_base)
+        shares = float(shares_outstanding)
+        debt = float(net_debt)
+        dps = float(dividends_per_share)
+        if rev <= 0 or shares <= 0 or not isinstance(cases, dict):
+            out["note"] += "; needs positive revenue/shares and a cases map"
+            return out
+    except (TypeError, ValueError):
+        out["note"] += "; non-numeric inputs"
+        return out
+    out["inputs_echo"] = {"revenue_base": rev, "shares_outstanding": shares,
+                          "net_debt": debt, "dividends_per_share": dps,
+                          "cases": cases}
+    for name, c in cases.items():
+        try:
+            g = float(c.get("revenue_growth", 0) or 0)
+            m = float(c.get("net_margin", 0) or 0)
+            pe = float(c.get("exit_pe", 0) or 0)
+            yrs = int(c.get("years", 5) or 5)
+            rev_n = rev * (1 + g) ** yrs
+            eps_n = rev_n * m / shares
+            value = eps_n * pe + dps * yrs - debt / shares
+            out["cases"][str(name)] = {"value_per_share": round(value, 2),
+                                       "eps_year_n": round(eps_n, 2),
+                                       "revenue_year_n": round(rev_n, 2)}
+        except (TypeError, ValueError, KeyError, AttributeError):
+            out["cases"][str(name)] = {"value_per_share": None}
+    return out
