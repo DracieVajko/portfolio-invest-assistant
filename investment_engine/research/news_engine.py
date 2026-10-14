@@ -1106,6 +1106,61 @@ def _record_published_dt(record):
         return None
 
 
+_INJECTION_RES = (
+    r"(?i)\bignore\s+(all\s+)?previous\s+instructions\b",
+    r"(?i)\byou are now\b",
+    r"(?i)^\s*system\s*:",
+    r"(?i)jailbreak",
+    r"(?i)reveal\s+(your|the)\s+(system\s+)?prompt",
+)
+_ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\ufeff]")
+_BASE64_BLOB_RE = re.compile(r"^[A-Za-z0-9+/=\s]{200,}$")
+
+
+def _strip_url(url: str) -> str:
+    """Drop query string and fragment (tracking params, exfil channels)."""
+    try:
+        text = str(url or "").strip()
+        text = text.split("#", 1)[0].split("?", 1)[0].strip()
+        return text
+    except Exception:
+        return ""
+
+
+def sanitize_news_item(title: str, url: str, source: str = "") -> dict:
+    """Scrub one scraped news item before it reaches model/state/logs.
+
+    - Strips zero-width characters (hidden-text channel).
+    - Drops URL query strings and fragments.
+    - Detects prompt-injection shapes; suspected items return NO verbatim
+      text (only a hash), and callers must drop them, never store them.
+    Pure; never raises.
+    """
+    import hashlib
+
+    out = {"title": "", "url": "", "source_id": "", "injection_suspected": False,
+           "text_hash": ""}
+    try:
+        raw_title = str(title or "")
+        raw_url = str(url or "")
+        out["text_hash"] = hashlib.sha256(
+            (raw_title + "\n" + raw_url).encode("utf-8", "replace")).hexdigest()[:16]
+        clean = _ZERO_WIDTH_RE.sub("", raw_title).strip()
+        suspected = any(re.search(pat, clean) for pat in _INJECTION_RES)
+        if not suspected and _BASE64_BLOB_RE.match(clean):
+            suspected = True
+        out["injection_suspected"] = bool(suspected)
+        if suspected:
+            return out
+        out["title"] = clean
+        out["url"] = _strip_url(raw_url)
+        out["source_id"] = re.sub(r"[^a-z0-9]+", "-",
+                                  str(source or "unknown").strip().lower()).strip("-")
+        return out
+    except Exception:
+        return out
+
+
 def _record_links(
     title,
     symbol_key,
@@ -1194,6 +1249,16 @@ def filter_decision_news(
         url = str(record.get("url", "") or "").strip()
         source = str(record.get("source", "") or "unknown").strip()
         if not title or not canonical_url(url):
+            _st["no_title_url"] += 1
+            continue
+        # Security gate (T12): instruction-bearing items never reach the
+        # model, brief, state or logs — only their hash is retained.
+        _san = sanitize_news_item(title, url, source)
+        if _san["injection_suspected"]:
+            _st["quarantined"] = _st.get("quarantined", 0) + 1
+            continue
+        title, url = _san["title"], _san["url"]
+        if not title or not url:
             _st["no_title_url"] += 1
             continue
         try:

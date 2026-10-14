@@ -123,6 +123,24 @@ py -3.12 scripts/verify_environment.py   :: preflight incl. matplotlib + pip-che
 - Copy `agent_data/*.example.*` to the real names and fill them in; without a
   profile, suitability conclusions are provisional.
 
+## Security model
+
+- **Read-only broker.** The Trading212 client refuses every non-GET call at
+  code level (`trading212/auth.py`); use a read-only API key (the server
+  answers 403 otherwise). No order endpoints are called anywhere.
+- **Outbound traffic is GET-only market data** (yfinance, RSS, TradingView
+  pages) plus the configured local/cloud LLM endpoints. Queries carry public
+  identifiers only (ticker, company, topic) — never positions, values,
+  account ids or keys.
+- **Secrets live in `api.env`** (gitignored) and `agent_data/*.yaml`
+  (gitignored). Tracked are only `*.example.*` placeholders and `.gitkeep`.
+- **Scraped news is sanitized** before use: prompt-injection shapes are
+  quarantined (hash retained, text dropped), query strings stripped.
+- **Agent (opencode) allowlist:** read/write confined to this repository;
+  approve external access only for `C:\Users\DracieVajko\AppData\Local\Temp\opencode`.
+  Scripts default to writing under `agent_data/{scratch,charts,decision_log}/`;
+  reports/logs go to the gitignored `reports/` and `logs/`.
+
 ## AI Models (LM Studio, per-stage routing)
 
 | Stage | Model (`portfolio_config.json` key) |

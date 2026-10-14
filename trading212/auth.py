@@ -81,6 +81,12 @@ class Trading212Auth:
     ) -> Dict[str, Any]:
         headers = self.generate_auth_header()
         url = f"{self.api_base}/{endpoint.lstrip('/')}"
+        if method.upper() != "GET":
+            # Read-only broker client: order placement and any other writes
+            # are refused at code level (server-side read-only key is the
+            # second layer). Never silently downgraded.
+            raise ValueError(
+                f"refusing non-GET broker call: {method} {endpoint}")
 
         for attempt in range(retry_count):
             try:
