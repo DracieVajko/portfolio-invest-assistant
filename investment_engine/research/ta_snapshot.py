@@ -375,6 +375,44 @@ def classify_regime(close: float, s50: float, s200: float, slope200: float) -> s
 
 
 # --------------------------------------------------------------------------
+# built-in self-tests (B8 subset, recorded in every snapshot)
+# --------------------------------------------------------------------------
+
+def run_snapshot_selftests() -> dict:
+    """Fast invariant checks on synthetic data. Never raises."""
+    failed: list[str] = []
+    try:
+        if abs(float(_sma(np.arange(1.0, 101.0), 100)[-1]) - 50.5) > 1e-9:
+            failed.append("sma-exact")
+        up = np.arange(1.0, 301.0)
+        if abs(float(_rsi_wilder(up)[-1]) - 100.0) > 1e-9:
+            failed.append("rsi-up")
+        if abs(float(_rsi_wilder(up[::-1].copy())[-1]) - 0.0) > 1e-9:
+            failed.append("rsi-down")
+        flat = np.full(300, 42.0)
+        if abs(float(_rsi_wilder(flat)[-1]) - 50.0) > 1e-9:
+            failed.append("rsi-flat")
+        if bool(np.any(_atr_wilder(flat, flat, flat)[14:] < 0)):
+            failed.append("atr-nonneg")
+        cu, cl_, _, bw, _ = _bollinger(np.arange(1.0, 301.0))
+        if not (bool(np.all(cu[19:] >= cl_[19:]))):
+            failed.append("bollinger-order")
+        dd = _drawdown_series(np.arange(1.0, 501.0))
+        if not bool(np.all(dd[~np.isnan(dd)] <= 0)):
+            failed.append("drawdown-nonpositive")
+        if abs(float(_cagr(100.0, 200.0, 365.25)) - 1.0) > 1e-9:
+            failed.append("cagr-doubling")
+        trend = 100.0 + np.arange(500.0)
+        if classify_regime(trend[-1], float(np.mean(trend[-50:])),
+                           float(np.mean(trend[-200:])),
+                           float(np.mean(trend[-200:]) / np.mean(trend[-220:-20]) - 1)) != "STRONG_UPTREND":
+            failed.append("regime-uptrend")
+    except Exception as exc:
+        failed.append(f"harness:{type(exc).__name__}")
+    return {"passed": not failed, "failed": failed}
+
+
+# --------------------------------------------------------------------------
 # snapshot builder (B5/B7)
 # --------------------------------------------------------------------------
 
@@ -384,6 +422,48 @@ def _num(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return v if v == v else None
+
+
+def _normalize_dates(values: Any) -> list[date]:
+    """Tolerant date-list parser (str/date/datetime/Series). Never raises."""
+    out: list[date] = []
+    try:
+        items = list(values) if values is not None else []
+    except TypeError:
+        return out
+    for item in items:
+        try:
+            if isinstance(item, datetime):
+                out.append(item.date())
+            elif isinstance(item, date):
+                out.append(item)
+            else:
+                out.append(date.fromisoformat(str(item)[:10]))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _normalize_splits(splits: Any) -> dict[date, float]:
+    """Split map date -> post-split price multiplier (0.25 = 4:1).
+
+    Accepts {date-like: ratio} or [(date-like, ratio), ...]. Never raises.
+    """
+    out: dict[date, float] = {}
+    try:
+        pairs = list(splits.items()) if isinstance(splits, dict) else list(splits or [])
+    except TypeError:
+        return out
+    for pair in pairs:
+        try:
+            d, ratio = pair
+            parsed = _normalize_dates([d])
+            mult = float(ratio)
+            if parsed and mult > 0:
+                out[parsed[0]] = mult
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def build_snapshot(
@@ -402,12 +482,20 @@ def build_snapshot(
     eps: list | None = None,
     events: list | None = None,
     ref_close: float | None = None,
+    ex_div_dates: Any = None,
+    splits: Any = None,
     raw_path: str = "",
     chart_paths: list | None = None,
     source: str = "yfinance",
     now: datetime | None = None,
 ) -> dict:
-    """Build the Appendix B7 snapshot. Never raises; gaps are null + notes."""
+    """Build the Appendix B7 snapshot. Never raises; gaps are null + notes.
+
+    ex_div_dates: known ex-dividend dates (vendor auto-adjust detection).
+    splits: {date: post-split multiplier} e.g. 0.25 for 4:1 (pre-split bars
+    are adjusted; without an entry, unexplained >50% overnight gaps refuse
+    indicator computation).
+    """
     notes: list[str] = []
     quality_flags: list[str] = []
     now_utc = now if isinstance(now, datetime) else datetime.now(timezone.utc)
@@ -415,6 +503,10 @@ def build_snapshot(
         now_utc = now_utc.replace(tzinfo=timezone.utc)
 
     frame = _to_daily(df)
+    try:
+        _had_dups = bool(pd.Series(pd.to_datetime(df.index)).duplicated().any())
+    except Exception:
+        _had_dups = False
     required = {"open", "high", "low", "close", "volume"}
     if not required.issubset(frame.columns):
         return _empty_snapshot(symbol, name, isin, exchange, currency, price_unit,
@@ -422,6 +514,29 @@ def build_snapshot(
                                [f"missing columns: {sorted(required - set(frame.columns))}"])
     for col in ("open", "high", "low", "close", "volume"):
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    # --- corporate-action adjustment first (T09b): known splits rescale
+    # pre-split bars; without an entry, unexplained gaps refuse indicators.
+    split_map = _normalize_splits(splits)
+    applied: list[str] = []
+    if split_map:
+        try:
+            bar_dates = [d.date() for d in frame.index]
+            for sdate, mult in sorted(split_map.items()):
+                if mult == 1.0:
+                    continue
+                mask = np.array([d < sdate for d in bar_dates])
+                if not mask.any():
+                    continue
+                for col in ("open", "high", "low", "close"):
+                    frame[col] = np.where(mask, frame[col].to_numpy() * mult,
+                                          frame[col].to_numpy())
+                frame["volume"] = np.where(
+                    mask, frame["volume"].to_numpy() / mult, frame["volume"].to_numpy())
+                applied.append(f"{sdate.isoformat()} x{mult:g}")
+            if applied:
+                notes.append("split-adjusted pre-split bars: " + ", ".join(applied))
+        except Exception as exc:
+            notes.append(f"split adjustment skipped: {type(exc).__name__}")
     frame = frame.dropna(subset=["close"])
     if frame.empty:
         return _empty_snapshot(symbol, name, isin, exchange, currency, price_unit,
@@ -431,6 +546,7 @@ def build_snapshot(
     adj_col = "adj_close" if has_adj else "close"
     if not has_adj:
         notes.append("no adj_close column: returns use price-only basis")
+        notes.append("single price series: split-adjusted levels assumed")
     dates: list[date] = [d.date() for d in frame.index]
     n = len(frame)
     annual = ANNUALIZATION.get(asset_class, 252)
@@ -444,17 +560,37 @@ def build_snapshot(
     vo = frame["volume"].to_numpy(dtype=float)
     adj = pd.to_numeric(frame[adj_col], errors="coerce").to_numpy(dtype=float)
 
-    # --- data quality (6.2.6) ---
-    if frame.index.has_duplicates:
+    # --- data quality (6.2.6, T09) ---
+    if _had_dups or frame.index.has_duplicates:
         quality_flags.append("duplicate bars (kept last)")
-    if bool((vo == 0).any()):
+    try:
+        expected_bdays = set(pd.date_range(dates[0], dates[-1], freq="B").date)
+        missing_wd = len(expected_bdays - {d for d in dates if d.weekday() < 5})
+        if missing_wd > 0:
+            quality_flags.append(f"missing {missing_wd} weekday sessions")
+    except Exception:
+        pass
+    run = maxrun = 0
+    for v in vo:
+        run = run + 1 if v == 0 else 0
+        maxrun = max(maxrun, run)
+    if maxrun >= 3:
+        quality_flags.append(f"zero-volume run of {maxrun} bars")
+    elif bool((vo == 0).any()):
         quality_flags.append("zero-volume bars present")
     if n >= 2:
         rets_chk = np.diff(np.log(np.where(adj > 0, adj, np.nan)))
+        valid_chk = rets_chk[~np.isnan(rets_chk)]
         with np.errstate(invalid="ignore"):
             big = np.abs(rets_chk) > 0.40
         if bool(np.any(big[~np.isnan(rets_chk)])):
             quality_flags.append(">40% daily move: check splits/corporate actions")
+        if valid_chk.size >= 30:
+            sigma = float(np.std(valid_chk, ddof=1))
+            if sigma > 0:
+                n5 = int(np.sum(np.abs(valid_chk) > 5 * sigma))
+                if n5 > 0:
+                    quality_flags.append(f"{n5} moves beyond 5 sigma")
     if ref_close is not None and cl[-1]:
         try:
             if abs(float(ref_close) - float(cl[-1])) / abs(float(cl[-1])) > 0.02:
@@ -463,6 +599,44 @@ def build_snapshot(
             pass
     if (hi < lo).any():
         quality_flags.append("high<low bars present")
+    # --- refusal: unexplained >50% overnight gaps (T09a) ---
+    refused: list[str] = []
+    split_dates = set(split_map)
+    if n > 1:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            gaps_chk = op[1:] / np.where(cl[:-1] != 0, cl[:-1], np.nan) - 1.0
+        for t in range(len(gaps_chk)):
+            if gaps_chk[t] != gaps_chk[t] or abs(gaps_chk[t]) <= 0.5:
+                continue
+            gdate = dates[t + 1]
+            explained = any(abs((gdate - s).days) <= 3 for s in split_dates)
+            if not explained:
+                refused.append(gdate.isoformat())
+    if refused:
+        quality_flags.append("bad_data_possible_split at "
+                             + ",".join(refused[:3]) + ": indicators refused")
+    # --- price-basis detection (B1, T08) ---
+    basis_levels = "split_adjusted"
+    if has_adj:
+        exdiv = _normalize_dates(ex_div_dates)
+        if exdiv:
+            auto_evidence = None
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = np.where(cl > 0, adj / np.where(cl > 0, cl, np.nan), np.nan)
+            for d in exdiv:
+                window = [i for i, dt in enumerate(dates)
+                          if dt < d and (d - dt).days <= 60]
+                window = [i for i in window if ratio[i] == ratio[i]]
+                if window and all(abs(ratio[i] - 1.0) < 1e-9 for i in window):
+                    auto_evidence = d.isoformat()
+                    break
+            if auto_evidence is not None:
+                basis_levels = "adjusted_only"
+                quality_flags.append(
+                    "vendor auto-adjusted data (close==adj before ex-div "
+                    f"{auto_evidence}): levels flagged")
+                notes.append("price_basis.levels=adjusted_only: zones suppressed, "
+                             "levels fields flagged as total-return based")
 
     last_bar = dates[-1]
     first_bar = dates[0]
@@ -517,9 +691,17 @@ def build_snapshot(
             break
         underwater += 1
     top5 = _top_drawdowns(dates, adj)
+    dd_hist = dd[~np.isnan(dd)]
+    cur_dd_pct = (float(100.0 * np.mean(dd_hist <= cur_dd))
+                  if cur_dd is not None and dd_hist.size else None)
     dist_1y = _rolling_distribution(adj, w12)
     dist_3y = _rolling_distribution(adj, w12 * 3)
-    dist_5y = _rolling_distribution(adj, w12 * 5)
+    if n >= 1800:
+        dist_5y = _rolling_distribution(adj, w12 * 5)
+    else:
+        dist_5y = {"p5": None, "p25": None, "p50": None, "p75": None,
+                   "p95": None, "current_pctile": None}
+        notes.append("rolling 5y needs >=1800 bars: null")
 
     # --- 52w / ATH (levels) ---
     high52 = float(np.nanmax(hi[-251:])) if n >= 2 else None
@@ -539,8 +721,12 @@ def build_snapshot(
     rv_hist = rv63[(3 * 63):] if hist_ok else np.array([])
     rv_pct = _percentile(rv63[-1] if rv63.size else float("nan"), rv_hist) if hist_ok else None
 
-    # --- regime + modifiers ---
-    regime = classify_regime(cl[-1], sma50[-1], sma200[-1], slope200)
+    # --- regime + modifiers (no classification under ~1y of history) ---
+    if n >= 252:
+        regime = classify_regime(cl[-1], sma50[-1], sma200[-1], slope200)
+    else:
+        regime = ""
+        notes.append("history <252 bars (~1y): no daily regime classification")
     mods: list[str] = []
     if (ext_pct is not None and ext_pct >= 95) or (ext_pct is None and ext_atr == ext_atr and ext_atr >= 5):
         mods.append("EXTENDED")
@@ -579,9 +765,13 @@ def build_snapshot(
     w50 = _sma(wcl, 10)
     w200 = _sma(wcl, 40)
     wslope = (w200[-1] / w200[-5] - 1.0) if len(wcl) > 44 and w200[-5] else float("nan")
-    wregime = classify_regime(wcl[-1] if len(wcl) else float("nan"),
-                              w50[-1] if len(w50) else float("nan"),
-                              w200[-1] if len(w200) else float("nan"), wslope)
+    if len(wcl) >= 40:
+        wregime = classify_regime(wcl[-1] if len(wcl) else float("nan"),
+                                  w50[-1] if len(w50) else float("nan"),
+                                  w200[-1] if len(w200) else float("nan"), wslope)
+    else:
+        wregime = ""
+        notes.append("weekly bars <40: no weekly regime classification")
     w_rsi = _rsi_wilder(wcl)
     w_m, w_s, w_h = _macd(wcl)
     monthly = _resample_monthly(frame)
@@ -594,17 +784,22 @@ def build_snapshot(
         mstate = ""
         notes.append("monthly state unavailable (<13 bars)")
 
-    # --- structure ---
+    # --- structure (suppressed when levels basis is not split-adjusted) ---
     lookback = frame.iloc[-504:] if n > 504 else frame
     ph, pl = _swing_pivots(lookback["high"].to_numpy(dtype=float),
                            lookback["low"].to_numpy(dtype=float), 5)
     ldates = [d.date() for d in lookback.index]
-    supports = _zones(lookback["low"].to_numpy(dtype=float), pl, ldates,
-                      float(atr14[-1]) if atr14[-1] == atr14[-1] else 0.0,
-                      (lookback["volume"] / lookback["volume"].rolling(20).mean()).to_numpy(), "support")
-    resistances = _zones(lookback["high"].to_numpy(dtype=float), ph, ldates,
-                         float(atr14[-1]) if atr14[-1] == atr14[-1] else 0.0,
-                         (lookback["volume"] / lookback["volume"].rolling(20).mean()).to_numpy(), "resistance")
+    if basis_levels != "split_adjusted":
+        supports, resistances = [], []
+        notes.append("support/resistance zones suppressed (levels basis "
+                     f"{basis_levels})")
+    else:
+        supports = _zones(lookback["low"].to_numpy(dtype=float), pl, ldates,
+                          float(atr14[-1]) if atr14[-1] == atr14[-1] else 0.0,
+                          (lookback["volume"] / lookback["volume"].rolling(20).mean()).to_numpy(), "support")
+        resistances = _zones(lookback["high"].to_numpy(dtype=float), ph, ldates,
+                             float(atr14[-1]) if atr14[-1] == atr14[-1] else 0.0,
+                             (lookback["volume"] / lookback["volume"].rolling(20).mean()).to_numpy(), "resistance")
 
     # --- benchmark-relative (optional) ---
     bench = _to_daily(benchmark) if benchmark is not None and not benchmark.empty else None
@@ -712,7 +907,7 @@ def build_snapshot(
         "data": {"source": source, "first_bar": first_bar.isoformat(),
                  "last_bar_in_data": last_bar.isoformat(),
                  "last_complete_bar": last_bar.isoformat(), "n_bars": n,
-                 "price_basis": {"levels": "split_adjusted",
+                 "price_basis": {"levels": basis_levels,
                                  "returns": "total_return" if has_adj else "price_only"},
                  "quality_flags": quality_flags, "notes": notes},
         "daily": {
@@ -760,7 +955,7 @@ def build_snapshot(
             "base_currency_total_return": base_ret,
         },
         "relative": rel,
-        "drawdown": {"current": cur_dd, "current_pctile": None, "max": max_dd,
+        "drawdown": {"current": cur_dd, "current_pctile": cur_dd_pct, "max": max_dd,
                      "underwater_bars": underwater, "top5": top5},
         "distributions": {"rolling_1y": dist_1y, "rolling_3y": dist_3y,
                           "rolling_5y": dist_5y,
@@ -770,9 +965,34 @@ def build_snapshot(
         "events": clean_events,
         "stress_windows": stress,
         "attribution": attribution,
-        "tests": {"passed": None, "failed": []},
+        "tests": run_snapshot_selftests(),
         "files": {"raw_data": raw_path, "charts": list(chart_paths or [])},
     }
+    if refused:
+        # Bad-data refusal (T09a): indicators, regimes and levels are nulled;
+        # returns/drawdowns/gaps stay as flagged evidence.
+        notes.append("indicators refused: bad_data_possible_split (see quality_flags)")
+        snap["data"]["notes"] = notes
+        daily = snap["daily"]
+        for key in ("sma50", "sma200", "slope200_20d", "rsi14", "atr14",
+                    "atr_pct", "adx14", "ext_atr_from_sma50", "ext_pct_from_sma200",
+                    "ext_atr_pctile", "relvol", "adv20_value",
+                    "adv20_value_base_ccy", "high52", "low52",
+                    "dist_high52_pct", "dist_low52_pct", "ath", "dist_ath_pct"):
+            daily[key] = None
+        daily["macd"] = {"macd": None, "signal": None, "hist": None}
+        daily["bollinger"] = {"upper": None, "lower": None, "pct_b": None,
+                              "bandwidth": None, "bandwidth_pctile_252": None}
+        daily["vol"] = {"rv21": None, "rv63": None, "rv252": None, "rv63_pctile": None}
+        daily["regime"] = ""
+        daily["modifiers"] = []
+        snap["weekly"]["regime"] = ""
+        for key in ("sma10w", "sma40w", "slope40w_4w", "rsi14"):
+            snap["weekly"][key] = None
+        snap["weekly"]["macd"] = {"macd": None, "signal": None, "hist": None}
+        snap["monthly"]["state"] = ""
+        snap["monthly"]["sma10m"] = None
+        snap["levels"] = {"support": [], "resistance": []}
     return snap
 
 

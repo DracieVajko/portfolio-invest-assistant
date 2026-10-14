@@ -78,6 +78,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: data fetch failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
         return 1
+    try:
+        import yfinance as yf
+
+        acts = yf.Ticker(args.symbol).actions
+        exdiv: list[str] = []
+        splits: dict[str, float] = {}
+        if acts is not None and not acts.empty:
+            cols = {str(c).lower().replace(" ", "_"): c for c in acts.columns}
+            if "dividends" in cols:
+                div = acts[cols["dividends"]].dropna()
+                exdiv = [d.date().isoformat() for d in div.index if float(div.loc[d]) != 0]
+            if "stock_splits" in cols:
+                spl = acts[cols["stock_splits"]].dropna()
+                for d in spl.index:
+                    try:
+                        ratio = float(spl.loc[d])
+                        if ratio and ratio != 1.0:
+                            splits[d.date().isoformat()] = 1.0 / ratio
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        continue
+    except Exception as exc:
+        print(f"WARNING: corporate actions unreadable: {type(exc).__name__}",
+              file=sys.stderr)
+        exdiv, splits = [], {}
     complete = last_complete_bar(now_utc)
     frame = frame[frame.index.date <= complete]
     if frame.empty:
@@ -101,7 +125,8 @@ def main(argv: list[str] | None = None) -> int:
         price_unit=args.price_unit,
         asset_class="crypto" if args.crypto else "equity",
         benchmark=bench if bench is not None else None,
-        benchmark_meta=bmeta, now=now_utc)
+        benchmark_meta=bmeta, ex_div_dates=exdiv, splits=splits,
+        now=now_utc)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     dest = out_dir / f"ta_snapshot_{args.symbol}_{complete.isoformat()}.json"
