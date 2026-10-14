@@ -30,19 +30,29 @@ def test_build_record_id_shape():
     assert rec["created_utc"] != ""
 
 
-def test_append_never_overwrites(tmp_path):
-    from scripts.decision_log import append_record, build_record, list_records
+def test_append_same_id_raises_and_correction_supersedes(tmp_path):
+    """T10: same id raises; corrections are new records with supersedes."""
+    import pytest
+
+    from scripts.decision_log import (append_record, build_record,
+                                      lookup_prior)
 
     first = append_record(build_record(_good(), created_utc="20261013T120000Z"),
                           log_dir=tmp_path)
-    second = append_record(build_record(_good(), created_utc="20261013T120000Z"),
+    assert first.is_file()
+    with pytest.raises(FileExistsError):
+        append_record(build_record(_good(), created_utc="20261013T120000Z"),
+                      log_dir=tmp_path)
+    fix = dict(_good(), supersedes="20261013T120000Z_AAPL_M1",
+               verdict="TRIM", notes="take-profit")
+    second = append_record(build_record(fix, created_utc="20261013T130000Z"),
                            log_dir=tmp_path)
-    assert first != second and first.is_file() and second.is_file()
-    rows = list_records(log_dir=tmp_path)
-    assert len(rows) == 2
-    assert all(r["ticker"] == "AAPL" and r["verdict"] == "HOLD" for r in rows)
-    assert list_records("aapl", log_dir=tmp_path) == rows
-    assert list_records("MSFT", log_dir=tmp_path) == []
+    assert second.is_file()
+    prior = lookup_prior("AAPL", log_dir=tmp_path)
+    assert prior is not None and prior["verdict"] == "TRIM"
+    assert prior["id"] == "20261013T130000Z_AAPL_M1"
+    assert lookup_prior("US0378331005", log_dir=tmp_path)["id"] == prior["id"]
+    assert lookup_prior("MSFT", log_dir=tmp_path) is None
 
 
 def test_cli_new_and_list(tmp_path, monkeypatch):
@@ -60,3 +70,32 @@ def test_cli_new_and_list(tmp_path, monkeypatch):
     assert len(rows) == 1 and rows[0]["mode"] == "M1"
     payload = json.dumps(_good())
     assert dl.main(["new", "--data", payload]) == 0
+
+
+def test_anti_churn_matrix():
+    from scripts.decision_log import anti_churn
+
+    prior = {"id": "x", "verdict": "HOLD"}
+    assert anti_churn(None) == "no_prior"
+    assert anti_churn(prior, triggers_fired=[], new_filing=False,
+                      error=False, regime_changed=True) == "repeat_prior"
+    assert anti_churn(prior, triggers_fired=["rsi>80"]) == "re-evaluate"
+    assert anti_churn(prior, new_filing=True) == "re-evaluate"
+    assert anti_churn(prior, error=True) == "re-evaluate"
+
+
+def test_secrets_in_notes_rejected_and_action_stays_null():
+    from scripts.decision_log import append_record, build_record, validate_record
+
+    evil = dict(_good(), notes="contact broker, api_key=AKIAIOSFODNN7EXAMPLE")
+    assert any("secret" in p for p in validate_record(evil))
+    evil2 = dict(_good(), notes=["-----BEGIN RSA PRIVATE KEY-----\nx"])
+    assert any("secret" in p for p in validate_record(evil2))
+    ok = build_record(dict(_good(), parent_allocation_id="alloc-1",
+                           notes="thesis intact"))
+    assert ok["user_action_confirmed"] is None
+    assert ok["parent_allocation_id"] == "alloc-1"
+    import pytest
+
+    with pytest.raises(ValueError):
+        build_record(evil)
