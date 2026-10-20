@@ -167,3 +167,11 @@ Secrets: `api.env` holds real keys — never commit it, never paste logs contain
 ## License
 
 MIT
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
