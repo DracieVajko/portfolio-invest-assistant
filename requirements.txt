@@ -13,7 +13,7 @@ scipy>=1.10.0
 numpy>=1.24.0
 feedparser>=6.0.10
 finvizfinance>=1.0.0
-tzdata>=2022.0  # Windows-safe zoneinfo database (Europe/Bratislava); no-op on most Linux/macOS
+tzdata>=2026.5  # Windows-safe zoneinfo database (Europe/Bratislava); no-op on most Linux/macOS
 
 # --- Optional technical (validation/reference only; never required) ---
 # Technical analysis (requires Python 3.12+ for numba)
