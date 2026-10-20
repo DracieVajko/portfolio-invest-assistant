@@ -3,7 +3,7 @@
 # optional: when absent, manual indicators are the production fallback.
 #
 # --- Core (required; verify_environment.py fails without these) ---
-requests>=2.31.0
+requests>=2.34.2
 yfinance>=1.6.0
 pandas>=2.0.0
 ddgs>=0.2.0
